@@ -1,0 +1,8 @@
+__pycache__/
+build/
+dist/
+export_bundle/
+*.exe
+*.spec
+live/
+reports/
