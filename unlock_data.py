@@ -26,7 +26,7 @@ def deobfuscate_data(encoded_str):
         return None
     except: return None
 
-base_dir = r"d:\python\The Automation People\application (5)\TempTrek Environmental Monitoring System v2"
+base_dir = os.path.dirname(os.path.abspath(__file__))
 src_config = os.path.join(base_dir, "config")
 src_live = os.path.join(base_dir, "live")
 src_reports = os.path.join(base_dir, "reports")

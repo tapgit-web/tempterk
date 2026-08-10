@@ -36,6 +36,7 @@ import shutil
 import smtplib
 import imaplib
 import poplib
+import ssl
 import hashlib
 import uuid
 import requests
@@ -332,57 +333,76 @@ def csv_filename(ip, port, slave_id=1):
     date_str = datetime.now().strftime("%Y-%m-%d")
     return os.path.join(DATA_PATH, "live", f"{ip.replace('.', '_')}_{port}_s{slave_id}_{date_str}.csv")
 
+def safe_format_val(val, prec=3):
+    """Safely formats a value as a float string if numeric, or returns string as-is if text/boolean."""
+    if val is None:
+        return "N/A"
+    if isinstance(val, (int, float)):
+        return f"{val:.{prec}f}"
+    s = str(val).strip()
+    try:
+        f_val = float(s)
+        return f"{f_val:.{prec}f}"
+    except (ValueError, TypeError):
+        return s
+
 def write_csv(ip, port, slave_id, reg, value):
     filename = csv_filename(ip, port, slave_id)
-    exists = os.path.exists(filename)
-    try:
-        with open(filename, "a", newline="") as f:
-            writer = csv.writer(f)
-            if not exists:
-                writer.writerow(["Timestamp", "IP", "Port", "SlaveID", "Register", "Value"])
-            writer.writerow([datetime.now().strftime("%Y-%m-%d %H:%M:%S"), ip, port, slave_id, reg, value])
-    except:
-        pass # Handle potential file access issues (e.g. file open in Excel)
+    for attempt in range(3):
+        exists = os.path.exists(filename)
+        try:
+            with open(filename, "a", newline="") as f:
+                writer = csv.writer(f)
+                if not exists:
+                    writer.writerow(["Timestamp", "IP", "Port", "SlaveID", "Register", "Value"])
+                writer.writerow([datetime.now().strftime("%Y-%m-%d %H:%M:%S"), ip, port, slave_id, reg, value])
+            break
+        except Exception:
+            time.sleep(0.1)
 
 def write_alarm_history_csv(dev_name, reg_name, reg_addr, value, condition, threshold):
     date_str = datetime.now().strftime("%Y-%m-%d")
     filename = os.path.join(DATA_PATH, "live", f"Alarm_History_{date_str}.csv")
-    exists = os.path.exists(filename)
-    try:
-        with open(filename, "a", newline="") as f:
-            writer = csv.writer(f)
-            if not exists:
-                writer.writerow(["Timestamp", "Device Name", "Field Name", "Addr", "Reading Value", "Condition", "Threshold"])
-            writer.writerow([
-                datetime.now().strftime("%Y-%m-%d %H:%M:%S"), 
-                dev_name, 
-                reg_name, 
-                reg_addr, 
-                value, 
-                condition, 
-                threshold
-            ])
-    except:
-        pass
+    for attempt in range(3):
+        exists = os.path.exists(filename)
+        try:
+            with open(filename, "a", newline="") as f:
+                writer = csv.writer(f)
+                if not exists:
+                    writer.writerow(["Timestamp", "Device Name", "Field Name", "Addr", "Reading Value", "Condition", "Threshold"])
+                writer.writerow([
+                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"), 
+                    dev_name, 
+                    reg_name, 
+                    reg_addr, 
+                    value, 
+                    condition, 
+                    threshold
+                ])
+            break
+        except Exception:
+            time.sleep(0.1)
 
 def write_email_log_csv(dev_name, field_name, recipient, status):
     date_str = datetime.now().strftime("%Y-%m-%d")
     filename = os.path.join(DATA_PATH, "live", f"Email_Logs_{date_str}.csv")
-    exists = os.path.exists(filename)
-    try:
-        with open(filename, "a", newline="") as f:
-            writer = csv.writer(f)
-            if not exists:
-                writer.writerow(["Timestamp", "Device Name", "Field Name", "Recipient", "Status"])
-            writer.writerow([
-                datetime.now().strftime("%Y-%m-%d %H:%M:%S"), 
-                dev_name, 
-                field_name, 
-                recipient, 
-                status
-            ])
-    except:
-        pass
+    for attempt in range(3):
+        exists = os.path.exists(filename)
+        try:
+            with open(filename, "a", newline="") as f:
+                writer = csv.writer(f)
+                if not exists:
+                    writer.writerow(["Timestamp", "Device Name", "Field Name", "Recipient", "Status"])
+                writer.writerow([
+                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"), 
+                    dev_name, 
+                    field_name, 
+                    recipient, 
+                    status
+                ])
+            break
+        except Exception:
+            time.sleep(0.1)
 
 # -------------------------
 # FLOAT DECODING (ABCD)
@@ -478,7 +498,7 @@ def read_modbus_device(host, port, registers, app, stop_event, unit_id=1, refres
                         dt = "INT32"
                         reg_mode = "FC04" # Fixed back to FC04
                         poll_interval = 1.0
-                        for d in app.devices:
+                        for d in list(app.devices):
                             if d['ip'] == host and d['port'] == port and d.get('slave_id', 1) == unit_id:
                                 dt = d.get('types', {}).get(str(reg), "INT32")
                                 reg_mode = d.get('modes', {}).get(str(reg), "FC04")
@@ -658,7 +678,7 @@ def read_dummy_device(host, port, registers, app, stop_event, unit_id=1, refresh
                 dt = "FLOAT32"
                 target_dev = None
                 poll_interval = 1.0
-                for d in app.devices:
+                for d in list(app.devices):
                     if d['ip'] == host and d['port'] == port and d.get('slave_id', 1) == unit_id:
                         p_val = d.get('decimals', {}).get(str(reg))
                         if p_val is not None:
@@ -3150,15 +3170,15 @@ class ModbusApp:
         tree_cnt.pack(fill="both", expand=True, padx=30, pady=(0, 20))
 
         self.rules_tree = ttk.Treeview(tree_cnt, columns=("ip", "reg", "cond", "thresh", "interval", "msg"), show="headings", style="Treeview")
-        self.rules_tree.heading("ip", text="DEVICE IP")
-        self.rules_tree.heading("reg", text="REGISTER")
+        self.rules_tree.heading("ip", text="DEVICE NAME")
+        self.rules_tree.heading("reg", text="REGISTER NAME")
         self.rules_tree.heading("cond", text="COND")
         self.rules_tree.heading("thresh", text="PROCESS VALUE")
         self.rules_tree.heading("interval", text="INTERVAL")
         self.rules_tree.heading("msg", text="TEMPLATE")
         
-        self.rules_tree.column("ip", width=100)
-        self.rules_tree.column("reg", width=120)
+        self.rules_tree.column("ip", width=140)
+        self.rules_tree.column("reg", width=140)
         self.rules_tree.column("cond", width=60)
         self.rules_tree.column("thresh", width=100)
         self.rules_tree.column("interval", width=80)
@@ -3209,12 +3229,44 @@ class ModbusApp:
             return
 
         def run_test():
+            def try_smtp_connect(target_host, target_port):
+                for unverified in [False, True]:
+                    if unverified:
+                        ssl_ctx = ssl._create_unverified_context()
+                    else:
+                        try:
+                            ssl_ctx = ssl.create_default_context()
+                        except Exception:
+                            ssl_ctx = ssl._create_unverified_context()
+                    try:
+                        if target_port == 465:
+                            srv = smtplib.SMTP_SSL(target_host, target_port, timeout=15, context=ssl_ctx)
+                        else:
+                            srv = smtplib.SMTP(target_host, target_port, timeout=15)
+                            if srv.has_extn('STARTTLS') or target_port == 587:
+                                srv.starttls(context=ssl_ctx)
+                        srv.login(user, pwd)
+                        return srv, target_port, None
+                    except (ssl.SSLError, ssl.SSLCertVerificationError) as ssl_err:
+                        if not unverified:
+                            continue
+                        return None, target_port, ssl_err
+                    except Exception as err:
+                        return None, target_port, err
+                return None, target_port, Exception("Connection failed")
+
             try:
                 if stype in ["Gmail", "SMTP"]:
                     # Support multiple recipients (comma or semicolon)
                     raw_to = self.recipient_email.get().strip()
+                    if not raw_to:
+                        self.root.after(0, lambda: messagebox.showwarning("Incomplete", "Please specify at least one recipient email address."))
+                        return
                     # Replace semicolon with comma then split
                     recipients = [r.strip() for r in raw_to.replace(";", ",").split(",") if r.strip()]
+                    if not recipients:
+                        self.root.after(0, lambda: messagebox.showwarning("Incomplete", "Please specify a valid recipient email address."))
+                        return
                     
                     msg = MIMEMultipart()
                     msg['From'] = user
@@ -3222,14 +3274,66 @@ class ModbusApp:
                     msg['Subject'] = "TempTrek Environmental Monitoring System Test Mail"
                     msg.attach(MIMEText("This is a test email from the TempTrek Environmental Monitoring System.", 'plain'))
                     
-                    if port == 465:
-                        server = smtplib.SMTP_SSL(host, port)
-                    else:
-                        server = smtplib.SMTP(host, port)
-                        server.starttls()
+                    # Build list of host/port combinations to try automatically
+                    domain = user.split('@')[-1] if '@' in user else ''
                     
-                    server.login(user, pwd)
+                    candidate_targets = [(host, port)]
+                    alt_p = 587 if port == 465 else (465 if port == 587 else 587)
+                    if (host, alt_p) not in candidate_targets:
+                        candidate_targets.append((host, alt_p))
                     
+                    # Add domain-specific candidate hosts for custom domains
+                    if domain and '.' in domain:
+                        cpanel_host = f"mail.{domain}"
+                        if (cpanel_host, 465) not in candidate_targets:
+                            candidate_targets.append((cpanel_host, 465))
+                        if (cpanel_host, 587) not in candidate_targets:
+                            candidate_targets.append((cpanel_host, 587))
+                        if ("smtp.office365.com", 587) not in candidate_targets:
+                            candidate_targets.append(("smtp.office365.com", 587))
+                        if ("smtpout.secureserver.net", 465) not in candidate_targets:
+                            candidate_targets.append(("smtpout.secureserver.net", 465))
+                        if ("smtpout.secureserver.net", 587) not in candidate_targets:
+                            candidate_targets.append(("smtpout.secureserver.net", 587))
+
+                    server = None
+                    used_host = host
+                    used_port = port
+                    last_err = None
+
+                    for h_cand, p_cand in candidate_targets:
+                        srv, p_res, err = try_smtp_connect(h_cand, p_cand)
+                        if srv is not None:
+                            server = srv
+                            used_host = h_cand
+                            used_port = p_cand
+                            last_err = None
+                            break
+                        else:
+                            last_err = err
+
+                    if server is None:
+                        if isinstance(last_err, smtplib.SMTPServerDisconnected):
+                            err_msg = (f"Connection unexpectedly closed by mail server ({host}:{port}).\n\n"
+                                       "Most Likely Causes & Solutions:\n\n"
+                                       "1. INCORRECT USERNAME OR PASSWORD:\n"
+                                       "   GoDaddy and security-hardened mail servers immediately drop the connection when given invalid credentials.\n\n"
+                                       "2. SERVER HOST / DOMAIN CONFIGURATION:\n"
+                                       "   - GoDaddy cPanel Webmail: Host is usually 'mail." + (domain if domain else "yourdomain.com") + "' (Port 465 or 587).\n"
+                                       "   - GoDaddy Microsoft 365: Host is 'smtp.office365.com' (Port 587 TLS).\n"
+                                       "   - GoDaddy Workspace: Host is 'smtpout.secureserver.net' (Port 587 or 465).\n\n"
+                                       "3. GMAIL / GOOGLE WORKSPACE:\n"
+                                       "   Must use a 16-character 'App Password' instead of your standard password.\n\n"
+                                       "4. PORT & FIREWALL:\n"
+                                       "   Check if antivirus or network firewall is blocking outgoing SMTP traffic.")
+                            self.root.after(0, lambda: messagebox.showerror("Failure", err_msg))
+                        elif isinstance(last_err, smtplib.SMTPAuthenticationError):
+                            err_msg = f"Authentication failed for {user}.\nPlease check your username and password (or Gmail App Password)."
+                            self.root.after(0, lambda: messagebox.showerror("Failure", err_msg))
+                        else:
+                            self.root.after(0, lambda: messagebox.showerror("Failure", f"Test failed: {str(last_err)}"))
+                        return
+
                     # Send individual emails to ensure delivery with strict servers
                     for recipient in recipients:
                         # Update the To header for each recipient
@@ -3237,14 +3341,37 @@ class ModbusApp:
                         server.sendmail(user, recipient, msg.as_string())
                         
                     server.quit()
-                    self.root.after(0, lambda: messagebox.showinfo("Success", "Test email sent successfully!"))
+                    
+                    if used_host != host or used_port != port:
+                        def apply_auto_discovered():
+                            self.email_host.delete(0, tk.END)
+                            self.email_host.insert(0, used_host)
+                            self.email_port.delete(0, tk.END)
+                            self.email_port.insert(0, str(used_port))
+                            messagebox.showinfo("Success", f"Test email sent successfully using Host: {used_host} (Port {used_port})!\n\nHost and Port fields have been auto-updated.")
+                        self.root.after(0, apply_auto_discovered)
+                    else:
+                        self.root.after(0, lambda: messagebox.showinfo("Success", "Test email sent successfully!"))
                 elif stype == "IMAP":
-                    server = imaplib.IMAP4_SSL(host, port)
+                    if port == 993:
+                        server = imaplib.IMAP4_SSL(host, port, timeout=15)
+                    else:
+                        try:
+                            server = imaplib.IMAP4_SSL(host, port, timeout=15)
+                        except Exception:
+                            server = imaplib.IMAP4(host, port, timeout=15)
+                            server.starttls()
                     server.login(user, pwd)
                     server.logout()
                     self.root.after(0, lambda: messagebox.showinfo("Success", "IMAP connection successful!"))
                 elif stype == "POP3":
-                    server = poplib.POP3_SSL(host, port)
+                    if port == 995:
+                        server = poplib.POP3_SSL(host, port, timeout=15)
+                    else:
+                        try:
+                            server = poplib.POP3_SSL(host, port, timeout=15)
+                        except Exception:
+                            server = poplib.POP3(host, port, timeout=15)
                     server.user(user)
                     server.pass_(pwd)
                     server.quit()
@@ -3386,9 +3513,40 @@ class ModbusApp:
             return m.get(sym, sym)
 
         for alert in self.email_settings.get('alerts', []):
+            dev_ip = alert.get('device_ip', '')
+            slave_id = str(alert.get('slave_id', 1))
+            dev_alias = alert.get('device_alias', '')
+
+            matched_dev = None
+            for d in self.devices:
+                if str(d.get('ip')) == str(dev_ip) and str(d.get('slave_id', 1)) == slave_id:
+                    matched_dev = d
+                    break
+
+            if matched_dev and matched_dev.get('device_name'):
+                device_display = matched_dev.get('device_name')
+            elif dev_alias:
+                device_display = dev_alias
+            else:
+                device_display = dev_ip
+
+            reg_id = str(alert.get('reg', ''))
+            reg_display = ""
+            if matched_dev:
+                reg_display = matched_dev.get('names', {}).get(reg_id, '')
+
+            if not reg_display:
+                reg_info = alert.get('reg_name', '')
+                if "(" in reg_info and ")" in reg_info:
+                    reg_display = reg_info[reg_info.find("(")+1 : reg_info.find(")")]
+                elif reg_info:
+                    reg_display = reg_info
+                else:
+                    reg_display = f"Reg {reg_id}" if reg_id else "N/A"
+
             self.rules_tree.insert("", "end", values=(
-                alert.get('device_ip'),
-                alert.get('reg'),
+                device_display,
+                reg_display,
                 get_display_cond(alert.get('condition')),
                 alert.get('threshold'),
                 f"{alert.get('interval', '0')} min",
@@ -3541,27 +3699,33 @@ class ModbusApp:
 
         with self.alert_lock:
             was_active = self.active_alerts.get(alert_id, False)
+            last_sent_time = self.email_cooldowns.get(alert_id, 0)
             
-            if is_triggered and not was_active:
-                # TRANSITION: Normal -> Alert (Check for Cooldown first)
-                last_norm_time = self.email_cooldowns.get(alert_id, 0)
-                if time.time() - last_norm_time < interval_secs:
-                    # In cooldown period, don't trigger yet
+            if is_triggered:
+                # Check for cooldown based on when the last alert email was SENT
+                if time.time() - last_sent_time < interval_secs:
+                    # Still in cooldown window, skip email
                     return
 
-                self.active_alerts[alert_id] = True
-                self.log(f"ALERT DETECTED: {alert.get('device_ip')} Reg {alert.get('reg')} value {float(current_value):.3f}")
-                threading.Thread(target=self.send_email_async, args=(alert, current_value), daemon=True).start()
+                if not was_active or (interval_secs > 0 and time.time() - last_sent_time >= interval_secs):
+                    self.active_alerts[alert_id] = True
+                    self.email_cooldowns[alert_id] = time.time()
+                    formatted_val = safe_format_val(current_value)
+                    self.log(f"ALERT DETECTED: {alert.get('device_ip')} Reg {alert.get('reg')} value {formatted_val}")
+                    threading.Thread(target=self.send_email_async, args=(alert, current_value), daemon=True).start()
                 
             elif not is_triggered and was_active:
-                # TRANSITION: Alert -> Normal (Reset state, and START cooldown)
+                # TRANSITION: Alert -> Normal (Reset state only, DO NOT overwrite last_sent_time cooldown clock)
                 self.active_alerts[alert_id] = False
-                self.email_cooldowns[alert_id] = time.time()
-                self.log(f"NORMAL RESTORED: {alert.get('device_ip')} Reg {alert.get('reg')} value {float(current_value):.3f}")
+                formatted_val = safe_format_val(current_value)
+                self.log(f"NORMAL RESTORED: {alert.get('device_ip')} Reg {alert.get('reg')} value {formatted_val}")
 
     def send_email_async(self, alert, current_value):
         s = self.email_settings
         
+        formatted_val = safe_format_val(current_value)
+        formatted_thresh = safe_format_val(alert.get('threshold'))
+
         # 1. Prepare Metadata for both Log and Email
         reg_info = alert.get('reg_name', f"Register {alert.get('reg')}")
         only_reg_name = reg_info
@@ -3570,7 +3734,7 @@ class ModbusApp:
         
         dev_alias = alert.get('device_alias', '')
         if not dev_alias:
-            for d in self.devices:
+            for d in list(self.devices):
                 if str(d['ip']) == str(alert.get('device_ip')) and str(d.get('slave_id', 1)) == str(alert.get('slave_id', 1)):
                     dev_alias = d.get('device_name', '')
                     break
@@ -3582,15 +3746,15 @@ class ModbusApp:
             dev_alias,
             only_reg_name,
             alert.get('reg', 'N/A'),
-            f"{float(current_value):.3f}",
+            formatted_val,
             alert.get('condition', ''),
-            f"{float(alert.get('threshold')):.3f}"
+            formatted_thresh
         )
         # Live Update UI
         ts_now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self.root.after(0, lambda: self._append_alarm_live([
             ts_now, dev_alias, only_reg_name, alert.get('reg', 'N/A'),
-            f"{float(current_value):.3f}", alert.get('condition', ''), f"{float(alert.get('threshold')):.3f}"
+            formatted_val, alert.get('condition', ''), formatted_thresh
         ]))
 
         # 3. Check if actual Email sending is enabled
@@ -3617,13 +3781,13 @@ class ModbusApp:
             
             title_line = "SYSTEM ALERT NOTIFICATION"
             tpl = alert.get('template', "Alert: {name} reached {value} at {time}")
-            status_block = tpl.replace("{name}", full_name).replace("{value}", f"{float(current_value):.3f}").replace("{time}", ts_str).replace("{ip}", alert.get('device_ip', '0.0.0.0'))
+            status_block = tpl.replace("{name}", full_name).replace("{value}", formatted_val).replace("{time}", ts_str).replace("{ip}", alert.get('device_ip', '0.0.0.0'))
 
             body = (f"{title_line}\n"
                     f"================================\n"
                     f"{status_block}\n"
                     f"================================\n"
-                    f"Condition: {alert.get('condition')} {float(alert.get('threshold')):.3f}\n"
+                    f"Condition: {alert.get('condition')} {formatted_thresh}\n"
                     f"Time of Event: {ts_str}\n"
                     f"================================")
             
@@ -3634,19 +3798,65 @@ class ModbusApp:
             try: smtp_port = int(smtp_port_raw)
             except: smtp_port = 587
             
-            if smtp_port == 465:
-                server = smtplib.SMTP_SSL(smtp_server, smtp_port)
-            else:
-                server = smtplib.SMTP(smtp_server, smtp_port)
-                server.starttls()
-                
-            server.login(s.get('sender_email', ''), s.get('sender_password', ''))
+            sender_usr = s.get('sender_email', '').strip()
+            sender_pwd = s.get('sender_password', '').strip()
+
+            def try_smtp_connect(target_host, target_port):
+                for unverified in [False, True]:
+                    if unverified:
+                        ssl_ctx = ssl._create_unverified_context()
+                    else:
+                        try:
+                            ssl_ctx = ssl.create_default_context()
+                        except Exception:
+                            ssl_ctx = ssl._create_unverified_context()
+                    try:
+                        if target_port == 465:
+                            srv = smtplib.SMTP_SSL(target_host, target_port, timeout=15, context=ssl_ctx)
+                        else:
+                            srv = smtplib.SMTP(target_host, target_port, timeout=15)
+                            if srv.has_extn('STARTTLS') or target_port == 587:
+                                srv.starttls(context=ssl_ctx)
+                        srv.login(sender_usr, sender_pwd)
+                        return srv, target_port, None
+                    except (ssl.SSLError, ssl.SSLCertVerificationError) as ssl_err:
+                        if not unverified:
+                            continue
+                        return None, target_port, ssl_err
+                    except Exception as err:
+                        return None, target_port, err
+                return None, target_port, Exception("Connection failed")
+
+            domain = sender_usr.split('@')[-1] if '@' in sender_usr else ''
+            candidate_targets = [(smtp_server, smtp_port)]
+            alt_p = 587 if smtp_port == 465 else (465 if smtp_port == 587 else 587)
+            if (smtp_server, alt_p) not in candidate_targets:
+                candidate_targets.append((smtp_server, alt_p))
             
+            if domain and '.' in domain:
+                cpanel_host = f"mail.{domain}"
+                if (cpanel_host, 465) not in candidate_targets: candidate_targets.append((cpanel_host, 465))
+                if (cpanel_host, 587) not in candidate_targets: candidate_targets.append((cpanel_host, 587))
+                if ("smtp.office365.com", 587) not in candidate_targets: candidate_targets.append(("smtp.office365.com", 587))
+
+            server = None
+            last_err = None
+            for h_cand, p_cand in candidate_targets:
+                srv, p_res, err = try_smtp_connect(h_cand, p_cand)
+                if srv is not None:
+                    server = srv
+                    break
+                else:
+                    last_err = err
+
+            if server is None:
+                raise last_err if last_err else Exception("Could not establish connection to mail server.")
+
             # Send individual emails to ensure delivery with strict servers
             for recipient in recipients:
                 # Update the To header for each recipient
                 msg.replace_header('To', recipient)
-                server.sendmail(s.get('sender_email', ''), recipient, msg.as_string())
+                server.sendmail(sender_usr, recipient, msg.as_string())
                 
             server.quit()
             
