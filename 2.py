@@ -1620,8 +1620,8 @@ class ModbusApp:
         self.trend_from_dt = trend_dt_selector("FROM", start_of_day, row2)
         self.trend_to_dt = trend_dt_selector("TO", now, row2)
 
-        tk.Button(row2, text="🔄 REFRESH VIEW", bg=self.COLORS["accent"], fg="black", 
-                  font=("Segoe UI", 8, "bold"), relief="flat", padx=15, pady=2,
+        tk.Button(row2, text="🔍 QUERY DATA", bg="#0288D1", fg="white", 
+                  font=("Segoe UI", 8, "bold"), relief="flat", padx=15, pady=2, cursor="hand2",
                   command=self.sync_trend_history).pack(side="left", padx=10)
 
         # Row 3: Limits and PDF
@@ -1680,6 +1680,7 @@ class ModbusApp:
         
         self.large_graph_canvas = tk.Canvas(graph_cnt, bg=self.COLORS["bg_dark"], highlightthickness=0)
         self.large_graph_canvas.pack(fill="both", expand=True, padx=20, pady=20)
+        self.large_graph_canvas.create_text(400, 200, text="Select Node & Parameters, set Date Range, then click '🔍 QUERY DATA' to display graph.", font=("Segoe UI", 11, "bold"), fill=self.COLORS["text_dim"])
 
         # Table View Content
         table_cnt = tk.Frame(self.trend_table_tab, bg=self.COLORS["bg_surface"], highlightbackground=self.COLORS["bg_highlight"], highlightthickness=1)
@@ -1753,7 +1754,6 @@ class ModbusApp:
                     self.combo_val_var.set(f"{len(selected_names)} Parameters Selected")
 
                 self.selected_trend_lids = lids
-                self.sync_trend_history()
 
         self.trend_dev_cb.bind("<<ComboboxSelected>>", _on_dev_change)
         
@@ -3164,7 +3164,7 @@ class ModbusApp:
             f_pdf_sched = tk.Frame(left, bg=self.COLORS["bg_surface"])
             f_pdf_sched.pack(fill="x", pady=6)
             tk.Label(f_pdf_sched, text="SCHEDULED PDF REPORT INTERVAL", font=("Segoe UI", 8, "bold"), fg=self.COLORS["accent"], bg=self.COLORS["bg_surface"]).pack(anchor="w")
-            self.scheduled_pdf_cb = ttk.Combobox(f_pdf_sched, values=["Disabled", "30 Mins", "1 Hour", "6 Hours", "12 Hours", "24 Hours"], style="TCombobox", state="readonly")
+            self.scheduled_pdf_cb = ttk.Combobox(f_pdf_sched, values=["Disabled", "5 Mins", "30 Mins", "1 Hour", "6 Hours", "12 Hours", "24 Hours"], style="TCombobox", state="readonly")
             self.scheduled_pdf_cb.set(s.get('scheduled_pdf_interval', 'Disabled'))
             self.scheduled_pdf_cb.pack(fill="x", pady=(2, 0))
 
@@ -4130,6 +4130,7 @@ class ModbusApp:
             return
 
         interval_map = {
+            "5 Mins": 300,
             "30 Mins": 1800,
             "1 Hour": 3600,
             "6 Hours": 21600,
@@ -4154,10 +4155,10 @@ class ModbusApp:
             threading.Thread(target=self.send_scheduled_pdf_email, args=(interval_str, interval_sec), daemon=True).start()
 
     def send_scheduled_pdf_now(self):
-        interval_str = self.email_settings.get('scheduled_pdf_interval', '30 Mins')
+        interval_str = self.email_settings.get('scheduled_pdf_interval', '5 Mins')
         if interval_str == 'Disabled':
-            interval_str = '30 Mins'
-        interval_map = {"30 Mins": 1800, "1 Hour": 3600, "6 Hours": 21600, "12 Hours": 43200, "24 Hours": 86400}
+            interval_str = '5 Mins'
+        interval_map = {"5 Mins": 300, "30 Mins": 1800, "1 Hour": 3600, "6 Hours": 21600, "12 Hours": 43200, "24 Hours": 86400}
         interval_sec = interval_map.get(interval_str, 3600)
         threading.Thread(target=self.send_scheduled_pdf_email, args=(interval_str, interval_sec), daemon=True).start()
         messagebox.showinfo("Report Email Dispatched", f"Generating PDF data report for the past {interval_str} and sending via email in the background...")
@@ -4179,78 +4180,244 @@ class ModbusApp:
 
         try:
             if HAS_REPORTLAB:
-                c = canvas.Canvas(target_pdf, pagesize=landscape(letter))
-                w, h = landscape(letter)
-                
-                matching_logs = []
+                p_size = landscape(letter)
+                c = canvas.Canvas(target_pdf, pagesize=p_size)
+                w, h = p_size
+
                 date_str_now = to_dt.strftime("%Y-%m-%d")
                 date_str_prev = from_dt.strftime("%Y-%m-%d")
-                target_csv_files = set([
-                    os.path.join(DATA_PATH, "live", f"Log_{date_str_now}.csv"),
-                    os.path.join(DATA_PATH, "live", f"Log_{date_str_prev}.csv")
-                ])
+                target_dates = set([date_str_now, date_str_prev])
+                live_dir = os.path.join(DATA_PATH, "live")
 
-                for fn in target_csv_files:
-                    if os.path.exists(fn):
-                        try:
-                            with open(fn, "r", encoding='utf-8', errors='replace') as f:
-                                reader = csv.reader((line.replace('\0', '') for line in f))
-                                header = next(reader, None)
-                                for row in reader:
-                                    if len(row) >= 9:
-                                        try:
-                                            row_dt = datetime.strptime(row[8], "%Y-%m-%d %H:%M:%S")
-                                            if from_dt <= row_dt <= to_dt:
-                                                matching_logs.append(row)
-                                        except Exception: pass
-                        except Exception: pass
-
-                matching_logs.sort(key=lambda x: x[8])
-
-                def draw_report_hdr(curr_page):
-                    c.setFillColorRGB(0.05, 0.08, 0.12); c.rect(0, 0, w, h, fill=1)
-                    c.setFillColorRGB(0, 0.7, 1.0); c.setFont("Helvetica-Bold", 18)
-                    c.drawString(40, h-45, "TempTrek Environmental Monitoring System")
-                    c.setFillColorRGB(1, 1, 1); c.setFont("Helvetica", 9)
-                    c.drawString(40, h-65, f"PERIODIC PDF REPORT ({interval_str.upper()}) | Window: {from_dt.strftime('%Y-%m-%d %H:%M')} to {to_dt.strftime('%Y-%m-%d %H:%M')} | Page: {curr_page}")
-                    c.setStrokeColorRGB(0, 0.7, 1.0); c.setLineWidth(1.5); c.line(40, h-75, w-40, h-75)
-                    
-                    c.setFont("Helvetica-Bold", 9); c.setFillColorRGB(0.85, 0.85, 0.85)
-                    yh = h - 95
-                    labels = [("S.NO", 40), ("DEVICE NAME", 85), ("IP", 210), ("FIELD NAME", 330), 
-                              ("ADDR", 470), ("READING", 520), ("UNIT", 610), ("TYPE", 660), ("TIME", 725)]
-                    for lbl, lx in labels: c.drawString(lx, yh, lbl)
-                    c.setLineWidth(0.5); c.line(40, yh-5, w-40, yh-5)
-                    return yh - 22
-
-                page_num = 1
-                y_pos = draw_report_hdr(page_num)
-                
-                if matching_logs:
-                    for idx, e in enumerate(matching_logs):
-                        val_text = str(e[5])
-                        is_alert = any(k in val_text for k in ["SUCCESS:", "FAILURE:", "ALERT:"]) or "Error" in val_text
-                        c.setFillColorRGB(1, 0.2, 0.2) if is_alert else c.setFillColorRGB(0.95, 0.95, 0.95)
-                        c.setFont("Helvetica", 8)
-                        
-                        c.drawString(40, y_pos, str(idx+1))
-                        c.drawString(85, y_pos, str(e[1])[:20])
-                        c.drawString(210, y_pos, str(e[2])[:18])
-                        c.drawString(330, y_pos, str(e[3])[:20])
-                        c.drawString(470, y_pos, str(e[4]))
-                        c.drawString(520, y_pos, str(e[5])[:12])
-                        c.drawString(610, y_pos, str(e[6]))
-                        c.drawString(660, y_pos, str(e[7])[:15])
-                        c.drawString(725, y_pos, str(e[8]))
-                        
-                        y_pos -= 14
-                        if y_pos < 45:
-                            c.showPage()
-                            page_num += 1
-                            y_pos = draw_report_hdr(page_num)
+                device_list = list(self.devices)
+                if not device_list:
+                    c.setFillColorRGB(0.0, 0.36, 0.72); c.setFont("Helvetica-Bold", 18)
+                    c.drawString(40, h-50, "TempTrek Environmental Monitoring System")
+                    c.setFont("Helvetica", 9); c.setFillColorRGB(0.5, 0.5, 0.5)
+                    c.drawString(40, h-70, f"SCHEDULED REPORT ({interval_str.upper()}) | GENERATED: {to_dt.strftime('%Y-%m-%d %H:%M:%S')}")
+                    c.drawString(40, h-85, f"RANGE: {from_dt.strftime('%Y-%m-%d %H:%M')} TO {to_dt.strftime('%Y-%m-%d %H:%M')}")
+                    c.line(40, h-95, w-40, h-95)
+                    c.drawString(40, h-130, "No configured devices found.")
                 else:
-                    c.setFillColorRGB(0.9, 0.9, 0.9); c.setFont("Helvetica-Oblique", 10)
-                    c.drawString(40, y_pos, "No data records logged during this interval.")
+                    for dev_idx, dev in enumerate(device_list):
+                        if dev_idx > 0:
+                            c.showPage()
+
+                        ip, port, slave = dev['ip'], str(dev['port']), str(dev.get('slave_id', 1))
+                        d_alias = dev.get('device_name', ip)
+                        registers = [str(r) for r in dev.get('registers', [])]
+                        reg_names = [dev.get('names', {}).get(r, f"Reg {r}") for r in registers]
+                        num_params = len(reg_names)
+
+                        col_spacing = (w - 200) / (num_params if num_params > 0 else 1)
+                        f_size = 9 if num_params <= 6 else (8 if num_params <= 10 else 7)
+
+                        # Header
+                        c.setFillColorRGB(0.0, 0.36, 0.72); c.setFont("Helvetica-Bold", 18)
+                        c.drawString(40, h-50, "TempTrek Environmental Monitoring System")
+                        c.setFont("Helvetica", 9); c.setFillColorRGB(0.5, 0.5, 0.5)
+                        c.drawString(40, h-70, f"DEVICE: {d_alias} ({ip}:{port} @ Slave {slave}) | EXPORTED: {to_dt.strftime('%Y-%m-%d %H:%M:%S')}")
+                        c.drawString(40, h-85, f"PERIODIC REPORT ({interval_str.upper()}) | RANGE: {from_dt.strftime('%Y-%m-%d %H:%M')} TO {to_dt.strftime('%Y-%m-%d %H:%M')}")
+                        c.setStrokeColorRGB(0.0, 0.36, 0.72); c.setLineWidth(1.5)
+                        c.line(40, h-95, w-40, h-95)
+
+                        # Read historical CSV files for this device
+                        prefix = f"{ip.replace('.', '_')}_{port}_s{slave}"
+                        all_rows = []
+                        if os.path.exists(live_dir):
+                            for f in os.listdir(live_dir):
+                                if f.startswith(prefix) and any(d_str in f for d_str in target_dates) and f.endswith(".csv"):
+                                    sf = os.path.join(live_dir, f)
+                                    try:
+                                        with open(sf, 'r', encoding='utf-8', errors='replace') as f_in:
+                                            reader = csv.reader((line.replace('\0', '') for line in f_in))
+                                            next(reader, None)
+                                            for r_item in reader:
+                                                if len(r_item) >= 6:
+                                                    all_rows.append(r_item)
+                                    except: pass
+
+                        # Fallback/Merge with memory global_log for this device
+                        if hasattr(self, 'global_log'):
+                            for g in list(self.global_log):
+                                try:
+                                    if len(g) >= 9 and (g[2] == ip or g[1] == d_alias):
+                                        ts_raw = str(g[8])
+                                        ts_full = f"{date_str_now} {ts_raw}" if len(ts_raw) == 8 else ts_raw
+                                        r_addr = str(g[4])
+                                        val = str(g[5])
+                                        all_rows.append([ts_full, ip, port, slave, r_addr, val])
+                                except: pass
+
+                        # Pivot data by timestamp
+                        pivoted = {}
+                        for row in all_rows:
+                            try:
+                                ts_str = row[0]
+                                row_dt = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
+                                if from_dt <= row_dt <= to_dt:
+                                    r_addr, val = str(row[4]), str(row[5])
+                                    if r_addr in registers:
+                                        if ts_str not in pivoted: pivoted[ts_str] = {}
+                                        pivoted[ts_str][r_addr] = val
+                            except: pass
+
+                        # Build series data for Graph Preview
+                        all_series = []
+                        sorted_ts = sorted(pivoted.keys())
+                        for r_addr in registers:
+                            ser_vals = []
+                            for ts in sorted_ts:
+                                v_raw = pivoted[ts].get(r_addr)
+                                if v_raw is not None and v_raw != "---":
+                                    try: ser_vals.append(float(v_raw))
+                                    except: pass
+                            if ser_vals:
+                                all_series.append((r_addr, ser_vals))
+
+                        # --- Draw Graph Preview ---
+                        gw, gh = w - 80, 200
+                        gx, gy = 40, h - 310
+
+                        c.setFillColorRGB(0.98, 0.98, 0.99)
+                        c.rect(gx, gy, gw, gh, fill=1, stroke=1)
+                        c.setStrokeColorRGB(0.85, 0.85, 0.85); c.setLineWidth(0.5)
+
+                        c.setStrokeColorRGB(0.4, 0.4, 0.4); c.setLineWidth(0.5)
+                        c.line(gx+60, gy+40, gx+gw-150, gy+40)  # X-axis
+                        c.line(gx+60, gy+40, gx+60, gy+gh-30) # Y-axis
+
+                        if all_series:
+                            all_vals = [v for s in all_series for v in s[1]]
+                            glob_min, glob_max = min(all_vals), max(all_vals)
+                            if glob_min == glob_max: glob_min -= 5; glob_max += 5
+                            v_range = glob_max - glob_min
+                            max_len = max([len(s[1]) for s in all_series])
+
+                            plot_w = gw - 60 - 160
+                            plot_h = gh - 40 - 30
+
+                            # Y-Axis Labels & Grid
+                            c.setFont("Helvetica", 7); c.setFillColorRGB(0.4, 0.4, 0.4)
+                            for i in range(6):
+                                tick_val = glob_min + (i * v_range / 5)
+                                py = gy + 40 + (i * plot_h / 5)
+                                c.setStrokeColorRGB(0.88, 0.88, 0.88)
+                                c.line(gx+60, py, gx+60+plot_w, py)
+                                c.drawString(gx+15, py-2, f"{tick_val:.2f}")
+
+                            # Draw Data Lines
+                            palette = ["#D32F2F", "#28A745", "#4285F4", "#F29900", "#6F42C1"]
+                            for idx, (r_addr, s_data) in enumerate(all_series):
+                                color = palette[idx % len(palette)]
+                                r_col = int(color[1:3], 16)/255.0
+                                g_col = int(color[3:5], 16)/255.0
+                                b_col = int(color[5:7], 16)/255.0
+
+                                c.setStrokeColorRGB(r_col, g_col, b_col); c.setLineWidth(1.5)
+                                path = c.beginPath()
+                                for i, v in enumerate(s_data):
+                                    px = gx + 60 + (i * plot_w / (max_len-1 if max_len > 1 else 1))
+                                    py = gy + 40 + ((v - glob_min) * plot_h / v_range)
+                                    if i == 0: path.moveTo(px, py)
+                                    else: path.lineTo(px, py)
+                                c.drawPath(path)
+
+                            # Legend
+                            for idx, (r_addr, s_data) in enumerate(all_series):
+                                color = palette[idx % len(palette)]
+                                r_col = int(color[1:3], 16)/255.0
+                                g_col = int(color[3:5], 16)/255.0
+                                b_col = int(color[5:7], 16)/255.0
+
+                                leg_name = dev.get('names', {}).get(r_addr, f"Reg {r_addr}")
+                                ly_leg = gy + gh - 45 - (idx * 14)
+                                c.setFillColorRGB(r_col, g_col, b_col); c.rect(gx + gw - 140, ly_leg, 8, 8, fill=1, stroke=0)
+                                c.setFillColorRGB(0.2, 0.2, 0.2); c.setFont("Helvetica-Bold", 8)
+                                c.drawString(gx + gw - 125, ly_leg + 1, leg_name.upper())
+
+                        # --- DATA LOG TABLE ---
+                        curr_y = gy - 35
+                        c.setFillColorRGB(0.1, 0.1, 0.1); c.setFont("Helvetica-Bold", 10)
+                        c.drawString(40, curr_y, f"HISTORICAL DATA LOG (TIME WINDOW: {interval_str.upper()})")
+
+                        curr_y -= 25
+                        c.line(40, curr_y+15, w-40, curr_y+15)
+                        c.setFont("Helvetica-Bold", f_size)
+                        c.drawString(40, curr_y, "TIMESTAMP")
+                        for i, rname in enumerate(reg_names):
+                            c.drawString(180 + (i*col_spacing), curr_y, rname.upper())
+
+                        curr_y -= 30
+                        c.line(40, curr_y+18, w-40, curr_y+18)
+                        c.setFont("Helvetica", f_size)
+
+                        active_alerts = []
+                        for alert in self.email_settings.get('alerts', []):
+                            if str(alert.get('device_ip')) == str(ip) and str(alert.get('slave_id', 1)) == slave:
+                                active_alerts.append(alert)
+
+                        rows_found = 0
+                        for ts in sorted(pivoted.keys(), reverse=True):
+                            if curr_y < 50:
+                                c.showPage(); curr_y = h - 60
+                                c.setFillColorRGB(0.1, 0.1, 0.1); c.setFont("Helvetica-Bold", f_size)
+                                c.drawString(40, curr_y, "TIMESTAMP")
+                                for i, rname in enumerate(reg_names):
+                                    c.drawString(180 + (i*col_spacing), curr_y, rname.upper())
+                                curr_y -= 30
+                                c.line(40, curr_y+18, w-40, curr_y+18)
+                                c.setFont("Helvetica", f_size)
+
+                            row_has_alert = False
+                            for r_addr in registers:
+                                val = pivoted[ts].get(r_addr, "---")
+                                if val != "---":
+                                    try:
+                                        f_val = float(val)
+                                        for alert in active_alerts:
+                                            if str(alert.get('reg')) == str(r_addr):
+                                                cond = alert.get('condition')
+                                                thresh = float(alert.get('threshold'))
+                                                if (cond == ">" and f_val > thresh) or \
+                                                   (cond == "<" and f_val < thresh) or \
+                                                   (cond == "==" and f_val == thresh) or \
+                                                   ("Greater" in cond and f_val > thresh) or \
+                                                   ("Less" in cond and f_val < thresh) or \
+                                                   ("Upper" in cond and f_val > thresh) or \
+                                                   ("Low" in cond and f_val < thresh):
+                                                    row_has_alert = True; break
+                                        if row_has_alert: break
+                                    except: pass
+
+                            if row_has_alert:
+                                c.setFillColorRGB(0.85, 0.1, 0.1)
+                                c.setFont("Helvetica-Bold", f_size)
+                            else:
+                                c.setFillColorRGB(0.2, 0.2, 0.2)
+                                c.setFont("Helvetica", f_size)
+
+                            c.drawString(40, curr_y, ts)
+
+                            for i, r_addr in enumerate(registers):
+                                v = pivoted[ts].get(r_addr, "---")
+                                if v != "---":
+                                    try:
+                                        if dev.get('types', {}).get(str(r_addr)) == "BOOLEAN":
+                                            label_0 = dev.get('ops', {}).get(str(r_addr), "OFF")
+                                            label_1 = dev.get('factors', {}).get(str(r_addr), "ON")
+                                            v = label_0 if int(float(v)) == 0 else label_1
+                                        else:
+                                            prec = int(dev.get('decimals', {}).get(str(r_addr), 3))
+                                            v = f"{float(v):.{prec}f}"
+                                    except: pass
+                                c.drawString(180 + (i*col_spacing), curr_y, v)
+
+                            curr_y -= 15
+                            rows_found += 1
+
+                        if rows_found == 0:
+                            c.drawString(40, curr_y, "No historical data logged for this device in the specified interval.")
 
                 c.save()
         except Exception as ex:
@@ -5636,29 +5803,12 @@ class ModbusApp:
 
     def refresh_view_if_active(self):
         if self.active_view == "live_data": self.navigate("live_data")
-        elif self.active_view == "data_trends": self.sync_trend_history()
 
     def periodic_refresher(self):
         try:
             self.check_scheduled_pdf_email()
         except Exception:
             pass
-
-        if self.active_view == "data_trends" and hasattr(self, 'trend_to_dt'):
-            # Auto-update 'TO' time to current time
-            now = datetime.now()
-            try:
-                # Update comboboxes
-                self.trend_to_dt['y'].set(now.strftime("%Y"))
-                self.trend_to_dt['m'].set(now.strftime("%m"))
-                self.trend_to_dt['d'].set(now.strftime("%d"))
-                self.trend_to_dt['h'].set(now.strftime("%H"))
-                self.trend_to_dt['min'].set(now.strftime("%M"))
-                
-                # Fetch new data
-                self.sync_trend_history()
-            except Exception:
-                pass
         
         self.root.after(1000, self.periodic_refresher)
 
