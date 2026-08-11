@@ -6,7 +6,8 @@ import json
 import os
 import csv
 import webbrowser
-from datetime import datetime
+from datetime import datetime, timedelta
+from collections import deque
 import random
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
@@ -43,6 +44,7 @@ import requests
 import subprocess
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+from email.mime.application import MIMEApplication
 
 def resource_path(relative_path):
     """ Get absolute path to resource, works for dev and for PyInstaller """
@@ -266,7 +268,7 @@ def load_users():
     default_admin = {
         "admin": {
             "password": default_h,
-            "permissions": ["live_data", "add_device", "live_log", "email_config", "email_smtp_config", "export_data", "data_trends", "user_manager"],
+            "permissions": ["live_data", "add_device", "live_log", "email_config", "email_smtp_config", "export_data", "data_trends", "user_manager", "audit_log"],
             "is_admin": True
         }
     }
@@ -288,7 +290,7 @@ def load_users():
             if "admin" not in users:
                 users["admin"] = default_admin["admin"]
             
-            all_perms = ["live_data", "add_device", "live_log", "email_config", "email_smtp_config", "export_data", "data_trends", "user_manager"]
+            all_perms = ["live_data", "add_device", "live_log", "email_config", "email_smtp_config", "export_data", "data_trends", "user_manager", "audit_log"]
             for p in all_perms:
                 if p not in users["admin"]["permissions"]:
                     users["admin"]["permissions"].append(p)
@@ -399,6 +401,27 @@ def write_email_log_csv(dev_name, field_name, recipient, status):
                     field_name, 
                     recipient, 
                     status
+                ])
+            break
+        except Exception:
+            time.sleep(0.1)
+
+def write_audit_log_csv(username, action, category, details):
+    date_str = datetime.now().strftime("%Y-%m-%d")
+    filename = os.path.join(DATA_PATH, "live", f"Audit_Logs_{date_str}.csv")
+    for attempt in range(3):
+        exists = os.path.exists(filename)
+        try:
+            with open(filename, "a", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                if not exists:
+                    writer.writerow(["Timestamp", "Username", "Action", "Category", "Details"])
+                writer.writerow([
+                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"), 
+                    username, 
+                    action, 
+                    category, 
+                    details
                 ])
             break
         except Exception:
@@ -833,9 +856,10 @@ class ModbusApp:
         self.ip_locks = {}
         self.shared_clients = {} # (host, port) -> ModbusTcpClient
         
-        # User Authentication
+        # User Authentication & Audit Log
         self.users = load_users()
         self.current_user = None
+        self.global_audit_log = deque(maxlen=2000)
 
         # Live Real-time Analytics
         self.data_history = {}  # { lid: [val1, val2, ...] }
@@ -857,6 +881,98 @@ class ModbusApp:
         self.active_view = "live_data"
         self.check_initial_license()
         self.periodic_refresher()
+
+    def log_audit(self, action, category, details, user=None):
+        username = user if user else (getattr(self, 'current_user', None) or 'SYSTEM')
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        write_audit_log_csv(username, action, category, details)
+        entry = (ts, username, action, category, details)
+        self.global_audit_log.append(entry)
+        if hasattr(self, 'audit_tree') and self.audit_tree and self.audit_tree.winfo_exists():
+            self.root.after(0, lambda: self._append_audit_live(entry))
+
+    def _append_audit_live(self, entry):
+        try:
+            if hasattr(self, 'audit_tree') and self.audit_tree and self.audit_tree.winfo_exists():
+                self.audit_tree.insert("", 0, values=entry)
+        except Exception:
+            pass
+
+    def compute_device_diff(self, old_dev, new_dev):
+        changes = []
+        # Header level checks
+        if old_dev.get("device_name") != new_dev.get("device_name"):
+            changes.append(f"Name: '{old_dev.get('device_name')}' -> '{new_dev.get('device_name')}'")
+        if old_dev.get("ip") != new_dev.get("ip") or old_dev.get("port") != new_dev.get("port"):
+            changes.append(f"Network: {old_dev.get('ip')}:{old_dev.get('port')} -> {new_dev.get('ip')}:{new_dev.get('port')}")
+        if old_dev.get("slave_id") != new_dev.get("slave_id"):
+            changes.append(f"Slave ID: {old_dev.get('slave_id')} -> {new_dev.get('slave_id')}")
+        if str(old_dev.get("poll_interval")) != str(new_dev.get("poll_interval")):
+            changes.append(f"Poll Interval: {old_dev.get('poll_interval')}s -> {new_dev.get('poll_interval')}s")
+
+        # Register level checks
+        old_regs = [str(r) for r in old_dev.get("registers", [])]
+        new_regs = [str(r) for r in new_dev.get("registers", [])]
+
+        added_regs = [r for r in new_regs if r not in old_regs]
+        removed_regs = [r for r in old_regs if r not in new_regs]
+
+        if added_regs:
+            changes.append(f"Added Regs: [{', '.join(added_regs)}]")
+        if removed_regs:
+            changes.append(f"Removed Regs: [{', '.join(removed_regs)}]")
+
+        code_map = {"FC01": "Output Coil", "FC02": "Input Coil", "FC03": "Holding Register", "FC04": "Input Register"}
+
+        common_regs = [r for r in new_regs if r in old_regs]
+        for r in common_regs:
+            reg_diffs = []
+            # Name
+            old_n = old_dev.get("names", {}).get(r, "")
+            new_n = new_dev.get("names", {}).get(r, "")
+            if old_n != new_n:
+                reg_diffs.append(f"Name: '{old_n}' -> '{new_n}'")
+
+            # Unit
+            old_u = old_dev.get("units", {}).get(r, "")
+            new_u = new_dev.get("units", {}).get(r, "")
+            if old_u != new_u:
+                reg_diffs.append(f"Unit: '{old_u}' -> '{new_u}'")
+
+            # Type
+            old_t = old_dev.get("types", {}).get(r, "FLOAT32")
+            new_t = new_dev.get("types", {}).get(r, "FLOAT32")
+            if old_t != new_t:
+                reg_diffs.append(f"Type: '{old_t}' -> '{new_t}'")
+
+            # Mode
+            old_m_raw = old_dev.get("modes", {}).get(r, "FC04")
+            new_m_raw = new_dev.get("modes", {}).get(r, "FC04")
+            old_m = code_map.get(old_m_raw, old_m_raw)
+            new_m = code_map.get(new_m_raw, new_m_raw)
+            if old_m != new_m:
+                reg_diffs.append(f"Mode: '{old_m}' -> '{new_m}'")
+
+            # Math Formula (op & factor)
+            old_op = old_dev.get("ops", {}).get(r, "/")
+            old_f = old_dev.get("factors", {}).get(r, "1")
+            new_op = new_dev.get("ops", {}).get(r, "/")
+            new_f = new_dev.get("factors", {}).get(r, "1")
+            old_math = f"0={old_op}/1={old_f}" if old_t == "BOOLEAN" else f"{old_op} {old_f}"
+            new_math = f"0={new_op}/1={new_f}" if new_t == "BOOLEAN" else f"{new_op} {new_f}"
+            if old_math != new_math:
+                reg_diffs.append(f"Math: '{old_math}' -> '{new_math}'")
+
+            # Decimals
+            old_d = str(old_dev.get("decimals", {}).get(r, "3"))
+            new_d = str(new_dev.get("decimals", {}).get(r, "3"))
+            if old_d != new_d:
+                reg_diffs.append(f"Decimals: '{old_d}' -> '{new_d}'")
+
+            if reg_diffs:
+                changes.append(f"Reg {r} ({', '.join(reg_diffs)})")
+
+        return "; ".join(changes) if changes else "No parameter changes"
 
     def check_initial_license(self):
         """ Checks for local license; if not found, shows activation screen. """
@@ -976,6 +1092,9 @@ class ModbusApp:
     # 2. LOGIN SCREEN
     # -------------------------
     def show_login(self):
+        if hasattr(self, 'current_user') and self.current_user:
+            self.log_audit("LOGOUT", "AUTHENTICATION", f"User '{self.current_user.upper()}' logged out")
+            self.current_user = None
         self.clear_window()
         self.root.configure(bg=self.COLORS["bg_dark"])
         
@@ -1023,11 +1142,14 @@ class ModbusApp:
         if username in self.users:
             if self.users[username]["password"] == h:
                 self.current_user = username
+                self.log_audit("LOGIN", "AUTHENTICATION", f"User '{username.upper()}' logged in successfully", user=username)
                 self.build_main_ui()
             else:
+                self.log_audit("LOGIN_FAILED", "AUTHENTICATION", f"Failed login attempt for user '{username.upper()}' (invalid passcode)", user=username)
                 self.lbl_error.config(text="ACCESS DENIED: INVALID PASSCODE")
                 self.pass_entry.delete(0, tk.END)
         else:
+            self.log_audit("LOGIN_FAILED", "AUTHENTICATION", f"Failed login attempt for unknown user '{username.upper()}'", user=username)
             self.lbl_error.config(text="ACCESS DENIED: UNKNOWN USER")
             self.pass_entry.delete(0, tk.END)
 
@@ -1071,6 +1193,8 @@ class ModbusApp:
             self.create_nav_item("data_trends", "Historic Trends")
         if "user_manager" in user_perms:
             self.create_nav_item("user_manager", "System Users")
+        if "audit_log" in user_perms:
+            self.create_nav_item("audit_log", "Audit Log")
 
         footer = tk.Frame(self.sidebar, bg=self.COLORS["bg_surface"], pady=20)
         footer.pack(side="bottom", fill="x")
@@ -1216,7 +1340,8 @@ class ModbusApp:
             "data_trends": "HISTORIC TREND ANALYTICS",
             "user_manager": "USER MANAGEMENT",
             "email_alerts": "ALARM HISTORY",
-            "email_logs_view": "EMAIL SEND LOGS"
+            "email_logs_view": "EMAIL SEND LOGS",
+            "audit_log": "USER AUDIT LOG"
         }
         self.view_title.config(text=titles.get(view_name, ""))
 
@@ -1241,6 +1366,8 @@ class ModbusApp:
             self.show_email_logs_history()
         elif view_name == "user_manager":
             self.show_user_manager()
+        elif view_name == "audit_log":
+            self.show_audit_log()
 
     # -------------------------
     # VIEW: LIVE DATA
@@ -1970,6 +2097,7 @@ class ModbusApp:
                 c.drawString(40, curr_y, "No historical data available for selected registers.")
 
             c.save()
+            self.log_audit("TREND_EXPORT", "EXPORT", f"Exported trend report PDF for device '{clean_alias}' ({rows_found} records)")
             messagebox.showinfo("Success", f"Trend report saved to {target_file}")
             webbrowser.open(target_file)
             
@@ -2426,7 +2554,8 @@ class ModbusApp:
             ("email_smtp_config", "Gmail Configuration"),
             ("export_data", "Data Export"),
             ("data_trends", "Historic Trends"),
-            ("user_manager", "User Manager")
+            ("user_manager", "User Manager"),
+            ("audit_log", "Audit Log")
         ]
         
         for pid, pname in perms:
@@ -2520,11 +2649,24 @@ class ModbusApp:
         # Maintain admin status if updating
         is_admin = self.users[uname].get("is_admin", False) if is_update else (uname == "admin")
         
-        # Only update password if provided
-        if upass:
-            h = hashlib.sha256(upass.encode()).hexdigest()
+        if is_update:
+            old_user = self.users.get(uname, {})
+            old_perms = old_user.get("permissions", [])
+            added = [p for p in selected_perms if p not in old_perms]
+            removed = [p for p in old_perms if p not in selected_perms]
+            changes = []
+            if upass:
+                changes.append("Passcode updated")
+            if added:
+                changes.append(f"Added perms: [{', '.join(added)}]")
+            if removed:
+                changes.append(f"Removed perms: [{', '.join(removed)}]")
+            diff_str = "; ".join(changes) if changes else "No permission/passcode changes"
+            audit_msg = f"Updated user '{uname.upper()}': {diff_str}"
+            act = "USER_UPDATE"
         else:
-            h = self.users[uname]["password"]
+            audit_msg = f"Created user '{uname.upper()}' (Permissions: [{', '.join(selected_perms)}])"
+            act = "USER_CREATE"
 
         self.users[uname] = {
             "password": h,
@@ -2533,6 +2675,7 @@ class ModbusApp:
         }
         
         save_users(self.users)
+        self.log_audit(act, "USER_MGMT", audit_msg)
         self.refresh_user_list()
         self.u_manager_name.delete(0, tk.END)
         self.u_manager_pass.delete(0, tk.END)
@@ -2552,8 +2695,10 @@ class ModbusApp:
             return
         
         if messagebox.askyesno("Confirm", f"Remove user {uname.upper()}?"):
-            del self.users[uname]
+            removed_user = self.users.pop(uname, {})
+            old_perms = removed_user.get("permissions", [])
             save_users(self.users)
+            self.log_audit("USER_DELETE", "USER_MGMT", f"Deleted user '{uname.upper()}' (Had permissions: [{', '.join(old_perms)}])")
             self.refresh_user_list()
 
     def render_device_block(self, parent, dev):
@@ -3015,6 +3160,14 @@ class ModbusApp:
             self.recipient_email, self.f_recip = fld("RECIPIENT EMAIL", initial=s.get('recipient_email', ''))
             self.email_subject, self.f_sub = fld("EMAIL SUBJECT", initial=s.get('subject', ''))
 
+            # Scheduled PDF Report Interval Selection
+            f_pdf_sched = tk.Frame(left, bg=self.COLORS["bg_surface"])
+            f_pdf_sched.pack(fill="x", pady=6)
+            tk.Label(f_pdf_sched, text="SCHEDULED PDF REPORT INTERVAL", font=("Segoe UI", 8, "bold"), fg=self.COLORS["accent"], bg=self.COLORS["bg_surface"]).pack(anchor="w")
+            self.scheduled_pdf_cb = ttk.Combobox(f_pdf_sched, values=["Disabled", "30 Mins", "1 Hour", "6 Hours", "12 Hours", "24 Hours"], style="TCombobox", state="readonly")
+            self.scheduled_pdf_cb.set(s.get('scheduled_pdf_interval', 'Disabled'))
+            self.scheduled_pdf_cb.pack(fill="x", pady=(2, 0))
+
             def update_server_fields(event=None):
                 stype = self.server_type_cb.get()
                 self.email_host.delete(0, tk.END)
@@ -3053,10 +3206,13 @@ class ModbusApp:
             update_server_fields() # Initial call
 
             tk.Button(left, text="SAVE SETTINGS", bg=self.COLORS["accent"], fg="black", font=self.FONTS["button"], 
-                      relief="flat", padx=20, pady=10, command=self.save_email_settings_ui).pack(fill="x", pady=(20, 10))
+                      relief="flat", padx=20, pady=10, command=self.save_email_settings_ui).pack(fill="x", pady=(20, 5))
             
-            tk.Button(left, text="TEST MAIL / CONNETION", bg=self.COLORS["success"], fg="white", font=self.FONTS["button"], 
-                      relief="flat", padx=20, pady=10, command=self.test_email_config).pack(fill="x", pady=5)
+            tk.Button(left, text="TEST MAIL / CONNECTION", bg=self.COLORS["success"], fg="white", font=self.FONTS["button"], 
+                      relief="flat", padx=20, pady=8, command=self.test_email_config).pack(fill="x", pady=4)
+
+            tk.Button(left, text="📄 SEND SCHEDULED PDF REPORT NOW", bg="#0288D1", fg="white", font=self.FONTS["button"], 
+                      relief="flat", padx=20, pady=8, command=self.send_scheduled_pdf_now).pack(fill="x", pady=4)
         
             # Email Enable Toggle
             self.email_enabled_var = tk.BooleanVar(value=s.get('email_enabled', True))
@@ -3190,6 +3346,7 @@ class ModbusApp:
         self.refresh_rules_list()
 
     def save_email_settings_ui(self):
+        old_settings = dict(self.email_settings)
         stype = self.server_type_cb.get()
         self.email_settings['server_type'] = stype
         self.email_settings['sender_email'] = self.sender_email.get().strip()
@@ -3208,7 +3365,28 @@ class ModbusApp:
             self.email_settings['pop3_port'] = self.email_port.get().strip()
             
         self.email_settings['email_enabled'] = self.email_enabled_var.get()
+        if hasattr(self, 'scheduled_pdf_cb'):
+            self.email_settings['scheduled_pdf_interval'] = self.scheduled_pdf_cb.get()
+
         save_email_settings(self.email_settings)
+
+        changes = []
+        if old_settings.get('server_type') != stype:
+            changes.append(f"Type: {old_settings.get('server_type')} -> {stype}")
+        if old_settings.get('sender_email') != self.email_settings['sender_email']:
+            changes.append(f"Sender: '{old_settings.get('sender_email')}' -> '{self.email_settings['sender_email']}'")
+        if stype in ["Gmail", "SMTP"]:
+            if old_settings.get('recipient_email') != self.email_settings.get('recipient_email'):
+                changes.append(f"Recipients: '{old_settings.get('recipient_email')}' -> '{self.email_settings.get('recipient_email')}'")
+            if old_settings.get('smtp_server') != self.email_settings.get('smtp_server') or old_settings.get('smtp_port') != self.email_settings.get('smtp_port'):
+                changes.append(f"Server: {old_settings.get('smtp_server')}:{old_settings.get('smtp_port')} -> {self.email_settings.get('smtp_server')}:{self.email_settings.get('smtp_port')}")
+        if old_settings.get('email_enabled') != self.email_settings['email_enabled']:
+            changes.append(f"Notifications: {'Enabled' if self.email_settings['email_enabled'] else 'Disabled'}")
+        if old_settings.get('scheduled_pdf_interval') != self.email_settings.get('scheduled_pdf_interval'):
+            changes.append(f"Scheduled PDF Report: '{old_settings.get('scheduled_pdf_interval', 'Disabled')}' -> '{self.email_settings.get('scheduled_pdf_interval')}'")
+
+        diff_str = "; ".join(changes) if changes else "Saved email settings"
+        self.log_audit("EMAIL_CONFIG_SAVE", "ALARM", f"Updated Email Settings ({stype}): {diff_str}")
         messagebox.showinfo("Success", f"{stype} settings saved successfully.")
 
     def test_email_config(self):
@@ -3437,11 +3615,27 @@ class ModbusApp:
         sel = self.rules_tree.selection()
         if sel:
             idx = self.rules_tree.index(sel[0])
+            old_rule = self.email_settings['alerts'][idx]
+            changes = []
+            if old_rule.get('device_alias') != dev_alias:
+                changes.append(f"Device: '{old_rule.get('device_alias')}' -> '{dev_alias}'")
+            if str(old_rule.get('reg')) != str(reg) or old_rule.get('reg_name') != reg_raw:
+                changes.append(f"Register: {old_rule.get('reg')} -> {reg}")
+            if old_rule.get('condition') != cond_symbol or str(old_rule.get('threshold')) != str(thresh):
+                changes.append(f"Condition: ({old_rule.get('condition')} {old_rule.get('threshold')}) -> ({cond_symbol} {thresh})")
+            if str(old_rule.get('interval')) != str(interval):
+                changes.append(f"Interval: {old_rule.get('interval')}m -> {interval}m")
+            if old_rule.get('template') != (msg_tpl if msg_tpl else "{name} alert: {value}"):
+                changes.append("Template updated")
+
+            diff_str = "; ".join(changes) if changes else "Saved alert rule"
             self.email_settings['alerts'][idx] = new_rule
+            self.log_audit("ALERT_RULE_UPDATE", "ALARM", f"Updated alert rule for '{dev_alias}': {diff_str}")
             messagebox.showinfo("Success", "Alert rule updated.")
             self.rules_tree.selection_remove(sel[0])
         else:
             self.email_settings['alerts'].append(new_rule)
+            self.log_audit("ALERT_RULE_ADD", "ALARM", f"Added alert rule for '{dev_alias}' Reg {reg} (IF Value {cond_symbol} {thresh} THEN alert every {interval}m)")
             messagebox.showinfo("Success", "Alert rule added.")
             
         save_email_settings(self.email_settings)
@@ -3501,7 +3695,9 @@ class ModbusApp:
         sel = self.rules_tree.selection()
         if not sel: return
         idx = self.rules_tree.index(sel[0])
-        self.email_settings['alerts'].pop(idx)
+        removed = self.email_settings['alerts'].pop(idx)
+        alias = removed.get('device_alias', removed.get('device_ip'))
+        self.log_audit("ALERT_RULE_DELETE", "ALARM", f"Deleted alert rule for '{alias}' Reg {removed.get('reg')} (Condition: {removed.get('condition')} {removed.get('threshold')}, Interval: {removed.get('interval', '0')}m)")
         save_email_settings(self.email_settings)
         self.refresh_rules_list()
 
@@ -3564,6 +3760,7 @@ class ModbusApp:
         try:
             with open(filepath, "w") as f:
                 json.dump(self.devices, f, indent=4)
+            self.log_audit("DEVICE_EXPORT", "DEVICE", f"Exported device configuration to '{os.path.basename(filepath)}'")
             messagebox.showinfo("Success", "Device configuration exported successfully.")
         except Exception as e:
             messagebox.showerror("Error", f"Failed to export configuration: {e}")
@@ -3615,6 +3812,7 @@ class ModbusApp:
             
             save_devices(self.devices)
             self.refresh_device_list()
+            self.log_audit("DEVICE_IMPORT", "DEVICE", f"Imported device config ({'Replace' if ans else 'Merge'}) from '{os.path.basename(filepath)}'")
             messagebox.showinfo("Success", "Device configuration imported successfully. All active polling threads have been stopped. Please restart them as needed.")
         except Exception as e:
             messagebox.showerror("Error", f"Failed to import configuration: {e}")
@@ -3631,6 +3829,7 @@ class ModbusApp:
             alerts = self.email_settings.get('alerts', [])
             with open(filepath, "w") as f:
                 json.dump(alerts, f, indent=4)
+            self.log_audit("ALERT_RULE_EXPORT", "ALARM", f"Exported alarm rules to '{os.path.basename(filepath)}'")
             messagebox.showinfo("Success", "Alarm rules exported successfully.")
         except Exception as e:
             messagebox.showerror("Error", f"Failed to export alarm rules: {e}")
@@ -3683,6 +3882,7 @@ class ModbusApp:
             
             save_email_settings(self.email_settings)
             self.refresh_rules_list()
+            self.log_audit("ALERT_RULE_IMPORT", "ALARM", f"Imported alarm rules ({'Replace' if ans else 'Merge'}) from '{os.path.basename(filepath)}'")
             messagebox.showinfo("Success", "Alarm rules imported successfully.")
         except Exception as e:
             messagebox.showerror("Error", f"Failed to import alarm rules: {e}")
@@ -3871,6 +4071,246 @@ class ModbusApp:
             self.root.after(0, lambda: self.log(f"SUCCESS: Alert email sent at {datetime.now().strftime('%H:%M:%S')} for {full_name}"))
         except Exception as e:
             self.root.after(0, lambda: self.log(f"FAILURE: Email send failed: {e}"))
+
+    def _connect_smtp(self, sender_usr, sender_pwd, smtp_server, smtp_port):
+        def try_smtp_connect(target_host, target_port):
+            for unverified in [False, True]:
+                if unverified:
+                    ssl_ctx = ssl._create_unverified_context()
+                else:
+                    try:
+                        ssl_ctx = ssl.create_default_context()
+                    except Exception:
+                        ssl_ctx = ssl._create_unverified_context()
+                try:
+                    if target_port == 465:
+                        srv = smtplib.SMTP_SSL(target_host, target_port, timeout=15, context=ssl_ctx)
+                    else:
+                        srv = smtplib.SMTP(target_host, target_port, timeout=15)
+                        if srv.has_extn('STARTTLS') or target_port == 587:
+                            srv.starttls(context=ssl_ctx)
+                    srv.login(sender_usr, sender_pwd)
+                    return srv, target_port, None
+                except (ssl.SSLError, ssl.SSLCertVerificationError) as ssl_err:
+                    if not unverified:
+                        continue
+                    return None, target_port, ssl_err
+                except Exception as err:
+                    return None, target_port, err
+            return None, target_port, Exception("Connection failed")
+
+        domain = sender_usr.split('@')[-1] if '@' in sender_usr else ''
+        candidate_targets = [(smtp_server, smtp_port)]
+        alt_p = 587 if smtp_port == 465 else (465 if smtp_port == 587 else 587)
+        if (smtp_server, alt_p) not in candidate_targets:
+            candidate_targets.append((smtp_server, alt_p))
+        
+        if domain and '.' in domain:
+            cpanel_host = f"mail.{domain}"
+            if (cpanel_host, 465) not in candidate_targets: candidate_targets.append((cpanel_host, 465))
+            if (cpanel_host, 587) not in candidate_targets: candidate_targets.append((cpanel_host, 587))
+            if ("smtp.office365.com", 587) not in candidate_targets: candidate_targets.append(("smtp.office365.com", 587))
+
+        server = None
+        last_err = None
+        for h_cand, p_cand in candidate_targets:
+            srv, p_res, err = try_smtp_connect(h_cand, p_cand)
+            if srv is not None:
+                server = srv
+                break
+            else:
+                last_err = err
+
+        return server, last_err
+
+    def check_scheduled_pdf_email(self):
+        s = self.email_settings
+        interval_str = s.get('scheduled_pdf_interval', 'Disabled')
+        if interval_str == 'Disabled' or not s.get('email_enabled', True):
+            return
+
+        interval_map = {
+            "30 Mins": 1800,
+            "1 Hour": 3600,
+            "6 Hours": 21600,
+            "12 Hours": 43200,
+            "24 Hours": 86400
+        }
+        interval_sec = interval_map.get(interval_str, 0)
+        if interval_sec <= 0:
+            return
+
+        last_sent = s.get('last_scheduled_pdf_time', 0)
+        now_ts = time.time()
+
+        if last_sent == 0:
+            s['last_scheduled_pdf_time'] = now_ts
+            save_email_settings(s)
+            return
+
+        if now_ts - last_sent >= interval_sec:
+            s['last_scheduled_pdf_time'] = now_ts
+            save_email_settings(s)
+            threading.Thread(target=self.send_scheduled_pdf_email, args=(interval_str, interval_sec), daemon=True).start()
+
+    def send_scheduled_pdf_now(self):
+        interval_str = self.email_settings.get('scheduled_pdf_interval', '30 Mins')
+        if interval_str == 'Disabled':
+            interval_str = '30 Mins'
+        interval_map = {"30 Mins": 1800, "1 Hour": 3600, "6 Hours": 21600, "12 Hours": 43200, "24 Hours": 86400}
+        interval_sec = interval_map.get(interval_str, 3600)
+        threading.Thread(target=self.send_scheduled_pdf_email, args=(interval_str, interval_sec), daemon=True).start()
+        messagebox.showinfo("Report Email Dispatched", f"Generating PDF data report for the past {interval_str} and sending via email in the background...")
+
+    def send_scheduled_pdf_email(self, interval_str, interval_sec):
+        s = self.email_settings
+        raw_to = s.get('recipient_email', '')
+        recipients = [r.strip() for r in raw_to.replace(";", ",").split(",") if r.strip()]
+        if not recipients:
+            return
+
+        to_dt = datetime.now()
+        from_dt = to_dt - timedelta(seconds=interval_sec)
+        
+        reports_dir = os.path.join(DATA_PATH, "reports")
+        os.makedirs(reports_dir, exist_ok=True)
+        pdf_fn = f"Scheduled_Report_{interval_str.replace(' ', '')}_{to_dt.strftime('%Y%m%d_%H%M%S')}.pdf"
+        target_pdf = os.path.join(reports_dir, pdf_fn)
+
+        try:
+            if HAS_REPORTLAB:
+                c = canvas.Canvas(target_pdf, pagesize=landscape(letter))
+                w, h = landscape(letter)
+                
+                matching_logs = []
+                date_str_now = to_dt.strftime("%Y-%m-%d")
+                date_str_prev = from_dt.strftime("%Y-%m-%d")
+                target_csv_files = set([
+                    os.path.join(DATA_PATH, "live", f"Log_{date_str_now}.csv"),
+                    os.path.join(DATA_PATH, "live", f"Log_{date_str_prev}.csv")
+                ])
+
+                for fn in target_csv_files:
+                    if os.path.exists(fn):
+                        try:
+                            with open(fn, "r", encoding='utf-8', errors='replace') as f:
+                                reader = csv.reader((line.replace('\0', '') for line in f))
+                                header = next(reader, None)
+                                for row in reader:
+                                    if len(row) >= 9:
+                                        try:
+                                            row_dt = datetime.strptime(row[8], "%Y-%m-%d %H:%M:%S")
+                                            if from_dt <= row_dt <= to_dt:
+                                                matching_logs.append(row)
+                                        except Exception: pass
+                        except Exception: pass
+
+                matching_logs.sort(key=lambda x: x[8])
+
+                def draw_report_hdr(curr_page):
+                    c.setFillColorRGB(0.05, 0.08, 0.12); c.rect(0, 0, w, h, fill=1)
+                    c.setFillColorRGB(0, 0.7, 1.0); c.setFont("Helvetica-Bold", 18)
+                    c.drawString(40, h-45, "TempTrek Environmental Monitoring System")
+                    c.setFillColorRGB(1, 1, 1); c.setFont("Helvetica", 9)
+                    c.drawString(40, h-65, f"PERIODIC PDF REPORT ({interval_str.upper()}) | Window: {from_dt.strftime('%Y-%m-%d %H:%M')} to {to_dt.strftime('%Y-%m-%d %H:%M')} | Page: {curr_page}")
+                    c.setStrokeColorRGB(0, 0.7, 1.0); c.setLineWidth(1.5); c.line(40, h-75, w-40, h-75)
+                    
+                    c.setFont("Helvetica-Bold", 9); c.setFillColorRGB(0.85, 0.85, 0.85)
+                    yh = h - 95
+                    labels = [("S.NO", 40), ("DEVICE NAME", 85), ("IP", 210), ("FIELD NAME", 330), 
+                              ("ADDR", 470), ("READING", 520), ("UNIT", 610), ("TYPE", 660), ("TIME", 725)]
+                    for lbl, lx in labels: c.drawString(lx, yh, lbl)
+                    c.setLineWidth(0.5); c.line(40, yh-5, w-40, yh-5)
+                    return yh - 22
+
+                page_num = 1
+                y_pos = draw_report_hdr(page_num)
+                
+                if matching_logs:
+                    for idx, e in enumerate(matching_logs):
+                        val_text = str(e[5])
+                        is_alert = any(k in val_text for k in ["SUCCESS:", "FAILURE:", "ALERT:"]) or "Error" in val_text
+                        c.setFillColorRGB(1, 0.2, 0.2) if is_alert else c.setFillColorRGB(0.95, 0.95, 0.95)
+                        c.setFont("Helvetica", 8)
+                        
+                        c.drawString(40, y_pos, str(idx+1))
+                        c.drawString(85, y_pos, str(e[1])[:20])
+                        c.drawString(210, y_pos, str(e[2])[:18])
+                        c.drawString(330, y_pos, str(e[3])[:20])
+                        c.drawString(470, y_pos, str(e[4]))
+                        c.drawString(520, y_pos, str(e[5])[:12])
+                        c.drawString(610, y_pos, str(e[6]))
+                        c.drawString(660, y_pos, str(e[7])[:15])
+                        c.drawString(725, y_pos, str(e[8]))
+                        
+                        y_pos -= 14
+                        if y_pos < 45:
+                            c.showPage()
+                            page_num += 1
+                            y_pos = draw_report_hdr(page_num)
+                else:
+                    c.setFillColorRGB(0.9, 0.9, 0.9); c.setFont("Helvetica-Oblique", 10)
+                    c.drawString(40, y_pos, "No data records logged during this interval.")
+
+                c.save()
+        except Exception as ex:
+            self.root.after(0, lambda: self.log(f"Scheduled PDF generation failed: {ex}"))
+            return
+
+        try:
+            msg = MIMEMultipart()
+            msg['From'] = s.get('sender_email', '')
+            msg['To'] = raw_to
+            base_sub = s.get('subject', 'TempTrek System Report')
+            msg['Subject'] = f"PERIODIC DATA REPORT ({interval_str}): {base_sub}"
+
+            body = (f"TempTrek Environmental Monitoring System\n"
+                    f"=========================================\n"
+                    f"SCHEDULED PDF DATA REPORT ({interval_str.upper()})\n"
+                    f"=========================================\n"
+                    f"Report Time Window: {from_dt.strftime('%Y-%m-%d %H:%M:%S')} to {to_dt.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                    f"Generated At: {to_dt.strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+                    f"Attached is the automated PDF data report for all monitored devices covering the past {interval_str}.\n"
+                    f"=========================================")
+            msg.attach(MIMEText(body, 'plain'))
+
+            if os.path.exists(target_pdf):
+                with open(target_pdf, 'rb') as f_pdf:
+                    part = MIMEApplication(f_pdf.read(), Name=os.path.basename(target_pdf))
+                part['Content-Disposition'] = f'attachment; filename="{os.path.basename(target_pdf)}"'
+                msg.attach(part)
+
+            sender_usr = s.get('sender_email', '').strip()
+            sender_pwd = s.get('sender_password', '').strip()
+            smtp_server = s.get('smtp_server', 'smtp.gmail.com')
+            try: smtp_port = int(s.get('smtp_port', 587))
+            except: smtp_port = 587
+
+            server, err = self._connect_smtp(sender_usr, sender_pwd, smtp_server, smtp_port)
+            if server:
+                for r in recipients:
+                    try:
+                        msg.replace_header('To', r)
+                    except Exception:
+                        msg['To'] = r
+                    try:
+                        server.sendmail(sender_usr, [r], msg.as_string())
+                        write_email_log_csv("System Periodic Report", f"{interval_str} PDF Report", r, "SUCCESS")
+                        ts_now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        self.root.after(0, lambda r_tgt=r: self._append_email_log_live([ts_now, "System Periodic Report", f"{interval_str} PDF Report", r_tgt, "SUCCESS"]))
+                    except Exception as send_err:
+                        write_email_log_csv("System Periodic Report", f"{interval_str} PDF Report", r, f"FAIL: {send_err}")
+                try: server.quit()
+                except: pass
+
+                self.log_audit("SCHEDULED_REPORT_EMAIL", "EXPORT", f"Sent scheduled {interval_str} PDF report email to [{', '.join(recipients)}]")
+                self.root.after(0, lambda: self.log(f"SCHEDULED PDF EMAIL SENT ({interval_str}) to {', '.join(recipients)}"))
+            else:
+                for r in recipients:
+                    write_email_log_csv("System Periodic Report", f"{interval_str} PDF Report", r, f"FAIL: {err}")
+                self.root.after(0, lambda: self.log(f"SCHEDULED PDF EMAIL FAILED: {err}"))
+        except Exception as ex:
+            self.root.after(0, lambda: self.log(f"Scheduled PDF email dispatch failed: {ex}"))
 
     # -------------------------
     # VIEW: DATA EXPORT
@@ -4092,6 +4532,7 @@ class ModbusApp:
                             writer.writerow(row_vals)
                     
                     messagebox.showinfo("Success", f"Data pivoted and exported to {target_file}")
+                    self.log_audit("DATA_EXPORT", "EXPORT", f"Exported CSV data for device '{dev_alias}' ({len(pivoted_data)} records)")
                     webbrowser.open(target_file)
                 else:
                     messagebox.showwarning("No Data", "No records found for the range.")
@@ -4333,6 +4774,7 @@ class ModbusApp:
 
                 c.save()
                 messagebox.showinfo("Success", f"PDF report generated: {target_file}")
+                self.log_audit("DATA_EXPORT", "EXPORT", f"Exported PDF report for device '{dev_alias}' ({len(sorted_ts)} records)")
                 webbrowser.open(target_file)
             except Exception as e: messagebox.showerror("Error", f"PDF Export failed: {e}")
 
@@ -4616,6 +5058,7 @@ class ModbusApp:
                         rop[str(addr)] = "/"
                         rf[str(addr)] = "1"
             
+            audit_logs = []
             # Add/Update nodes for each slave ID
             for i, sid in enumerate(slave_ids):
                 # If name is given and we have multiple slaves, append the slave ID to distinguish
@@ -4642,22 +5085,40 @@ class ModbusApp:
                 # If editing, we only update the first one or the specific index
                 if self.edit_index is not None and i == 0:
                     if self.edit_index < len(self.devices):
+                        old_dev = self.devices[self.edit_index]
+                        diff_str = self.compute_device_diff(old_dev, dev)
+                        audit_logs.append(("DEVICE_UPDATE", f"Updated device node '{final_name}': {diff_str}"))
                         self.devices[self.edit_index] = dev
                 else:
                     # Check for duplicates before adding
                     exists = False
                     for existing in self.devices:
                         if existing['ip'] == ip and existing['port'] == p and existing['slave_id'] == sid:
-                            # Update existing instead of adding? 
-                            # For simplicity in range-add, we'll just check if it exists
                             exists = True
                             break
                     if not exists:
                         self.devices.append(dev)
+                        code_map = {"FC01": "Output Coil", "FC02": "Input Coil", "FC03": "Holding Register", "FC04": "Input Register"}
+                        reg_specs = []
+                        for r in rl:
+                            r_str = str(r)
+                            n = rn.get(r_str, f"Reg {r}")
+                            u = ru.get(r_str, "")
+                            t = rt.get(r_str, "FLOAT32")
+                            m = code_map.get(rm.get(r_str, "FC04"), "Input Register")
+                            op = rop.get(r_str, "/")
+                            f = rf.get(r_str, "1")
+                            math_str = f"0={op}/1={f}" if t == "BOOLEAN" else f"{op}{f}"
+                            d = rdec.get(r_str, "3")
+                            reg_specs.append(f"Reg {r}[Name:'{n}', Unit:'{u}', Type:{t}, Mode:{m}, Math:{math_str}, Dec:{d}]")
+                        reg_str = "; ".join(reg_specs) if reg_specs else "No registers"
+                        audit_logs.append(("DEVICE_CREATE", f"Created device node '{final_name}' (IP: {ip}:{p}, Slave: {sid}, Poll: {poll_interval}s, Config: {reg_str})"))
 
             self.edit_index = None
             self.btn_add.config(text="SAVE NODE", bg=self.COLORS["accent"])
             save_devices(self.devices)
+            for act, msg in audit_logs:
+                self.log_audit(act, "DEVICE", msg)
             self.refresh_device_list()
             self.clear_add_device_form()
             messagebox.showinfo("Success", f"Added {len(slave_ids)} nodes successfully.")
@@ -4788,9 +5249,11 @@ class ModbusApp:
         
         if dev_idx is not None:
             if messagebox.askyesno("Confirm", "Remove entire device configuration?"):
-                self.devices.pop(dev_idx)
+                removed_dev = self.devices.pop(dev_idx)
+                dname = removed_dev.get('device_name', removed_dev.get('ip'))
                 self.edit_index = None # Reset edit mode
                 save_devices(self.devices)
+                self.log_audit("DEVICE_DELETE", "DEVICE", f"Deleted device node '{dname}' (IP: {removed_dev.get('ip')}:{removed_dev.get('port', 502)}, Slave: {removed_dev.get('slave_id', 1)}, Regs: {removed_dev.get('registers', [])})")
                 self.refresh_device_list()
 
     # -------------------------
@@ -5061,6 +5524,7 @@ class ModbusApp:
                     y = draw_header(page_num)
             
             c.save()
+            self.log_audit("LOG_EXPORT", "EXPORT", f"Exported complete daily log PDF ({len(all_logs)} records)")
             messagebox.showinfo("Success", f"Full Daily Log Exported!\n\nLocation: {fn}")
             webbrowser.open(target_file)
         except Exception as ex:
@@ -5175,6 +5639,11 @@ class ModbusApp:
         elif self.active_view == "data_trends": self.sync_trend_history()
 
     def periodic_refresher(self):
+        try:
+            self.check_scheduled_pdf_email()
+        except Exception:
+            pass
+
         if self.active_view == "data_trends" and hasattr(self, 'trend_to_dt'):
             # Auto-update 'TO' time to current time
             now = datetime.now()
@@ -5402,6 +5871,118 @@ class ModbusApp:
             self.graph_canvas.create_line(points, fill=self.COLORS["accent"], width=2, smooth=True)
             curr_x, curr_y = points[-2], points[-1]
             self.graph_canvas.create_oval(curr_x-3, curr_y-3, curr_x+3, curr_y+3, fill=self.COLORS["accent"], outline=self.COLORS["bg_surface"])
+
+    # -------------------------
+    # VIEW: AUDIT LOG
+    # -------------------------
+    def show_audit_log(self):
+        bar = tk.Frame(self.content_frame, bg=self.COLORS["bg_dark"])
+        bar.pack(side="top", fill="x", pady=10, padx=30)
+
+        tk.Label(bar, text="CATEGORY:", font=("Segoe UI", 9, "bold"), fg=self.COLORS["text_dim"], bg=self.COLORS["bg_dark"]).pack(side="left", padx=(0, 5))
+        self.audit_cat_cb = ttk.Combobox(bar, values=["ALL", "AUTHENTICATION", "DEVICE", "ALARM", "USER_MGMT", "EXPORT"], width=15, style="TCombobox", state="readonly")
+        self.audit_cat_cb.set("ALL")
+        self.audit_cat_cb.pack(side="left", padx=5)
+
+        tk.Label(bar, text="SEARCH:", font=("Segoe UI", 9, "bold"), fg=self.COLORS["text_dim"], bg=self.COLORS["bg_dark"]).pack(side="left", padx=(15, 5))
+        self.audit_search_entry = tk.Entry(bar, bg=self.COLORS["bg_surface"], fg=self.COLORS["text_main"], font=self.FONTS["body"], relief="flat", width=20, insertbackground="black")
+        self.audit_search_entry.pack(side="left", padx=5, ipady=4)
+
+        tk.Button(bar, text="🔍 FILTER", bg=self.COLORS["accent"], fg="black", font=self.FONTS["button"], relief="flat", padx=10, command=self.refresh_audit_log_view).pack(side="left", padx=5)
+        tk.Button(bar, text="↺ RESET", bg=self.COLORS["bg_surface"], fg=self.COLORS["text_dim"], font=self.FONTS["button"], relief="flat", padx=10, command=lambda: (self.audit_cat_cb.set("ALL"), self.audit_search_entry.delete(0, tk.END), self.refresh_audit_log_view())).pack(side="left", padx=5)
+
+        tk.Button(bar, text="📁 FOLDER", bg=self.COLORS["bg_surface"], fg=self.COLORS["text_dim"], font=self.FONTS["button"], relief="flat", padx=12, command=self.open_logs_folder).pack(side="right", padx=5)
+        tk.Button(bar, text="💾 EXPORT CSV", bg=self.COLORS["success"], fg="white", font=self.FONTS["button"], relief="flat", padx=12, command=self.export_audit_log_to_csv).pack(side="right", padx=5)
+
+        cnt = tk.Frame(self.content_frame, bg=self.COLORS["bg_surface"], highlightbackground=self.COLORS["bg_highlight"], highlightthickness=1)
+        cnt.pack(fill="both", expand=True, padx=30, pady=(0, 20))
+
+        cols = ("timestamp", "user", "action", "category", "details")
+        self.audit_tree = ttk.Treeview(cnt, columns=cols, show="headings", style="Treeview")
+
+        self.audit_tree.heading("timestamp", text="TIMESTAMP")
+        self.audit_tree.heading("user", text="USER")
+        self.audit_tree.heading("action", text="ACTION")
+        self.audit_tree.heading("category", text="CATEGORY")
+        self.audit_tree.heading("details", text="DETAILS")
+
+        self.audit_tree.column("timestamp", width=140, anchor="center")
+        self.audit_tree.column("user", width=110, anchor="w")
+        self.audit_tree.column("action", width=130, anchor="w")
+        self.audit_tree.column("category", width=130, anchor="w")
+        self.audit_tree.column("details", width=420, anchor="w")
+
+        v_sb = ttk.Scrollbar(cnt, orient="vertical", command=self.audit_tree.yview)
+        self.audit_tree.configure(yscrollcommand=v_sb.set)
+        v_sb.pack(side="right", fill="y")
+        self.audit_tree.pack(fill="both", expand=True)
+
+        self.refresh_audit_log_view()
+
+    def refresh_audit_log_view(self):
+        if not hasattr(self, 'audit_tree') or not self.audit_tree.winfo_exists():
+            return
+        
+        for item in self.audit_tree.get_children():
+            self.audit_tree.delete(item)
+
+        cat_filter = self.audit_cat_cb.get().upper() if hasattr(self, 'audit_cat_cb') else "ALL"
+        search_query = self.audit_search_entry.get().strip().lower() if hasattr(self, 'audit_search_entry') else ""
+
+        logs_to_display = []
+        date_str = datetime.now().strftime("%Y-%m-%d")
+        fn = os.path.join(DATA_PATH, "live", f"Audit_Logs_{date_str}.csv")
+        if os.path.exists(fn):
+            try:
+                with open(fn, "r", encoding='utf-8', errors='replace') as f:
+                    reader = csv.reader((line.replace('\0', '') for line in f))
+                    header = next(reader, None)
+                    for row in reader:
+                        if len(row) >= 5:
+                            logs_to_display.append(tuple(row[:5]))
+            except Exception:
+                pass
+
+        # Also merge in-memory log entries for entries not yet on disk or fallback
+        for entry in list(self.global_audit_log):
+            if entry not in logs_to_display:
+                logs_to_display.append(entry)
+
+        # Sort descending by timestamp
+        logs_to_display.sort(key=lambda x: x[0], reverse=True)
+
+        for entry in logs_to_display:
+            ts, user, action, category, details = entry[0], entry[1], entry[2], entry[3], entry[4]
+            if cat_filter != "ALL" and category.upper() != cat_filter:
+                continue
+            if search_query:
+                combined = f"{ts} {user} {action} {category} {details}".lower()
+                if search_query not in combined:
+                    continue
+            self.audit_tree.insert("", "end", values=(ts, user, action, category, details))
+
+    def export_audit_log_to_csv(self):
+        date_str = datetime.now().strftime("%Y-%m-%d")
+        target_file = filedialog.asksaveasfilename(
+            defaultextension=".csv", 
+            initialfile=f"Audit_Report_{date_str}.csv",
+            filetypes=[("CSV Files", "*.csv")]
+        )
+        if not target_file:
+            return
+            
+        try:
+            with open(target_file, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                writer.writerow(["Timestamp", "Username", "Action", "Category", "Details"])
+                for item in self.audit_tree.get_children():
+                    row = self.audit_tree.item(item)['values']
+                    writer.writerow(row)
+            self.log_audit("AUDIT_LOG_EXPORT", "EXPORT", f"Exported audit log report to '{os.path.basename(target_file)}'")
+            messagebox.showinfo("Success", f"Audit log exported to {target_file}")
+            webbrowser.open(target_file)
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to export audit log: {e}")
 
 # -------------------------
 # MAIN
