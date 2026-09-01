@@ -1,4 +1,4 @@
-import time
+import time 
 import base64
 import struct
 import threading
@@ -67,7 +67,7 @@ LICENSE_FILE = os.path.join(
     "Microsoft",
     "sys.dat"
 )
-
+ 
 def get_hwid():
     """Generates a stable unique ID for this specific PC using Disk Serial."""
     try:
@@ -168,12 +168,14 @@ os.makedirs(os.path.join(DATA_PATH, "reports"), exist_ok=True)
 
 CONFIG_FILE = os.path.join(DATA_PATH, "config", "devices.json")
 EMAIL_CONFIG_FILE = os.path.join(DATA_PATH, "config", "email_settings.json")
+SMS_CONFIG_FILE = os.path.join(DATA_PATH, "config", "sms_settings.json")
 USERS_FILE = os.path.join(DATA_PATH, "config", "users.json")
 TREND_CONFIG_FILE = os.path.join(DATA_PATH, "config", "trend_settings.json")
+APPROVALS_FILE = os.path.join(DATA_PATH, "config", "approvals.json")
 
 def migrate_config_files():
     """Scan config folder and obfuscate any plain-text JSON files."""
-    files = [CONFIG_FILE, EMAIL_CONFIG_FILE, USERS_FILE, TREND_CONFIG_FILE]
+    files = [CONFIG_FILE, EMAIL_CONFIG_FILE, SMS_CONFIG_FILE, USERS_FILE, TREND_CONFIG_FILE, APPROVALS_FILE]
     for filepath in files:
         if os.path.exists(filepath):
             try:
@@ -262,20 +264,85 @@ def save_email_settings(settings):
         data_str = json.dumps(settings, indent=4)
         f.write(obfuscate_data(data_str))
 
+def load_sms_settings():
+    default_settings = {
+        "api_key": "",
+        "route": "q",
+        "recipient_numbers": "",
+        "sms_enabled": True,
+        "alerts": []
+    }
+    if not os.path.exists(SMS_CONFIG_FILE):
+        return default_settings
+            
+    try:
+        with open(SMS_CONFIG_FILE, "r") as f:
+            content = f.read().strip()
+            decoded = deobfuscate_data(content)
+            if decoded:
+                data = json.loads(decoded)
+                for k, v in default_settings.items():
+                    if k not in data:
+                        data[k] = v
+                return data
+            else:
+                return json.loads(content)
+    except:
+        return default_settings
+
+def save_sms_settings(settings):
+    with open(SMS_CONFIG_FILE, "w") as f:
+        data_str = json.dumps(settings, indent=4)
+        f.write(obfuscate_data(data_str))
+
+def load_approvals():
+    if not os.path.exists(APPROVALS_FILE):
+        return {}
+    try:
+        with open(APPROVALS_FILE, "r") as f:
+            content = f.read().strip()
+            decoded = deobfuscate_data(content)
+            if decoded:
+                return json.loads(decoded)
+            return json.loads(content)
+    except:
+        return {}
+
+def save_approvals(approvals_data):
+    with open(APPROVALS_FILE, "w") as f:
+        data_str = json.dumps(approvals_data, indent=4)
+        f.write(obfuscate_data(data_str))
+
 def load_users():
-    # Define default admin in case of failure or first run
-    default_h = hashlib.sha256("admin".encode()).hexdigest()
+    # Define default superadmin and admin in case of failure or first run
+    superadmin_h = hashlib.sha256("superadmin".encode()).hexdigest()
+    admin_h = hashlib.sha256("admin".encode()).hexdigest()
+    
+    all_perms = ["live_data", "add_device", "live_log", "view_data", "approve_data", "email_config", "email_smtp_config", "sms_config", "export_data", "data_trends", "user_manager", "audit_log"]
+    admin_perms = ["live_data", "live_log", "view_data", "approve_data", "email_config", "email_smtp_config", "sms_config", "export_data", "data_trends", "user_manager", "audit_log"]
+    
+    default_superadmin = {
+        "password": superadmin_h,
+        "permissions": all_perms.copy(),
+        "is_admin": True,
+        "is_superadmin": True
+    }
+    
     default_admin = {
-        "admin": {
-            "password": default_h,
-            "permissions": ["live_data", "add_device", "live_log", "email_config", "email_smtp_config", "export_data", "data_trends", "user_manager", "audit_log"],
-            "is_admin": True
-        }
+        "password": admin_h,
+        "permissions": admin_perms.copy(),
+        "is_admin": True,
+        "is_superadmin": False
+    }
+
+    default_users = {
+        "superadmin": default_superadmin,
+        "admin": default_admin
     }
 
     if not os.path.exists(USERS_FILE):
-        save_users(default_admin)
-        return default_admin
+        save_users(default_users)
+        return default_users
             
     try:
         with open(USERS_FILE, "r") as f:
@@ -286,19 +353,43 @@ def load_users():
             else:
                 users = json.loads(content)
             
-            # Ensure "admin" exists and has full permissions
+            # Ensure "superadmin" exists and has full permissions
+            if "superadmin" not in users:
+                users["superadmin"] = default_superadmin
+            else:
+                users["superadmin"]["is_superadmin"] = True
+                users["superadmin"]["is_admin"] = True
+                if "permissions" not in users["superadmin"]:
+                    users["superadmin"]["permissions"] = all_perms.copy()
+                else:
+                    for p in all_perms:
+                        if p not in users["superadmin"]["permissions"]:
+                            users["superadmin"]["permissions"].append(p)
+            
+            # Ensure "admin" exists
             if "admin" not in users:
-                users["admin"] = default_admin["admin"]
+                users["admin"] = default_admin
+            else:
+                users["admin"]["is_admin"] = True
+                users["admin"]["is_superadmin"] = False
+                if "permissions" not in users["admin"]:
+                    users["admin"]["permissions"] = admin_perms.copy()
+                else:
+                    for p in admin_perms:
+                        if p not in users["admin"]["permissions"]:
+                            users["admin"]["permissions"].append(p)
             
-            all_perms = ["live_data", "add_device", "live_log", "email_config", "email_smtp_config", "export_data", "data_trends", "user_manager", "audit_log"]
-            for p in all_perms:
-                if p not in users["admin"]["permissions"]:
-                    users["admin"]["permissions"].append(p)
+            # Enforce that only superadmin has "add_device" permission
+            for uname, udata in users.items():
+                if uname != "superadmin" and not udata.get("is_superadmin"):
+                    if "permissions" in udata and "add_device" in udata["permissions"]:
+                        udata["permissions"].remove("add_device")
             
+            save_users(users)
             return users
     except:
-        # If file is corrupted or HWID changed beyond recovery, return default admin
-        return default_admin
+        # If file is corrupted or HWID changed beyond recovery, return default users
+        return default_users
 
 def save_users(users):
     with open(USERS_FILE, "w") as f:
@@ -401,6 +492,89 @@ def write_email_log_csv(dev_name, field_name, recipient, status):
                     field_name, 
                     recipient, 
                     status
+                ])
+            break
+        except Exception:
+            time.sleep(0.1)
+
+def send_fast2sms(api_key, route, numbers, message_text):
+    if not api_key:
+        return False, "API Key is missing"
+    if not numbers:
+        return False, "Recipient phone number(s) missing"
+    
+    clean_numbers = ",".join([n.strip() for n in numbers.replace(";", ",").split(",") if n.strip()])
+    if not clean_numbers:
+        return False, "No valid recipient numbers provided"
+
+    route_val = route.split()[0].strip() if " " in route else route
+    if not route_val:
+        route_val = "q"
+
+    url = "https://www.fast2sms.com/dev/bulkV2"
+    headers = {
+        "authorization": api_key,
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "route": route_val,
+        "message": message_text,
+        "language": "english",
+        "flash": 0,
+        "numbers": clean_numbers
+    }
+    
+    try:
+        res = requests.post(url, json=payload, headers=headers, timeout=15)
+        if res.status_code == 200:
+            res_json = res.json()
+            if res_json.get("return") == True or res_json.get("status_code") == 200:
+                msg = res_json.get("message", ["SMS sent successfully"])
+                msg_str = msg[0] if isinstance(msg, list) else str(msg)
+                return True, msg_str
+            else:
+                err = res_json.get("message", "Fast2SMS API Error")
+                err_str = ", ".join(err) if isinstance(err, list) else str(err)
+                return False, f"API Error: {err_str}"
+        else:
+            params = {
+                "authorization": api_key,
+                "route": route_val,
+                "message": message_text,
+                "language": "english",
+                "flash": 0,
+                "numbers": clean_numbers
+            }
+            res_get = requests.get(url, params=params, timeout=15)
+            if res_get.status_code == 200:
+                res_json = res_get.json()
+                if res_json.get("return") == True:
+                    return True, "SMS sent successfully"
+                else:
+                    err = res_json.get("message", "Failed")
+                    err_str = ", ".join(err) if isinstance(err, list) else str(err)
+                    return False, f"API Error: {err_str}"
+            return False, f"HTTP Error {res.status_code}: {res.text}"
+    except Exception as e:
+        return False, f"Connection Exception: {e}"
+
+def write_sms_log_csv(dev_name, field_name, recipient, status, message_text=""):
+    date_str = datetime.now().strftime("%Y-%m-%d")
+    filename = os.path.join(DATA_PATH, "live", f"SMS_Logs_{date_str}.csv")
+    for attempt in range(3):
+        exists = os.path.exists(filename)
+        try:
+            with open(filename, "a", newline="") as f:
+                writer = csv.writer(f)
+                if not exists:
+                    writer.writerow(["Timestamp", "Device Name", "Field Name", "Recipient", "Status", "Message"])
+                writer.writerow([
+                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"), 
+                    dev_name, 
+                    field_name, 
+                    recipient, 
+                    status,
+                    message_text
                 ])
             break
         except Exception:
@@ -666,6 +840,23 @@ def read_modbus_device(host, port, registers, app, stop_event, unit_id=1, refres
                                 except:
                                     continue
 
+                        # Check SMS Alerts
+                        for alert in app.sms_settings.get('alerts', []):
+                            if (str(alert.get('device_ip')) == str(host) and 
+                                str(alert.get('port')) == str(port) and 
+                                str(alert.get('slave_id', 1)) == str(unit_id) and 
+                                str(alert.get('reg')) == str(reg)):
+                                cond = alert.get('condition')
+                                try:
+                                    thresh = float(alert.get('threshold'))
+                                    triggered = False
+                                    if cond == ">" and value > thresh: triggered = True
+                                    elif cond == "<" and value < thresh: triggered = True
+                                    elif cond == "==" and value == thresh: triggered = True
+                                    app.check_sms_alert_logic(alert, value, triggered)
+                                except:
+                                    continue
+
                     except PermissionError:
                         log_ui(f"Error: CSV File Open! Close it.")
                         log_ui(f"Reg {reg} \u2192 0")
@@ -751,6 +942,23 @@ def read_dummy_device(host, port, registers, app, stop_event, unit_id=1, refresh
                         except:
                             continue
 
+                # Check SMS Alerts
+                for alert in app.sms_settings.get('alerts', []):
+                    if (str(alert.get('device_ip')) == str(host) and 
+                        str(alert.get('port')) == str(port) and 
+                        str(alert.get('slave_id', 1)) == str(unit_id) and 
+                        str(alert.get('reg')) == str(reg)):
+                        cond = alert.get('condition')
+                        try:
+                            thresh = float(alert.get('threshold'))
+                            triggered = False
+                            if cond == ">" and value > thresh: triggered = True
+                            elif cond == "<" and value < thresh: triggered = True
+                            elif cond == "==" and value == thresh: triggered = True
+                            app.check_sms_alert_logic(alert, value, triggered)
+                        except:
+                            continue
+
         except Exception as e:
             log_ui(f"Sim Error: {e}")
 
@@ -818,6 +1026,7 @@ class ModbusApp:
         self.root = root
         self.root.title("TempTrek Environmental Monitoring System")
         self.root.geometry("1200x800")
+        self.root.minsize(900, 600)
         self.root.configure(bg=self.COLORS["bg_dark"])
         
         # High DPI Support for Windows
@@ -851,6 +1060,12 @@ class ModbusApp:
         self.active_alerts = {}
         self.alert_lock = threading.Lock()
 
+        # SMS Settings
+        self.sms_settings = load_sms_settings()
+        self.sms_cooldowns = {}
+        self.sms_active_alerts = {}
+        self.sms_lock = threading.Lock()
+
         # Communication Locks (per IP:Port) to prevent collisions
         self.comms_lock = threading.Lock()
         self.ip_locks = {}
@@ -873,6 +1088,7 @@ class ModbusApp:
         # Force encode all config files on startup (Migration)
         save_devices(self.devices)
         save_email_settings(self.email_settings)
+        save_sms_settings(self.sms_settings)
         save_users(self.users)
         save_trend_settings(self.trend_settings)
 
@@ -1043,6 +1259,38 @@ class ModbusApp:
                         activebackground=self.COLORS["accent_glow"], command=process_activation)
         btn.pack(fill="x", ipady=12)
 
+    def create_scrollable_panel(self, parent, bg=None, pad_x=20, pad_y=20, width=460):
+        if bg is None:
+            bg = self.COLORS["bg_surface"]
+        outer = tk.Frame(parent, bg=bg, width=width, highlightbackground=self.COLORS["bg_highlight"], highlightthickness=1)
+        outer.pack_propagate(False)
+        
+        canvas = tk.Canvas(outer, bg=bg, width=width, highlightthickness=0)
+        v_sb = ttk.Scrollbar(outer, orient="vertical", style="Vertical.TScrollbar", command=canvas.yview)
+        inner = tk.Frame(canvas, bg=bg, padx=pad_x, pady=pad_y)
+        
+        def _on_inner_config(e):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+            w = max(width - 20, e.width)
+            canvas.itemconfig(win_id, width=w)
+
+        win_id = canvas.create_window((0, 0), window=inner, anchor="nw")
+        inner.bind("<Configure>", _on_inner_config)
+        canvas.configure(yscrollcommand=v_sb.set)
+
+        v_sb.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+
+        def _on_mousewheel(e):
+            try:
+                canvas.yview_scroll(int(-1*(e.delta/120)), "units")
+            except:
+                pass
+        canvas.bind("<Enter>", lambda e: canvas.bind_all("<MouseWheel>", _on_mousewheel))
+        canvas.bind("<Leave>", lambda e: canvas.unbind_all("<MouseWheel>"))
+
+        return outer, inner
+
     def clear_window(self):
         for widget in self.root.winfo_children():
             widget.destroy()
@@ -1109,7 +1357,7 @@ class ModbusApp:
                  bg=self.COLORS["bg_surface"], fg=self.COLORS["text_dim"]).pack(anchor="w")
         self.u_entry = tk.Entry(card, font=self.FONTS["body"], bg=self.COLORS["bg_dark"], 
                           fg=self.COLORS["text_main"], relief="flat", insertbackground="black")
-        self.u_entry.insert(0, "ADMIN")
+        self.u_entry.insert(0, "SUPERADMIN")
         self.u_entry.pack(fill="x", pady=(5, 20), ipady=8)
 
         tk.Label(card, text="PASSCODE", font=self.FONTS["body"], 
@@ -1178,15 +1426,22 @@ class ModbusApp:
 
         self.nav_btns = {}
         user_perms = self.users.get(self.current_user, {}).get("permissions", [])
+        is_superadmin = (self.current_user == "superadmin") or self.users.get(self.current_user, {}).get("is_superadmin", False)
         
         if "live_data" in user_perms:
             self.create_nav_item("live_data", "DASHBOARD")
-        if "add_device" in user_perms:
+        if "add_device" in user_perms and is_superadmin:
             self.create_nav_item("add_device", "Device Manager")
         if "live_log" in user_perms:
             self.create_nav_item("live_log", "Live Log")
+        if "view_data" in user_perms:
+            self.create_nav_item("view_data", "View Data")
+        if "approve_data" in user_perms:
+            self.create_nav_item("approve_data", "Approve Data")
         if "email_config" in user_perms:
             self.create_nav_item("email_config", "Alarm Configuration")
+        if "sms_config" in user_perms:
+            self.create_nav_item("sms_config", "SMS Alert")
         if "export_data" in user_perms:
             self.create_nav_item("export_data", "Data Export")
         if "data_trends" in user_perms:
@@ -1335,7 +1590,10 @@ class ModbusApp:
             "live_data": "MONITORING DASHBOARD", 
             "add_device": "DEVICE CONFIGURATION", 
             "live_log": "SYSTEM ANALYTICS",
+            "view_data": "VIEW DATA",
+            "approve_data": "APPROVE DATA",
             "email_config": "ALARM CONFIGURATION",
+            "sms_config": "SMS ALERT CONFIGURATION",
             "export_data": "DATA EXPORT",
             "data_trends": "HISTORIC TREND ANALYTICS",
             "user_manager": "USER MANAGEMENT",
@@ -1351,11 +1609,22 @@ class ModbusApp:
         if view_name == "live_data":
             self.show_live_data()
         elif view_name == "add_device":
-            self.show_add_device()
+            is_superadmin = (self.current_user == "superadmin") or self.users.get(self.current_user, {}).get("is_superadmin", False)
+            if is_superadmin:
+                self.show_add_device()
+            else:
+                messagebox.showerror("Access Denied", "Only Super Admin has access to Device Manager.")
+                self.navigate("live_data")
         elif view_name == "live_log":
             self.show_live_log()
+        elif view_name == "view_data":
+            self.show_view_data()
+        elif view_name == "approve_data":
+            self.show_approve_data()
         elif view_name == "email_config":
             self.show_email_config()
+        elif view_name == "sms_config":
+            self.show_sms_config()
         elif view_name == "export_data":
             self.show_export_data()
         elif view_name == "data_trends":
@@ -1425,6 +1694,13 @@ class ModbusApp:
         self.graph_canvas = tk.Canvas(graph_frame, bg=self.COLORS["bg_dark"], height=220, highlightthickness=0)
         self.graph_canvas.pack(fill="x", padx=15, pady=(0, 10))
         
+        def _on_live_graph_resize(e):
+            lid = getattr(self, 'selected_graph_lid', None)
+            nm = getattr(self, 'selected_graph_name', 'Live Data')
+            if lid:
+                self.draw_live_graph(lid, nm)
+        self.graph_canvas.bind("<Configure>", _on_live_graph_resize)
+        
         self.graph_title = tk.Label(graph_frame, text="SELECT A CARD TO VIEW TREND", font=("Segoe UI", 7, "bold"), 
                                    fg=self.COLORS["text_dim"], bg=self.COLORS["bg_surface"])
         self.graph_title.pack(pady=(0, 10))
@@ -1465,6 +1741,7 @@ class ModbusApp:
         
         canvas_window = canvas.create_window((0, 0), window=self.grid_frame, anchor="nw")
         canvas.bind("<Configure>", _configure_window)
+        self.grid_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
         canvas.configure(yscrollcommand=v_sb.set)
 
         v_sb.pack(side="right", fill="y")
@@ -1682,6 +1959,12 @@ class ModbusApp:
         self.large_graph_canvas.pack(fill="both", expand=True, padx=20, pady=20)
         self.large_graph_canvas.create_text(400, 200, text="Select Node & Parameters, set Date Range, then click '🔍 QUERY DATA' to display graph.", font=("Segoe UI", 11, "bold"), fill=self.COLORS["text_dim"])
 
+        def _on_lg_resize(e):
+            lids = getattr(self, 'selected_trend_lids', [])
+            if lids and self.active_view == "data_trends":
+                self.draw_large_graph(lids)
+        self.large_graph_canvas.bind("<Configure>", _on_lg_resize)
+
         # Table View Content
         table_cnt = tk.Frame(self.trend_table_tab, bg=self.COLORS["bg_surface"], highlightbackground=self.COLORS["bg_highlight"], highlightthickness=1)
         table_cnt.pack(fill="both", expand=True)
@@ -1707,6 +1990,12 @@ class ModbusApp:
 
         self.bar_chart_canvas = tk.Canvas(bar_cnt, bg=self.COLORS["bg_dark"], highlightthickness=0)
         self.bar_chart_canvas.pack(fill="both", expand=True, padx=20, pady=20)
+
+        def _on_bc_resize(e):
+            lids = getattr(self, 'selected_trend_lids', [])
+            if lids and self.active_view == "data_trends":
+                self.draw_bar_chart(lids)
+        self.bar_chart_canvas.bind("<Configure>", _on_bc_resize)
         
         def _on_dev_change(e):
             idx = self.trend_dev_cb.current()
@@ -2524,9 +2813,8 @@ class ModbusApp:
         layout = tk.Frame(self.content_frame, bg=self.COLORS["bg_dark"])
         layout.pack(fill="both", expand=True, padx=30, pady=20)
 
-        left = tk.Frame(layout, bg=self.COLORS["bg_surface"], padx=20, pady=20,
-                       highlightbackground=self.COLORS["bg_highlight"], highlightthickness=1)
-        left.pack(side="left", fill="y", anchor="n")
+        outer_left, left = self.create_scrollable_panel(layout, bg=self.COLORS["bg_surface"], pad_x=20, pad_y=15, width=340)
+        outer_left.pack(side="left", fill="y", anchor="n")
 
         tk.Label(left, text="ADD NEW USER", font=self.FONTS["h3"], fg=self.COLORS["accent"], bg=self.COLORS["bg_surface"]).pack(anchor="w", pady=(0, 15))
 
@@ -2548,11 +2836,13 @@ class ModbusApp:
         self.perm_vars = {}
         perms = [
             ("live_data", "Live Dashboard"),
-            ("add_device", "Device Manager"),
             ("live_log", "Live Log"),
+            ("view_data", "View Data"),
+            ("approve_data", "Approve Data"),
+            ("export_data", "Data Export"),
             ("email_config", "Email Alerts"),
             ("email_smtp_config", "Gmail Configuration"),
-            ("export_data", "Data Export"),
+            ("sms_config", "SMS Alerts & Fast2SMS API"),
             ("data_trends", "Historic Trends"),
             ("user_manager", "User Manager"),
             ("audit_log", "Audit Log")
@@ -2580,15 +2870,21 @@ class ModbusApp:
         table_frame = tk.Frame(right, bg=self.COLORS["bg_surface"])
         table_frame.pack(fill="both", expand=True)
 
-        self.user_tree = ttk.Treeview(table_frame, columns=("user", "perms", "type"), show="headings", style="Treeview")
+        self.user_tree = ttk.Treeview(table_frame, columns=("user", "type", "perms"), show="headings", style="Treeview")
         self.user_tree.heading("user", text="USERNAME")
-        self.user_tree.heading("perms", text="PERMISSIONS")
         self.user_tree.heading("type", text="ACCOUNT TYPE")
+        self.user_tree.heading("perms", text="PERMISSIONS")
         
-        self.user_tree.column("user", width=150)
-        self.user_tree.column("perms", width=400)
-        self.user_tree.column("type", width=100)
+        self.user_tree.column("user", width=130, minwidth=110, anchor="w", stretch=False)
+        self.user_tree.column("type", width=140, minwidth=120, anchor="center", stretch=False)
+        self.user_tree.column("perms", width=300, minwidth=220, anchor="w", stretch=True)
         
+        v_sb = ttk.Scrollbar(table_frame, orient="vertical", command=self.user_tree.yview, style="Vertical.TScrollbar")
+        h_sb = ttk.Scrollbar(table_frame, orient="horizontal", command=self.user_tree.xview, style="Horizontal.TScrollbar")
+        self.user_tree.configure(yscrollcommand=v_sb.set, xscrollcommand=h_sb.set)
+        
+        v_sb.pack(side="right", fill="y")
+        h_sb.pack(side="bottom", fill="x")
         self.user_tree.pack(side="left", fill="both", expand=True)
 
         self.user_tree.bind("<<TreeviewSelect>>", self._on_user_select)
@@ -2603,10 +2899,38 @@ class ModbusApp:
         for i in self.user_tree.get_children():
             self.user_tree.delete(i)
         
+        PERM_LABELS = {
+            "live_data": "Dashboard",
+            "live_log": "Live Log",
+            "view_data": "View Data",
+            "approve_data": "Approve Data",
+            "email_config": "Email Alerts",
+            "email_smtp_config": "Gmail SMTP",
+            "sms_config": "SMS Alerts",
+            "export_data": "Data Export",
+            "data_trends": "Historic Trends",
+            "user_manager": "User Mgr",
+            "audit_log": "Audit Log"
+        }
+
         for uname, udata in self.users.items():
-            perms = ", ".join(udata.get("permissions", []))
-            utype = "ADMIN" if udata.get("is_admin") else "OPERATOR"
-            self.user_tree.insert("", "end", values=(uname.upper(), perms, utype))
+            raw_perms = udata.get("permissions", [])
+            clean_perms = [p for p in raw_perms if p != "add_device"]
+            if udata.get("is_superadmin") or uname == "superadmin":
+                utype = "SUPER ADMIN"
+                perms = "ALL MODULES (FULL ACCESS)"
+            elif udata.get("is_admin") or uname == "admin":
+                utype = "ADMIN"
+                perms = "ALL MODULES (EXCEPT DEVICE MGR)"
+            else:
+                utype = "OPERATOR"
+                if len(clean_perms) >= 5:
+                    perms = f"{len(clean_perms)} MODULES ACCESS"
+                elif clean_perms:
+                    perms = ", ".join([PERM_LABELS.get(p, p) for p in clean_perms])
+                else:
+                    perms = "NO ACCESS"
+            self.user_tree.insert("", "end", values=(uname.upper(), utype, perms))
 
     def _on_user_select(self, event):
         selected = self.user_tree.selection()
@@ -2618,7 +2942,7 @@ class ModbusApp:
             self.u_manager_name.delete(0, tk.END)
             self.u_manager_name.insert(0, uname)
             
-            # Clear password for security, let them type new one if needed
+            # Clear password for security
             self.u_manager_pass.delete(0, tk.END)
             
             # Sync permissions
@@ -2644,10 +2968,20 @@ class ModbusApp:
             messagebox.showerror("Error", "Password required for new user")
             return
 
+        h = hashlib.sha256(upass.encode()).hexdigest() if upass else (self.users[uname]["password"] if is_update else "")
         selected_perms = [pid for pid, var in self.perm_vars.items() if var.get()]
         
-        # Maintain admin status if updating
-        is_admin = self.users[uname].get("is_admin", False) if is_update else (uname == "admin")
+        # Maintain superadmin / admin status if updating
+        is_superadmin = self.users[uname].get("is_superadmin", False) if is_update else (uname == "superadmin")
+        is_admin = self.users[uname].get("is_admin", False) if is_update else (uname in ["admin", "superadmin"])
+
+        # Device Manager (add_device) permission is strictly reserved for superadmin
+        if is_superadmin or uname == "superadmin":
+            if "add_device" not in selected_perms:
+                selected_perms.append("add_device")
+        else:
+            if "add_device" in selected_perms:
+                selected_perms.remove("add_device")
         
         if is_update:
             old_user = self.users.get(uname, {})
@@ -2671,7 +3005,8 @@ class ModbusApp:
         self.users[uname] = {
             "password": h,
             "permissions": selected_perms,
-            "is_admin": is_admin
+            "is_admin": is_admin,
+            "is_superadmin": is_superadmin
         }
         
         save_users(self.users)
@@ -2690,8 +3025,8 @@ class ModbusApp:
             return
         
         uname = self.user_tree.item(selected[0])['values'][0].lower()
-        if uname == "admin":
-            messagebox.showerror("Error", "Cannot remove primary admin")
+        if uname in ["admin", "superadmin"]:
+            messagebox.showerror("Error", f"Cannot remove primary {uname}")
             return
         
         if messagebox.askyesno("Confirm", f"Remove user {uname.upper()}?"):
@@ -2751,12 +3086,12 @@ class ModbusApp:
         cards = tk.Frame(device_frame, bg=self.COLORS["bg_dark"])
         cards.pack(fill="x")
 
-        cols = 4
+        card_frames = []
         for i, reg in enumerate(dev['registers']):
-            r_frame = tk.Frame(cards, bg=self.COLORS["bg_surface"], width=200, height=130,
+            r_frame = tk.Frame(cards, bg=self.COLORS["bg_surface"], height=130,
                                highlightbackground=self.COLORS["bg_highlight"], highlightthickness=1)
-            r_frame.grid(row=i//cols, column=i%cols, padx=5, pady=5)
             r_frame.pack_propagate(False)
+            card_frames.append(r_frame)
 
             # Priority: 1. User specified name, 2. Default name (first 10), 3. Generic REG #
             name = dev.get("names", {}).get(str(reg))
@@ -2799,6 +3134,7 @@ class ModbusApp:
             # Graph Selection Support
             def _select_graph(e, lid=val_id, nm=name):
                 self.selected_graph_lid = lid
+                self.selected_graph_name = nm
                 self.draw_live_graph(lid, nm)
                 # Visual feedback on card
                 for card in cards.winfo_children():
@@ -2812,17 +3148,40 @@ class ModbusApp:
                     for grandchild in child.winfo_children():
                         grandchild.bind("<Button-1>", _select_graph)
 
+        def _regrid_cards(e=None):
+            w = cards.winfo_width()
+            if w <= 10:
+                w = parent.winfo_width()
+            if w <= 10:
+                cols = 4
+            else:
+                cols = max(1, min(6, w // 200))
+            for idx, rf in enumerate(card_frames):
+                rf.grid(row=idx // cols, column=idx % cols, padx=5, pady=5, sticky="nsew")
+            for c in range(max(8, cols + 1)):
+                if c < cols:
+                    cards.columnconfigure(c, weight=1)
+                else:
+                    cards.columnconfigure(c, weight=0)
+
+        cards.bind("<Configure>", _regrid_cards)
+        cards.after(10, _regrid_cards)
+
     # -------------------------
     # VIEW: ADD DEVICE
     # -------------------------
     def show_add_device(self):
+        is_superadmin = (self.current_user == "superadmin") or self.users.get(self.current_user, {}).get("is_superadmin", False)
+        if not is_superadmin:
+            messagebox.showerror("Access Denied", "Only Super Admin has access to Device Manager.")
+            self.navigate("live_data")
+            return
         self.edit_index = None
         layout = tk.Frame(self.content_frame, bg=self.COLORS["bg_dark"])
         layout.pack(fill="both", expand=True)
 
-        left = tk.Frame(layout, bg=self.COLORS["bg_surface"], padx=30, pady=20,
-                       highlightbackground=self.COLORS["bg_highlight"], highlightthickness=1)
-        left.pack(side="left", fill="y", anchor="n")
+        outer_left, left = self.create_scrollable_panel(layout, bg=self.COLORS["bg_surface"], pad_x=25, pad_y=15)
+        outer_left.pack(side="left", fill="y", anchor="n")
 
         hdr_frame = tk.Frame(left, bg=self.COLORS["bg_surface"])
         hdr_frame.pack(fill="x", pady=(0, 15))
@@ -2880,52 +3239,59 @@ class ModbusApp:
         
         # Mapping Section
         tk.Label(left, text="REGISTER MAPPING", font=("Segoe UI", 9, "bold"), fg=self.COLORS["accent"], bg=self.COLORS["bg_surface"]).pack(anchor="w", pady=(15, 5))
-        map_frame = tk.Frame(left, bg=self.COLORS["bg_surface"])
-        map_frame.pack(fill="x", pady=5)
-        self.map_frame = map_frame
         
-        self.entry_reg_addr = fld("ADDRESS", map_frame)
-        self.entry_reg_addr.master.pack(side="left", fill="x", expand=True, padx=(0, 5))
-        
+        map_row1 = tk.Frame(left, bg=self.COLORS["bg_surface"])
+        map_row1.pack(fill="x", pady=2)
+
+        # Address
+        f_addr = tk.Frame(map_row1, bg=self.COLORS["bg_surface"])
+        f_addr.pack(side="left", fill="x", padx=(0, 4))
+        tk.Label(f_addr, text="ADDR", font=("Segoe UI", 8, "bold"), fg=self.COLORS["text_dim"], bg=self.COLORS["bg_surface"]).pack(anchor="w")
+        self.entry_reg_addr = tk.Entry(f_addr, bg=self.COLORS["bg_dark"], fg=self.COLORS["text_main"], relief="flat", font=self.FONTS["body"], insertbackground="black", width=6)
+        self.entry_reg_addr.pack(fill="x", pady=(2, 0), ipady=4)
+        tk.Frame(f_addr, bg=self.COLORS["bg_highlight"], height=1).pack(fill="x")
+
         # Name Selection
-        f_name = tk.Frame(map_frame, bg=self.COLORS["bg_surface"])
-        f_name.pack(side="left", fill="x", expand=True)
-        tk.Label(f_name, text="NAME", font=("Segoe UI", 8, "bold"), fg=self.COLORS["text_dim"], bg=self.COLORS["bg_surface"]).pack(anchor="w")
+        f_name = tk.Frame(map_row1, bg=self.COLORS["bg_surface"])
+        f_name.pack(side="left", fill="x", expand=True, padx=2)
+        tk.Label(f_name, text="REGISTER NAME", font=("Segoe UI", 8, "bold"), fg=self.COLORS["text_dim"], bg=self.COLORS["bg_surface"]).pack(anchor="w")
         self.entry_reg_name = ttk.Combobox(f_name, values=self.DEFAULT_REGISTER_NAMES, style="TCombobox", font=self.FONTS["body"])
         self.entry_reg_name.pack(fill="x", pady=(2, 0))
         tk.Frame(f_name, bg=self.COLORS["bg_highlight"], height=1).pack(fill="x")
 
         # Unit Selection
-        f_unit = tk.Frame(map_frame, bg=self.COLORS["bg_surface"])
-        f_unit.pack(side="left", fill="x", expand=True, padx=2)
+        f_unit = tk.Frame(map_row1, bg=self.COLORS["bg_surface"])
+        f_unit.pack(side="left", fill="x", padx=2)
         tk.Label(f_unit, text="UNIT", font=("Segoe UI", 8, "bold"), fg=self.COLORS["text_dim"], bg=self.COLORS["bg_surface"]).pack(anchor="w")
         self.entry_reg_unit = ttk.Combobox(f_unit, values=self.COMMON_UNITS, style="TCombobox", width=6, font=self.FONTS["body"])
         self.entry_reg_unit.pack(fill="x", pady=(2, 0))
         tk.Frame(f_unit, bg=self.COLORS["bg_highlight"], height=1).pack(fill="x")
 
         # Type Selection
-        f_type = tk.Frame(map_frame, bg=self.COLORS["bg_surface"])
-        f_type.pack(side="left", fill="x", expand=True, padx=(2, 0))
+        f_type = tk.Frame(map_row1, bg=self.COLORS["bg_surface"])
+        f_type.pack(side="left", fill="x", padx=(2, 0))
         tk.Label(f_type, text="TYPE", font=("Segoe UI", 8, "bold"), fg=self.COLORS["text_dim"], bg=self.COLORS["bg_surface"]).pack(anchor="w")
-        self.entry_reg_type = ttk.Combobox(f_type, values=self.DATA_TYPES, style="TCombobox", width=12, font=self.FONTS["body"])
+        self.entry_reg_type = ttk.Combobox(f_type, values=self.DATA_TYPES, style="TCombobox", width=11, font=self.FONTS["body"])
         self.entry_reg_type.set("FLOAT32")
         self.entry_reg_type.pack(fill="x", pady=(2, 0))
         tk.Frame(f_type, bg=self.COLORS["bg_highlight"], height=1).pack(fill="x")
 
+        map_row2 = tk.Frame(left, bg=self.COLORS["bg_surface"])
+        map_row2.pack(fill="x", pady=4)
+
         # Mode Selection
-        f_mode = tk.Frame(map_frame, bg=self.COLORS["bg_surface"])
-        f_mode.pack(side="left", fill="x", expand=True, padx=(5, 0))
-        tk.Label(f_mode, text="MODE", font=("Segoe UI", 8, "bold"), fg=self.COLORS["text_dim"], bg=self.COLORS["bg_surface"]).pack(anchor="w")
-        self.entry_reg_mode = ttk.Combobox(f_mode, values=["Output Coil", "Input Coil", "Holding Register", "Input Register"], style="TCombobox", width=14, font=self.FONTS["body"])
+        f_mode = tk.Frame(map_row2, bg=self.COLORS["bg_surface"])
+        f_mode.pack(side="left", fill="x", expand=True, padx=(0, 4))
+        tk.Label(f_mode, text="REGISTER MODE", font=("Segoe UI", 8, "bold"), fg=self.COLORS["text_dim"], bg=self.COLORS["bg_surface"]).pack(anchor="w")
+        self.entry_reg_mode = ttk.Combobox(f_mode, values=["Output Coil", "Input Coil", "Holding Register", "Input Register"], style="TCombobox", font=self.FONTS["body"])
         self.entry_reg_mode.set("Input Register")
         self.entry_reg_mode.pack(fill="x", pady=(2, 0))
         tk.Frame(f_mode, bg=self.COLORS["bg_highlight"], height=1).pack(fill="x")
 
-        # Resolution Selection
-        # Resolution / Scaling Section
-        f_math = tk.Frame(map_frame, bg=self.COLORS["bg_surface"])
-        f_math.pack(side="left", fill="x", expand=True, padx=(5, 0))
-        tk.Label(f_math, text="MATH", font=("Segoe UI", 8, "bold"), fg=self.COLORS["text_dim"], bg=self.COLORS["bg_surface"]).pack(anchor="w")
+        # Math Section
+        f_math = tk.Frame(map_row2, bg=self.COLORS["bg_surface"])
+        f_math.pack(side="left", fill="x", expand=True, padx=2)
+        tk.Label(f_math, text="MATH (OP/FACTOR)", font=("Segoe UI", 8, "bold"), fg=self.COLORS["text_dim"], bg=self.COLORS["bg_surface"]).pack(anchor="w")
         
         f_math_inner = tk.Frame(f_math, bg=self.COLORS["bg_surface"])
         f_math_inner.pack(fill="x", pady=(2, 0))
@@ -2940,13 +3306,14 @@ class ModbusApp:
         tk.Frame(f_math, bg=self.COLORS["bg_highlight"], height=1).pack(fill="x")
 
         # Decimal Point (Precision)
-        f_prec = tk.Frame(map_frame, bg=self.COLORS["bg_surface"])
-        f_prec.pack(side="left", fill="x", expand=True, padx=(5, 0))
+        f_prec = tk.Frame(map_row2, bg=self.COLORS["bg_surface"])
+        f_prec.pack(side="left", fill="x", padx=(2, 0))
         tk.Label(f_prec, text="DECIMALS", font=("Segoe UI", 8, "bold"), fg=self.COLORS["text_dim"], bg=self.COLORS["bg_surface"]).pack(anchor="w")
-        self.entry_reg_prec = ttk.Combobox(f_prec, values=["0", "1", "2", "3", "4"], style="TCombobox", width=4, font=self.FONTS["body"])
+        self.entry_reg_prec = ttk.Combobox(f_prec, values=["0", "1", "2", "3", "4"], style="TCombobox", width=5, font=self.FONTS["body"])
         self.entry_reg_prec.set("3")
         self.entry_reg_prec.pack(fill="x", pady=(2, 0))
         tk.Frame(f_prec, bg=self.COLORS["bg_highlight"], height=1).pack(fill="x")
+        self.map_frame = map_row2
 
         # Boolean Value Names (Only visible when BOOLEAN type is selected)
         self.f_bool_labels = tk.Frame(left, bg=self.COLORS["bg_surface"])
@@ -3002,26 +3369,25 @@ class ModbusApp:
         self.mini_tree.heading("addr", text="ADDRESS")
         self.mini_tree.heading("name", text="REGISTER NAME")
         self.mini_tree.heading("unit", text="UNIT")
-        self.mini_tree.heading("type", text="TYPE")
-        self.mini_tree.heading("mode", text="MODE")
+        self.mini_tree.heading("type", text="DATA TYPE")
+        self.mini_tree.heading("mode", text="REGISTER MODE")
         self.mini_tree.heading("math", text="MATH (OP/FACTOR)")
-        self.mini_tree.heading("prec", text="DEC")
+        self.mini_tree.heading("prec", text="DECIMALS")
         
-        self.mini_tree.column("addr", width=60)
-        self.mini_tree.column("name", width=120)
-        self.mini_tree.column("unit", width=60)
-        self.mini_tree.column("type", width=80)
-        self.mini_tree.column("mode", width=60)
-        self.mini_tree.column("math", width=100)
-        self.mini_tree.column("prec", width=40)
-        self.mini_tree.pack(side="top", fill="both", expand=True)
-        
+        self.mini_tree.column("addr", width=100, minwidth=100, anchor="center", stretch=False)
+        self.mini_tree.column("name", width=170, minwidth=170, anchor="w", stretch=False)
+        self.mini_tree.column("unit", width=75, minwidth=75, anchor="center", stretch=False)
+        self.mini_tree.column("type", width=110, minwidth=110, anchor="center", stretch=False)
+        self.mini_tree.column("mode", width=160, minwidth=160, anchor="w", stretch=False)
+        self.mini_tree.column("math", width=190, minwidth=190, anchor="center", stretch=False)
+        self.mini_tree.column("prec", width=130, minwidth=130, anchor="center", stretch=False)
         v_sb = ttk.Scrollbar(mini_cnt, orient="vertical", command=self.mini_tree.yview, style="Vertical.TScrollbar")
         h_sb = ttk.Scrollbar(mini_cnt, orient="horizontal", command=self.mini_tree.xview, style="Horizontal.TScrollbar")
         self.mini_tree.configure(yscrollcommand=v_sb.set, xscrollcommand=h_sb.set)
         
-        v_sb.place(relx=1, rely=0, relheight=1, anchor="ne")
+        v_sb.pack(side="right", fill="y")
         h_sb.pack(side="bottom", fill="x")
+        self.mini_tree.pack(side="left", fill="both", expand=True)
         
         self.mini_tree.bind("<<TreeviewSelect>>", self.on_mini_select)
         
@@ -3065,40 +3431,36 @@ class ModbusApp:
         self.node_tree = ttk.Treeview(tree_cnt, columns=cols, show="headings", style="Treeview")
         
         self.node_tree.heading("id", text="ID")
-        self.node_tree.heading("addr", text="DEVICE")
-        self.node_tree.heading("slave", text="SLAVE")
+        self.node_tree.heading("addr", text="DEVICE NAME")
+        self.node_tree.heading("slave", text="SLAVE ID")
         self.node_tree.heading("reg_name", text="REGISTER NAME")
         self.node_tree.heading("reg_addr", text="ADDRESS")
         self.node_tree.heading("reg_unit", text="UNIT")
-        self.node_tree.heading("reg_type", text="TYPE")
-        self.node_tree.heading("math", text="MATH")
-        self.node_tree.heading("mode", text="MODE")
-        self.node_tree.heading("prec", text="DEC")
-        self.node_tree.heading("status", text="STATE")
+        self.node_tree.heading("reg_type", text="DATA TYPE")
+        self.node_tree.heading("math", text="MATH (OP/FACTOR)")
+        self.node_tree.heading("mode", text="REGISTER MODE")
+        self.node_tree.heading("prec", text="DECIMALS")
+        self.node_tree.heading("status", text="STATUS")
         
-        self.node_tree.column("id", width=40, anchor="center")
-        self.node_tree.column("addr", width=140, anchor="w")
-        self.node_tree.column("slave", width=50, anchor="center")
-        self.node_tree.column("reg_name", width=160, anchor="w")
-        self.node_tree.column("reg_addr", width=80, anchor="center")
-        self.node_tree.column("reg_unit", width=60, anchor="center")
-        self.node_tree.column("reg_type", width=80, anchor="center")
-        self.node_tree.column("math", width=80, anchor="center")
-        self.node_tree.column("mode", width=60, anchor="center")
-        self.node_tree.column("prec", width=40, anchor="center")
-        self.node_tree.column("status", width=100, anchor="center")
+        self.node_tree.column("id", width=60, minwidth=50, anchor="center", stretch=False)
+        self.node_tree.column("addr", width=160, minwidth=140, anchor="w", stretch=True)
+        self.node_tree.column("slave", width=110, minwidth=100, anchor="center", stretch=False)
+        self.node_tree.column("reg_name", width=180, minwidth=160, anchor="w", stretch=True)
+        self.node_tree.column("reg_addr", width=110, minwidth=100, anchor="center", stretch=False)
+        self.node_tree.column("reg_unit", width=85, minwidth=75, anchor="center", stretch=False)
+        self.node_tree.column("reg_type", width=120, minwidth=100, anchor="center", stretch=False)
+        self.node_tree.column("math", width=200, minwidth=180, anchor="center", stretch=False)
+        self.node_tree.column("mode", width=170, minwidth=150, anchor="w", stretch=True)
+        self.node_tree.column("prec", width=110, minwidth=100, anchor="center", stretch=False)
+        self.node_tree.column("status", width=140, minwidth=120, anchor="center", stretch=False)
         
-        self.node_tree.pack(side="top", fill="both", expand=True)
-        
-        # Custom tags for row coloring and status
-        self.node_tree.tag_configure("even", background=self.COLORS["bg_surface"])
-        self.node_tree.tag_configure("odd", background=self.COLORS["bg_dark"])
-        self.node_tree.tag_configure("online", foreground=self.COLORS["accent"])
-        self.node_tree.tag_configure("offline", foreground=self.COLORS["text_dim"])
-
         v_sb = ttk.Scrollbar(tree_cnt, orient="vertical", command=self.node_tree.yview, style="Vertical.TScrollbar")
-        self.node_tree.configure(yscrollcommand=v_sb.set)
-        v_sb.place(relx=1, rely=0, relheight=1, anchor="ne")
+        h_sb = ttk.Scrollbar(tree_cnt, orient="horizontal", command=self.node_tree.xview, style="Horizontal.TScrollbar")
+        self.node_tree.configure(yscrollcommand=v_sb.set, xscrollcommand=h_sb.set)
+        
+        v_sb.pack(side="right", fill="y")
+        h_sb.pack(side="bottom", fill="x")
+        self.node_tree.pack(side="left", fill="both", expand=True)
 
         acts = tk.Frame(right, bg=self.COLORS["bg_dark"], pady=20)
         acts.pack(side="bottom", fill="x", padx=30)
@@ -3122,12 +3484,11 @@ class ModbusApp:
 
         user_perms = self.users.get(self.current_user, {}).get("permissions", [])
         
-        # Only admin or users with specific permission can see SMTP Configuration
-        if self.current_user == "admin" or "email_smtp_config" in user_perms:
+        # Only admin/superadmin or users with specific permission can see SMTP Configuration
+        if self.current_user in ["admin", "superadmin"] or "email_smtp_config" in user_perms:
             # Left Panel: Server Settings
-            left = tk.Frame(layout, bg=self.COLORS["bg_surface"], padx=30, pady=20,
-                           highlightbackground=self.COLORS["bg_highlight"], highlightthickness=1)
-            left.pack(side="left", fill="y", anchor="n")
+            outer_left, left = self.create_scrollable_panel(layout, bg=self.COLORS["bg_surface"], pad_x=25, pad_y=15)
+            outer_left.pack(side="left", fill="y", anchor="n")
 
             tk.Label(left, text="SERVER CONFIGURATION", font=self.FONTS["h3"], fg=self.COLORS["accent"], bg=self.COLORS["bg_surface"]).pack(anchor="w", pady=(0, 15))
 
@@ -3328,18 +3689,25 @@ class ModbusApp:
         self.rules_tree = ttk.Treeview(tree_cnt, columns=("ip", "reg", "cond", "thresh", "interval", "msg"), show="headings", style="Treeview")
         self.rules_tree.heading("ip", text="DEVICE NAME")
         self.rules_tree.heading("reg", text="REGISTER NAME")
-        self.rules_tree.heading("cond", text="COND")
+        self.rules_tree.heading("cond", text="CONDITION")
         self.rules_tree.heading("thresh", text="PROCESS VALUE")
-        self.rules_tree.heading("interval", text="INTERVAL")
-        self.rules_tree.heading("msg", text="TEMPLATE")
+        self.rules_tree.heading("interval", text="INTERVAL (SEC)")
+        self.rules_tree.heading("msg", text="ALERT TEMPLATE MESSAGE")
         
-        self.rules_tree.column("ip", width=140)
-        self.rules_tree.column("reg", width=140)
-        self.rules_tree.column("cond", width=60)
-        self.rules_tree.column("thresh", width=100)
-        self.rules_tree.column("interval", width=80)
-        self.rules_tree.column("msg", width=250)
-        self.rules_tree.pack(side="top", fill="both", expand=True)
+        self.rules_tree.column("ip", width=160, minwidth=130, stretch=True)
+        self.rules_tree.column("reg", width=180, minwidth=150, stretch=True)
+        self.rules_tree.column("cond", width=110, minwidth=100, stretch=False)
+        self.rules_tree.column("thresh", width=150, minwidth=130, stretch=False)
+        self.rules_tree.column("interval", width=150, minwidth=130, stretch=False)
+        self.rules_tree.column("msg", width=300, minwidth=200, stretch=True)
+        
+        v_sb = ttk.Scrollbar(tree_cnt, orient="vertical", command=self.rules_tree.yview, style="Vertical.TScrollbar")
+        h_sb = ttk.Scrollbar(tree_cnt, orient="horizontal", command=self.rules_tree.xview, style="Horizontal.TScrollbar")
+        self.rules_tree.configure(yscrollcommand=v_sb.set, xscrollcommand=h_sb.set)
+        
+        v_sb.pack(side="right", fill="y")
+        h_sb.pack(side="bottom", fill="x")
+        self.rules_tree.pack(side="left", fill="both", expand=True)
 
         self.rules_tree.bind("<<TreeviewSelect>>", self.on_rule_select)
 
@@ -3886,6 +4254,569 @@ class ModbusApp:
             messagebox.showinfo("Success", "Alarm rules imported successfully.")
         except Exception as e:
             messagebox.showerror("Error", f"Failed to import alarm rules: {e}")
+
+    def check_sms_alert_logic(self, alert, current_value, is_triggered):
+        alert_id = f"sms_{alert.get('device_ip')}_{alert.get('reg')}_{alert.get('condition')}_{alert.get('threshold')}"
+        
+        try:
+            interval_mins = float(alert.get('interval', 0))
+        except:
+            interval_mins = 0
+        interval_secs = interval_mins * 60
+
+        with self.sms_lock:
+            was_active = self.sms_active_alerts.get(alert_id, False)
+            last_sent_time = self.sms_cooldowns.get(alert_id, 0)
+            
+            if is_triggered:
+                if time.time() - last_sent_time < interval_secs:
+                    return
+
+                if not was_active or (interval_secs > 0 and time.time() - last_sent_time >= interval_secs):
+                    self.sms_active_alerts[alert_id] = True
+                    self.sms_cooldowns[alert_id] = time.time()
+                    formatted_val = safe_format_val(current_value)
+                    self.log(f"SMS ALERT DETECTED: {alert.get('device_ip')} Reg {alert.get('reg')} value {formatted_val}")
+                    threading.Thread(target=self.send_sms_async, args=(alert, current_value), daemon=True).start()
+                
+            elif not is_triggered and was_active:
+                self.sms_active_alerts[alert_id] = False
+                formatted_val = safe_format_val(current_value)
+                self.log(f"SMS NORMAL RESTORED: {alert.get('device_ip')} Reg {alert.get('reg')} value {formatted_val}")
+
+    def send_sms_async(self, alert, current_value):
+        s = self.sms_settings
+        
+        formatted_val = safe_format_val(current_value)
+        formatted_thresh = safe_format_val(alert.get('threshold'))
+
+        reg_info = alert.get('reg_name', f"Register {alert.get('reg')}")
+        only_reg_name = reg_info
+        if "(" in reg_info and ")" in reg_info:
+            only_reg_name = reg_info[reg_info.find("(")+1 : reg_info.find(")")]
+        
+        dev_alias = alert.get('device_alias', '')
+        if not dev_alias:
+            for d in list(self.devices):
+                if str(d['ip']) == str(alert.get('device_ip')) and str(d.get('slave_id', 1)) == str(alert.get('slave_id', 1)):
+                    dev_alias = d.get('device_name', '')
+                    break
+        
+        full_name = f"{dev_alias} {only_reg_name}" if dev_alias else only_reg_name
+        
+        if not s.get('sms_enabled', True):
+            return
+
+        try:
+            api_key = s.get('api_key', '').strip()
+            route = s.get('route', 'q').strip()
+            numbers = s.get('recipient_numbers', '').strip()
+            
+            if not api_key or not numbers:
+                write_sms_log_csv(dev_alias, only_reg_name, numbers, "FAILED (Config Missing)", "API Key or Mobile Numbers missing")
+                return
+
+            ts_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            tpl = alert.get('template', "Alert: {name} reached {value} at {time}")
+            msg_text = tpl.replace("{name}", full_name).replace("{value}", formatted_val).replace("{time}", ts_str).replace("{ip}", alert.get('device_ip', '0.0.0.0'))
+
+            success, response_msg = send_fast2sms(api_key, route, numbers, msg_text)
+            status_str = "SUCCESS" if success else f"FAILED ({response_msg})"
+            
+            write_sms_log_csv(dev_alias, only_reg_name, numbers, status_str, msg_text)
+            self.log(f"Fast2SMS Result [{full_name}]: {status_str}")
+        except Exception as e:
+            write_sms_log_csv(dev_alias, only_reg_name, s.get('recipient_numbers', ''), f"FAILED ({e})", "")
+
+    # -------------------------
+    # VIEW: SMS CONFIG & ALERTS (FAST2SMS)
+    # -------------------------
+    def show_sms_config(self):
+        layout = tk.Frame(self.content_frame, bg=self.COLORS["bg_dark"])
+        layout.pack(fill="both", expand=True)
+
+        user_perms = self.users.get(self.current_user, {}).get("permissions", [])
+        
+        # Left Panel: Fast2SMS Settings
+        outer_left, left = self.create_scrollable_panel(layout, bg=self.COLORS["bg_surface"], pad_x=25, pad_y=15)
+        outer_left.pack(side="left", fill="y", anchor="n")
+
+        tk.Label(left, text="FAST2SMS CONFIGURATION", font=self.FONTS["h3"], fg=self.COLORS["accent"], bg=self.COLORS["bg_surface"]).pack(anchor="w", pady=(0, 15))
+
+        def fld(lbl, parent=left, initial="", show=None):
+            f = tk.Frame(parent, bg=self.COLORS["bg_surface"])
+            f.pack(fill="x", pady=6)
+            tk.Label(f, text=lbl, font=("Segoe UI", 8, "bold"), fg=self.COLORS["text_dim"], bg=self.COLORS["bg_surface"]).pack(anchor="w")
+            e = tk.Entry(f, bg=self.COLORS["bg_dark"], fg=self.COLORS["text_main"], relief="flat", font=self.FONTS["body"], insertbackground="black", show=show)
+            e.insert(0, str(initial))
+            e.pack(fill="x", pady=(2, 0), ipady=6)
+            tk.Frame(f, bg=self.COLORS["bg_highlight"], height=1).pack(fill="x")
+            return e, f
+
+        s = self.sms_settings
+        
+        # API Key entry
+        self.sms_api_key, _ = fld("FAST2SMS API KEY", initial=s.get('api_key', ''))
+        
+        # Route selection
+        f_route = tk.Frame(left, bg=self.COLORS["bg_surface"])
+        f_route.pack(fill="x", pady=6)
+        tk.Label(f_route, text="FAST2SMS ROUTE", font=("Segoe UI", 8, "bold"), fg=self.COLORS["text_dim"], bg=self.COLORS["bg_surface"]).pack(anchor="w")
+        self.sms_route_cb = ttk.Combobox(f_route, values=["q (Quick SMS)", "dlt (DLT SMS)", "otp (OTP SMS)"], style="TCombobox", state="readonly")
+        cur_r = s.get('route', 'q')
+        if cur_r.startswith('dlt'):
+            self.sms_route_cb.set("dlt (DLT SMS)")
+        elif cur_r.startswith('otp'):
+            self.sms_route_cb.set("otp (OTP SMS)")
+        else:
+            self.sms_route_cb.set("q (Quick SMS)")
+        self.sms_route_cb.pack(fill="x", pady=(2, 0))
+
+        # Recipient Numbers
+        self.sms_recipients, _ = fld("RECIPIENT MOBILE NUMBERS (Comma Separated)", initial=s.get('recipient_numbers', ''))
+
+        # Enable SMS Toggle
+        self.sms_enabled_var = tk.BooleanVar(value=s.get('sms_enabled', True))
+        tk.Checkbutton(left, text="ENABLE SMS NOTIFICATIONS", variable=self.sms_enabled_var,
+                       font=("Segoe UI", 8, "bold"), fg=self.COLORS["text_dim"], bg=self.COLORS["bg_surface"],
+                       activebackground=self.COLORS["bg_surface"], selectcolor=self.COLORS["bg_dark"]).pack(anchor="w", pady=10)
+
+        tk.Button(left, text="SAVE SMS SETTINGS", bg=self.COLORS["accent"], fg="black", font=self.FONTS["button"], 
+                  relief="flat", padx=20, pady=10, command=self.save_sms_settings_ui).pack(fill="x", pady=(15, 5))
+        
+        tk.Button(left, text="📱 TEST FAST2SMS ALERT", bg=self.COLORS["success"], fg="white", font=self.FONTS["button"], 
+                  relief="flat", padx=20, pady=8, command=self.test_sms_config).pack(fill="x", pady=4)
+
+        tk.Button(left, text="📜 VIEW SMS SEND LOGS", bg="#0288D1", fg="white", font=self.FONTS["button"], 
+                  relief="flat", padx=20, pady=8, command=self.show_sms_logs_history).pack(fill="x", pady=4)
+
+        info_text = "Note: Fast2SMS requires a valid API Key from fast2sms.com.\nMultiple numbers should be separated by commas (e.g. 9876543210, 9123456789)."
+        info_lbl = tk.Label(left, text=info_text, 
+                           font=("Segoe UI", 8, "italic"), fg=self.COLORS["warning"], bg=self.COLORS["bg_surface"], justify="left")
+        info_lbl.pack(fill="x", pady=15)
+
+        # Right Panel: SMS Alert Rules
+        right = tk.Frame(layout, bg=self.COLORS["bg_dark"])
+        right.pack(side="left", fill="both", expand=True, padx=(30, 0))
+
+        tk.Label(right, text="SMS ALERT RULES", font=self.FONTS["h3"], fg=self.COLORS["text_main"], bg=self.COLORS["bg_dark"]).pack(anchor="w", pady=(15, 5), padx=30)
+
+        tree_bar = tk.Frame(right, bg=self.COLORS["bg_dark"])
+        tree_bar.pack(fill="x", padx=30, pady=(0, 10))
+        
+        tk.Button(tree_bar, text="🗑 REMOVE SELECTED RULE", bg=self.COLORS["danger"], fg="white", 
+                  font=("Segoe UI", 8, "bold"), relief="flat", padx=15, pady=6, 
+                  command=self.remove_sms_alert_rule).pack(side="left")
+
+        btn_cnt = tk.Frame(tree_bar, bg=self.COLORS["bg_dark"])
+        btn_cnt.pack(side="right")
+        
+        tk.Button(btn_cnt, text="EXPORT SMS ALERTS", bg=self.COLORS["accent"], fg="black", 
+                  font=("Segoe UI", 8, "bold"), relief="flat", cursor="hand2", padx=15, pady=6, 
+                  command=self.export_sms_alert_config).pack(side="left", padx=5)
+                  
+        tk.Button(btn_cnt, text="IMPORT SMS ALERTS", bg=self.COLORS["accent"], fg="black", 
+                  font=("Segoe UI", 8, "bold"), relief="flat", cursor="hand2", padx=15, pady=6, 
+                  command=self.import_sms_alert_config).pack(side="left", padx=5)
+
+        add_rule_frame = tk.Frame(right, bg=self.COLORS["bg_surface"], padx=20, pady=20,
+                                 highlightbackground=self.COLORS["bg_highlight"], highlightthickness=1)
+        add_rule_frame.pack(fill="x", padx=30, pady=(0, 20))
+
+        row1 = tk.Frame(add_rule_frame, bg=self.COLORS["bg_surface"])
+        row1.pack(fill="x")
+
+        f_ip = tk.Frame(row1, bg=self.COLORS["bg_surface"])
+        f_ip.pack(side="left", fill="x", expand=True, padx=5)
+        tk.Label(f_ip, text="SELECT DEVICE", font=("Segoe UI", 8, "bold"), fg=self.COLORS["text_dim"], bg=self.COLORS["bg_surface"]).pack(anchor="w")
+        display_names = [d.get('device_name') if d.get('device_name') else f"{d['ip']} @ {d.get('slave_id', 1)}" for d in self.devices]
+        self.rule_sms_ip = ttk.Combobox(f_ip, values=display_names, style="TCombobox")
+        self.rule_sms_ip.pack(fill="x", pady=(2, 0))
+
+        f_reg = tk.Frame(row1, bg=self.COLORS["bg_surface"])
+        f_reg.pack(side="left", fill="x", expand=True, padx=5)
+        tk.Label(f_reg, text="REGISTER", font=("Segoe UI", 8, "bold"), fg=self.COLORS["text_dim"], bg=self.COLORS["bg_surface"]).pack(anchor="w")
+        self.rule_sms_reg = ttk.Combobox(f_reg, style="TCombobox")
+        self.rule_sms_reg.pack(fill="x", pady=(2, 0))
+
+        self.rule_sms_ip.bind("<<ComboboxSelected>>", self.update_sms_regs)
+
+        row2 = tk.Frame(add_rule_frame, bg=self.COLORS["bg_surface"], pady=10)
+        row2.pack(fill="x")
+
+        f_cond = tk.Frame(row2, bg=self.COLORS["bg_surface"])
+        f_cond.pack(side="left", fill="x", expand=True, padx=5)
+        tk.Label(f_cond, text="CONDITION", font=("Segoe UI", 8, "bold"), fg=self.COLORS["text_dim"], bg=self.COLORS["bg_surface"]).pack(anchor="w")
+        self.rule_sms_cond = ttk.Combobox(f_cond, values=["Greater Than (>)", "Less Than (<)", "Upper Limit (>)", "Low Limit (<)", "Equal To (==)"], style="TCombobox")
+        self.rule_sms_cond.pack(fill="x", pady=(2, 0))
+
+        f_thresh = tk.Frame(row2, bg=self.COLORS["bg_surface"])
+        f_thresh.pack(side="left", fill="x", expand=True, padx=5)
+        tk.Label(f_thresh, text="PROCESS VALUE", font=("Segoe UI", 8, "bold"), fg=self.COLORS["text_dim"], bg=self.COLORS["bg_surface"]).pack(anchor="w")
+        self.rule_sms_thresh = tk.Entry(f_thresh, bg=self.COLORS["bg_dark"], fg=self.COLORS["text_main"], relief="flat", font=self.FONTS["body"], insertbackground="black")
+        self.rule_sms_thresh.pack(fill="x", pady=(2, 0), ipady=6)
+
+        f_interval = tk.Frame(row2, bg=self.COLORS["bg_surface"])
+        f_interval.pack(side="left", fill="x", expand=True, padx=5)
+        tk.Label(f_interval, text="INTERVAL (MINS)", font=("Segoe UI", 8, "bold"), fg=self.COLORS["text_dim"], bg=self.COLORS["bg_surface"]).pack(anchor="w")
+        self.rule_sms_interval = tk.Entry(f_interval, bg=self.COLORS["bg_dark"], fg=self.COLORS["text_main"], relief="flat", font=self.FONTS["body"], insertbackground="black")
+        self.rule_sms_interval.insert(0, "0")
+        self.rule_sms_interval.pack(fill="x", pady=(2, 0), ipady=6)
+
+        row3 = tk.Frame(add_rule_frame, bg=self.COLORS["bg_surface"])
+        row3.pack(fill="x", pady=10)
+        
+        tk.Label(row3, text="CUSTOM SMS TEMPLATE (Use {value}, {time}, {name}, {ip})", font=("Segoe UI", 8, "bold"), 
+                 fg=self.COLORS["text_dim"], bg=self.COLORS["bg_surface"]).pack(anchor="w")
+        self.rule_sms_msg = tk.Entry(row3, bg=self.COLORS["bg_dark"], fg=self.COLORS["text_main"], relief="flat", font=self.FONTS["body"], insertbackground="black")
+        self.rule_sms_msg.insert(0, "Alert: {name} reached {value} at {time}")
+        self.rule_sms_msg.pack(fill="x", pady=(5, 0), ipady=8)
+
+        btn_row = tk.Frame(add_rule_frame, bg=self.COLORS["bg_surface"])
+        btn_row.pack(fill="x", pady=10)
+        
+        self.btn_add_sms_alert = tk.Button(btn_row, text="+ ADD SMS ALERT RULE", bg=self.COLORS["bg_highlight"], fg=self.COLORS["accent"], 
+                  font=self.FONTS["button"], relief="flat", pady=8, command=self.add_sms_alert_rule)
+        self.btn_add_sms_alert.pack(side="left", fill="x", expand=True, padx=(0, 5))
+        
+        tk.Button(btn_row, text="CLEAR / CANCEL", bg=self.COLORS["bg_surface"], fg=self.COLORS["text_dim"], 
+                  font=self.FONTS["button"], relief="flat", pady=8, 
+                  command=lambda: (self.sms_rules_tree.selection_remove(self.sms_rules_tree.selection()), self.on_sms_rule_select(None))).pack(side="left", fill="x", expand=True, padx=(5, 0))
+
+        tree_cnt = tk.Frame(right, bg=self.COLORS["bg_surface"], highlightbackground=self.COLORS["bg_highlight"], highlightthickness=1)
+        tree_cnt.pack(fill="both", expand=True, padx=30, pady=(0, 20))
+
+        self.sms_rules_tree = ttk.Treeview(tree_cnt, columns=("ip", "reg", "cond", "thresh", "interval", "msg"), show="headings", style="Treeview")
+        self.sms_rules_tree.heading("ip", text="DEVICE NAME")
+        self.sms_rules_tree.heading("reg", text="REGISTER NAME")
+        self.sms_rules_tree.heading("cond", text="CONDITION")
+        self.sms_rules_tree.heading("thresh", text="PROCESS VALUE")
+        self.sms_rules_tree.heading("interval", text="INTERVAL (SEC)")
+        self.sms_rules_tree.heading("msg", text="SMS TEMPLATE MESSAGE")
+        
+        self.sms_rules_tree.column("ip", width=160, minwidth=130, stretch=True)
+        self.sms_rules_tree.column("reg", width=180, minwidth=150, stretch=True)
+        self.sms_rules_tree.column("cond", width=110, minwidth=100, stretch=False)
+        self.sms_rules_tree.column("thresh", width=150, minwidth=130, stretch=False)
+        self.sms_rules_tree.column("interval", width=150, minwidth=130, stretch=False)
+        self.sms_rules_tree.column("msg", width=300, minwidth=200, stretch=True)
+        
+        v_sb = ttk.Scrollbar(tree_cnt, orient="vertical", command=self.sms_rules_tree.yview, style="Vertical.TScrollbar")
+        h_sb = ttk.Scrollbar(tree_cnt, orient="horizontal", command=self.sms_rules_tree.xview, style="Horizontal.TScrollbar")
+        self.sms_rules_tree.configure(yscrollcommand=v_sb.set, xscrollcommand=h_sb.set)
+        
+        v_sb.pack(side="right", fill="y")
+        h_sb.pack(side="bottom", fill="x")
+        self.sms_rules_tree.pack(side="left", fill="both", expand=True)
+
+        self.sms_rules_tree.bind("<<TreeviewSelect>>", self.on_sms_rule_select)
+
+        self.refresh_sms_rules_list()
+
+    def save_sms_settings_ui(self):
+        old_settings = dict(self.sms_settings)
+        route_val = self.sms_route_cb.get().split()[0].strip()
+        self.sms_settings['api_key'] = self.sms_api_key.get().strip()
+        self.sms_settings['route'] = route_val
+        self.sms_settings['recipient_numbers'] = self.sms_recipients.get().strip()
+        self.sms_settings['sms_enabled'] = self.sms_enabled_var.get()
+
+        save_sms_settings(self.sms_settings)
+
+        self.log_audit("SMS_CONFIG_UPDATE", "CONFIG", f"Updated Fast2SMS configuration (Route: {route_val}, Recipients: {self.sms_settings['recipient_numbers']})")
+        messagebox.showinfo("Success", "Fast2SMS configuration saved successfully.")
+
+    def test_sms_config(self):
+        api_key = self.sms_api_key.get().strip()
+        route = self.sms_route_cb.get().split()[0].strip()
+        numbers = self.sms_recipients.get().strip()
+        
+        if not api_key:
+            messagebox.showerror("Error", "Please enter a Fast2SMS API Key.")
+            return
+        if not numbers:
+            messagebox.showerror("Error", "Please enter recipient mobile number(s).")
+            return
+            
+        test_msg = f"TempTrek Test SMS Alert at {datetime.now().strftime('%H:%M:%S')}"
+        
+        def run_test():
+            success, result_msg = send_fast2sms(api_key, route, numbers, test_msg)
+            if success:
+                self.root.after(0, lambda: messagebox.showinfo("Test SMS Success", f"Fast2SMS Response:\n{result_msg}"))
+            else:
+                self.root.after(0, lambda: messagebox.showerror("Test SMS Failed", f"Could not send SMS via Fast2SMS:\n{result_msg}"))
+                
+        threading.Thread(target=run_test, daemon=True).start()
+
+    def add_sms_alert_rule(self):
+        idx = self.rule_sms_ip.current()
+        if idx < 0:
+            messagebox.showerror("Error", "Please select a device.")
+            return
+            
+        dev = self.devices[idx]
+        ip = dev['ip']
+        dev_alias = dev.get('device_name', f"{ip} @ {dev.get('slave_id', 1)}")
+        port = dev['port']
+        slave_id = dev.get('slave_id', 1)
+        
+        reg_raw = self.rule_sms_reg.get().strip()
+        if not reg_raw:
+            messagebox.showerror("Error", "Please select a register.")
+            return
+            
+        try:
+            reg = int(reg_raw.split()[0])
+        except:
+            messagebox.showerror("Error", "Invalid register format.")
+            return
+            
+        cond = self.rule_sms_cond.get()
+        cond_symbol = ">"
+        if "<" in cond: cond_symbol = "<"
+        elif "==" in cond: cond_symbol = "=="
+        elif ">" in cond: cond_symbol = ">"
+        
+        try:
+            thresh = float(self.rule_sms_thresh.get().strip())
+        except:
+            messagebox.showerror("Error", "Invalid process value / threshold.")
+            return
+            
+        try:
+            interval = float(self.rule_sms_interval.get().strip())
+        except:
+            interval = 0
+            
+        msg_tpl = self.rule_sms_msg.get().strip()
+
+        new_rule = {
+            "device_ip": ip,
+            "device_alias": dev_alias,
+            "port": port, 
+            "slave_id": slave_id,
+            "reg": reg,
+            "condition": cond_symbol,
+            "threshold": thresh,
+            "interval": interval,
+            "reg_name": reg_raw,
+            "template": msg_tpl if msg_tpl else "Alert: {name} reached {value} at {time}"
+        }
+
+        if 'alerts' not in self.sms_settings:
+            self.sms_settings['alerts'] = []
+            
+        sel = self.sms_rules_tree.selection()
+        if sel:
+            idx_rule = self.sms_rules_tree.index(sel[0])
+            self.sms_settings['alerts'][idx_rule] = new_rule
+            self.log_audit("SMS_RULE_UPDATE", "ALARM", f"Updated SMS alert rule for '{dev_alias}' Reg {reg}")
+            messagebox.showinfo("Success", "SMS alert rule updated.")
+            self.sms_rules_tree.selection_remove(sel[0])
+        else:
+            self.sms_settings['alerts'].append(new_rule)
+            self.log_audit("SMS_RULE_ADD", "ALARM", f"Added SMS alert rule for '{dev_alias}' Reg {reg}")
+            messagebox.showinfo("Success", "SMS alert rule added.")
+            
+        save_sms_settings(self.sms_settings)
+        self.refresh_sms_rules_list()
+        self.btn_add_sms_alert.config(text="+ ADD SMS ALERT RULE", bg=self.COLORS["bg_highlight"])
+
+    def update_sms_regs(self, event=None):
+        idx = self.rule_sms_ip.current()
+        if idx < 0: return
+        d = self.devices[idx]
+        regs = []
+        for r in d['registers']:
+            name = d.get('names', {}).get(str(r), f"Reg {r}")
+            regs.append(f"{r} ({name}) @ {d.get('slave_id', 1)}")
+        self.rule_sms_reg['values'] = list(dict.fromkeys(regs))
+
+    def on_sms_rule_select(self, event):
+        sel = self.sms_rules_tree.selection()
+        if not sel:
+            self.btn_add_sms_alert.config(text="+ ADD SMS ALERT RULE", bg=self.COLORS["bg_highlight"])
+            return
+            
+        idx = self.sms_rules_tree.index(sel[0])
+        alert = self.sms_settings['alerts'][idx]
+        
+        matched_idx = -1
+        for i, d in enumerate(self.devices):
+            if d['ip'] == alert.get('device_ip') and str(d.get('slave_id', 1)) == str(alert.get('slave_id', 1)):
+                matched_idx = i
+                break
+        
+        if matched_idx >= 0:
+            self.rule_sms_ip.current(matched_idx)
+            self.update_sms_regs() 
+            self.rule_sms_reg.set(alert.get('reg_name', ''))
+        
+        cond_sym = alert.get('condition', '')
+        cond_map = {
+            ">": "Upper Limit (>)", 
+            "<": "Low Limit (<)", 
+            "==": "Equal To (==)"
+        }
+        self.rule_sms_cond.set(cond_map.get(cond_sym, cond_sym))
+        
+        self.rule_sms_thresh.delete(0, tk.END)
+        self.rule_sms_thresh.insert(0, alert.get('threshold', ''))
+        self.rule_sms_interval.delete(0, tk.END)
+        self.rule_sms_interval.insert(0, alert.get('interval', '0'))
+        self.rule_sms_msg.delete(0, tk.END)
+        self.rule_sms_msg.insert(0, alert.get('template', ''))
+        
+        self.btn_add_sms_alert.config(text="UPDATE SMS RULE", bg=self.COLORS["warning"])
+
+    def remove_sms_alert_rule(self):
+        sel = self.sms_rules_tree.selection()
+        if not sel: return
+        idx = self.sms_rules_tree.index(sel[0])
+        removed = self.sms_settings['alerts'].pop(idx)
+        alias = removed.get('device_alias', removed.get('device_ip'))
+        self.log_audit("SMS_RULE_DELETE", "ALARM", f"Deleted SMS alert rule for '{alias}' Reg {removed.get('reg')}")
+        save_sms_settings(self.sms_settings)
+        self.refresh_sms_rules_list()
+
+    def refresh_sms_rules_list(self):
+        for item in self.sms_rules_tree.get_children():
+            self.sms_rules_tree.delete(item)
+        def get_display_cond(sym):
+            m = {">": "Upper Limit", "<": "Low Limit", "==": "Equal To"}
+            return m.get(sym, sym)
+
+        for a in self.sms_settings.get('alerts', []):
+            alias = a.get('device_alias', a.get('device_ip'))
+            reg_disp = a.get('reg_name', f"Reg {a.get('reg')}")
+            self.sms_rules_tree.insert("", "end", values=(
+                alias,
+                reg_disp,
+                get_display_cond(a.get('condition')),
+                a.get('threshold'),
+                f"{a.get('interval', 0)} mins",
+                a.get('template', '')
+            ))
+
+    def export_sms_alert_config(self):
+        filepath = filedialog.asksaveasfilename(
+            defaultextension=".json",
+            filetypes=[("JSON Files", "*.json")],
+            initialfile="sms_alerts_backup.json",
+            title="Export SMS Alarm Rules"
+        )
+        if not filepath:
+            return
+        try:
+            alerts = self.sms_settings.get('alerts', [])
+            with open(filepath, "w") as f:
+                json.dump(alerts, f, indent=4)
+            self.log_audit("SMS_RULE_EXPORT", "ALARM", f"Exported SMS alarm rules to '{os.path.basename(filepath)}'")
+            messagebox.showinfo("Success", "SMS alarm rules exported successfully.")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to export SMS alarm rules: {e}")
+
+    def import_sms_alert_config(self):
+        filepath = filedialog.askopenfilename(
+            filetypes=[("JSON Files", "*.json")],
+            title="Import SMS Alarm Configuration"
+        )
+        if not filepath:
+            return
+        try:
+            with open(filepath, "r") as f:
+                imported_alerts = json.load(f)
+            
+            if not isinstance(imported_alerts, list):
+                raise ValueError("SMS configuration must be a JSON list of rules.")
+            
+            for rule in imported_alerts:
+                if not isinstance(rule, dict) or "device_ip" not in rule or "reg" not in rule or "condition" not in rule or "threshold" not in rule:
+                    raise ValueError("Invalid SMS alert rule structure.")
+            
+            ans = messagebox.askyesnocancel(
+                "Import Options",
+                "Would you like to REPLACE the current SMS alarm rules (Yes) or MERGE/Append them (No)?"
+            )
+            if ans is None:
+                return
+            
+            if ans is True:
+                self.sms_settings['alerts'] = imported_alerts
+            else:
+                current_alerts = self.sms_settings.get('alerts', [])
+                for rule in imported_alerts:
+                    exists = False
+                    for curr in current_alerts:
+                        if (curr.get('device_ip') == rule.get('device_ip') and 
+                            curr.get('port') == rule.get('port') and 
+                            curr.get('slave_id', 1) == rule.get('slave_id', 1) and 
+                            curr.get('reg') == rule.get('reg') and 
+                            curr.get('condition') == rule.get('condition') and 
+                            curr.get('threshold') == rule.get('threshold')):
+                            exists = True
+                            break
+                    if not exists:
+                        current_alerts.append(rule)
+                self.sms_settings['alerts'] = current_alerts
+            
+            save_sms_settings(self.sms_settings)
+            self.refresh_sms_rules_list()
+            self.log_audit("SMS_RULE_IMPORT", "ALARM", f"Imported SMS alarm rules from '{os.path.basename(filepath)}'")
+            messagebox.showinfo("Success", "SMS alarm rules imported successfully.")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to import SMS alarm rules: {e}")
+
+    def show_sms_logs_history(self):
+        bar = tk.Frame(self.content_frame, bg=self.COLORS["bg_dark"])
+        bar.pack(side="top", fill="x", pady=10, padx=30)
+        
+        tk.Button(bar, text="⬅ BACK TO SMS CONFIG", bg=self.COLORS["bg_surface"], fg=self.COLORS["text_dim"], font=self.FONTS["button"], relief="flat", padx=12, command=lambda: self.navigate("sms_config")).pack(side="left", padx=5)
+        
+        date_str = datetime.now().strftime("%Y-%m-%d")
+        tk.Label(bar, text=f"SMS Sent Logs: {date_str}", font=("Segoe UI", 10, "bold"), fg=self.COLORS["text_dim"], bg=self.COLORS["bg_dark"]).pack(side="left", padx=20)
+        
+        cnt = tk.Frame(self.content_frame, bg=self.COLORS["bg_surface"], highlightbackground=self.COLORS["bg_highlight"], highlightthickness=1)
+        cnt.pack(fill="both", expand=True, padx=30, pady=(0, 20))
+
+        cols = ("time", "device", "field", "recipient", "status", "message")
+        tree = ttk.Treeview(cnt, columns=cols, show="headings", style="Treeview")
+        
+        tree.heading("time", text="TIMESTAMP")
+        tree.heading("device", text="DEVICE NAME")
+        tree.heading("field", text="FIELD NAME")
+        tree.heading("recipient", text="RECIPIENT NUMBER")
+        tree.heading("status", text="DELIVERY STATUS")
+        tree.heading("message", text="MESSAGE CONTENT")
+        
+        tree.column("time", width=160, minwidth=140, anchor="center", stretch=False)
+        tree.column("device", width=160, minwidth=130, anchor="w", stretch=True)
+        tree.column("field", width=160, minwidth=130, anchor="w", stretch=True)
+        tree.column("recipient", width=160, minwidth=140, anchor="w", stretch=False)
+        tree.column("status", width=130, minwidth=100, anchor="center", stretch=False)
+        tree.column("message", width=300, minwidth=200, anchor="w", stretch=True)
+        
+        v_sb = ttk.Scrollbar(cnt, orient="vertical", command=tree.yview, style="Vertical.TScrollbar")
+        h_sb = ttk.Scrollbar(cnt, orient="horizontal", command=tree.xview, style="Horizontal.TScrollbar")
+        tree.configure(yscrollcommand=v_sb.set, xscrollcommand=h_sb.set)
+        
+        v_sb.pack(side="right", fill="y")
+        h_sb.pack(side="bottom", fill="x")
+        tree.pack(side="left", fill="both", expand=True)
+
+        filename = os.path.join(DATA_PATH, "live", f"SMS_Logs_{date_str}.csv")
+        if os.path.exists(filename):
+            try:
+                with open(filename, "r", newline="") as f:
+                    reader = csv.reader(f)
+                    header = next(reader, None)
+                    for row in reader:
+                        if len(row) >= 5:
+                            msg_val = row[5] if len(row) > 5 else ""
+                            tree.insert("", 0, values=(row[0], row[1], row[2], row[3], row[4], msg_val))
+            except Exception as e:
+                self.log(f"Error reading SMS logs: {e}")
 
     def check_alert_logic(self, alert, current_value, is_triggered):
         # Create a unique ID for this alert rule
@@ -4480,9 +5411,543 @@ class ModbusApp:
             self.root.after(0, lambda: self.log(f"Scheduled PDF email dispatch failed: {ex}"))
 
     # -------------------------
+    # VIEW: VIEW DATA
+    # -------------------------
+    def show_view_data(self):
+        user_perms = self.users.get(self.current_user, {}).get("permissions", [])
+        if "view_data" not in user_perms:
+            messagebox.showerror("Access Denied", "You do not have permission to access View Data.")
+            self.navigate("live_data")
+            return
+
+        layout = tk.Frame(self.content_frame, bg=self.COLORS["bg_dark"])
+        layout.pack(fill="both", expand=True, padx=30, pady=20)
+
+        # Top Control Card (Device, Date Range, Interval & Query)
+        card = tk.Frame(layout, bg=self.COLORS["bg_surface"], padx=20, pady=15,
+                        highlightbackground=self.COLORS["bg_highlight"], highlightthickness=1)
+        card.pack(fill="x", pady=(0, 15))
+
+        top_row = tk.Frame(card, bg=self.COLORS["bg_surface"])
+        top_row.pack(fill="x", pady=5)
+
+        # Device Combobox
+        f_dev = tk.Frame(top_row, bg=self.COLORS["bg_surface"])
+        f_dev.pack(side="left", padx=(0, 20))
+        tk.Label(f_dev, text="SELECT DEVICE", font=("Segoe UI", 8, "bold"), 
+                 bg=self.COLORS["bg_surface"], fg=self.COLORS["text_dim"]).pack(anchor="w")
+        display_names = [d.get('device_name') if d.get('device_name') else f"{d['ip']} @ {d.get('slave_id', 1)}" for d in self.devices]
+        self.view_node_cb = ttk.Combobox(f_dev, values=display_names, style="TCombobox", font=self.FONTS["body"], width=22)
+        if display_names: self.view_node_cb.current(0)
+        self.view_node_cb.pack(pady=(5, 0), ipady=4)
+
+        # Date Selectors Helper
+        dt_cnt = tk.Frame(top_row, bg=self.COLORS["bg_surface"])
+        dt_cnt.pack(side="left", fill="x", expand=True)
+
+        def dt_selector(parent, label, initial_dt):
+            f = tk.Frame(parent, bg=self.COLORS["bg_surface"])
+            f.pack(side="left", padx=10)
+            tk.Label(f, text=label, font=("Segoe UI", 8, "bold"), 
+                     bg=self.COLORS["bg_surface"], fg=self.COLORS["text_dim"]).pack(anchor="w")
+            box = tk.Frame(f, bg=self.COLORS["bg_dark"], padx=5, pady=3)
+            box.pack(pady=(5, 0))
+            
+            years = [str(y) for y in range(2024, 2031)]
+            months = [f"{i:02d}" for i in range(1, 13)]
+            days = [f"{i:02d}" for i in range(1, 32)]
+            hours = [f"{i:02d}" for i in range(0, 24)]
+            mins = [f"{i:02d}" for i in range(0, 61)]
+            
+            sel = {}
+            y_cb = ttk.Combobox(box, values=years, width=5, font=("Consolas", 9))
+            y_cb.set(initial_dt.strftime("%Y"))
+            y_cb.pack(side="left")
+            tk.Label(box, text="-", bg=self.COLORS["bg_dark"], fg="white").pack(side="left")
+            m_cb = ttk.Combobox(box, values=months, width=3, font=("Consolas", 9))
+            m_cb.set(initial_dt.strftime("%m"))
+            m_cb.pack(side="left")
+            tk.Label(box, text="-", bg=self.COLORS["bg_dark"], fg="white").pack(side="left")
+            d_cb = ttk.Combobox(box, values=days, width=3, font=("Consolas", 9))
+            d_cb.set(initial_dt.strftime("%d"))
+            d_cb.pack(side="left")
+            
+            tk.Label(box, text="  ", bg=self.COLORS["bg_dark"]).pack(side="left")
+            h_cb = ttk.Combobox(box, values=hours, width=3, font=("Consolas", 9))
+            h_cb.set(initial_dt.strftime("%H"))
+            h_cb.pack(side="left")
+            tk.Label(box, text=":", bg=self.COLORS["bg_dark"], fg="white").pack(side="left")
+            min_cb = ttk.Combobox(box, values=mins, width=3, font=("Consolas", 9))
+            min_cb.set(initial_dt.strftime("%M"))
+            min_cb.pack(side="left")
+            
+            sel['y'], sel['m'], sel['d'], sel['h'], sel['min'] = y_cb, m_cb, d_cb, h_cb, min_cb
+            return sel
+
+        now = datetime.now()
+        start_of_day = now.replace(hour=0, minute=0, second=0)
+        self.view_from_dt = dt_selector(dt_cnt, "FROM DATE & TIME", start_of_day)
+        self.view_to_dt = dt_selector(dt_cnt, "TO DATE & TIME", now)
+
+        # Interval and Action Buttons Row
+        action_row = tk.Frame(card, bg=self.COLORS["bg_surface"])
+        action_row.pack(fill="x", pady=(15, 0))
+
+        f_int = tk.Frame(action_row, bg=self.COLORS["bg_surface"])
+        f_int.pack(side="left")
+        tk.Label(f_int, text="INTERVAL", font=("Segoe UI", 8, "bold"), 
+                 bg=self.COLORS["bg_surface"], fg=self.COLORS["text_dim"]).pack(side="left", padx=(0, 5))
+        self.view_interval_cb = ttk.Combobox(f_int, values=["Raw", "1 Min", "5 Min", "15 Min", "30 Min", "1 Hour"], width=10, style="TCombobox")
+        self.view_interval_cb.set("Raw")
+        self.view_interval_cb.pack(side="left", padx=5)
+
+        tk.Button(action_row, text="🔍 LOAD DATA", bg=self.COLORS["accent"], fg="black", 
+                  font=self.FONTS["button"], relief="flat", cursor="hand2", padx=15, pady=6,
+                  command=self.load_view_data_records).pack(side="left", padx=10)
+
+        is_superadmin = (self.current_user == "superadmin") or self.users.get(self.current_user, {}).get("is_superadmin", False)
+        if "approve_data" in user_perms or is_superadmin:
+            tk.Button(action_row, text="✓ APPROVE DATA", bg=self.COLORS["success"], fg="white", 
+                      font=self.FONTS["button"], relief="flat", cursor="hand2", padx=15, pady=6,
+                      command=self.submit_data_approval_from_view_data).pack(side="left", padx=10)
+
+        if "export_data" in user_perms:
+            tk.Button(action_row, text="📥 EXCEL EXPORT", bg=self.COLORS["bg_highlight"], fg="white", 
+                      font=self.FONTS["button"], relief="flat", cursor="hand2", padx=15, pady=6,
+                      command=lambda: self.perform_export("excel")).pack(side="right", padx=5)
+
+            tk.Button(action_row, text="📄 PDF EXPORT (DRAFT)", bg="#FF5722", fg="white", 
+                      font=self.FONTS["button"], relief="flat", cursor="hand2", padx=15, pady=6,
+                      command=lambda: self.perform_export("pdf")).pack(side="right", padx=5)
+
+        # Status Banner
+        self.view_status_lbl = tk.Label(layout, text="APPROVAL STATUS: DRAFT / PENDING APPROVAL", 
+                                        font=("Segoe UI", 10, "bold"), fg="#FF9800", bg=self.COLORS["bg_surface"],
+                                        padx=15, pady=8, highlightbackground=self.COLORS["bg_highlight"], highlightthickness=1)
+        self.view_status_lbl.pack(fill="x", pady=(0, 10))
+
+        # Data Table
+        table_frame = tk.Frame(layout, bg=self.COLORS["bg_surface"])
+        table_frame.pack(fill="both", expand=True)
+
+        self.view_tree = ttk.Treeview(table_frame, columns=("ts", "dev", "details", "status"), show="headings", style="Treeview")
+        self.view_tree.heading("ts", text="TIMESTAMP")
+        self.view_tree.heading("dev", text="DEVICE NAME")
+        self.view_tree.heading("details", text="LOGGED READINGS / PARAMETERS")
+        self.view_tree.heading("status", text="APPROVAL STATUS")
+
+        self.view_tree.column("ts", width=160, anchor="center")
+        self.view_tree.column("dev", width=160, anchor="w")
+        self.view_tree.column("details", width=450, anchor="w")
+        self.view_tree.column("status", width=150, anchor="center")
+
+        v_sb = ttk.Scrollbar(table_frame, orient="vertical", command=self.view_tree.yview, style="Vertical.TScrollbar")
+        h_sb = ttk.Scrollbar(table_frame, orient="horizontal", command=self.view_tree.xview, style="Horizontal.TScrollbar")
+        self.view_tree.configure(yscrollcommand=v_sb.set, xscrollcommand=h_sb.set)
+
+        v_sb.pack(side="right", fill="y")
+        h_sb.pack(side="bottom", fill="x")
+        self.view_tree.pack(side="left", fill="both", expand=True)
+
+        # Auto-load initial data
+        self.load_view_data_records()
+
+    def submit_data_approval_from_view_data(self):
+        idx = self.view_node_cb.current()
+        if idx < 0 or idx >= len(self.devices):
+            messagebox.showerror("Error", "Select a valid device.")
+            return
+
+        dev = self.devices[idx]
+        ip, port, slave_id_part = dev['ip'], dev['port'], dev.get('slave_id', 1)
+        dev_alias = dev.get('device_name', ip)
+
+        try:
+            get_dt = lambda s: datetime.strptime(f"{s['y'].get()}-{s['m'].get()}-{s['d'].get()} {s['h'].get()}:{s['min'].get()}:00", "%Y-%m-%d %H:%M:%S")
+            from_dt = get_dt(self.view_from_dt)
+            to_dt = get_dt(self.view_to_dt)
+        except Exception as e:
+            messagebox.showerror("Error", f"Invalid date selection: {e}")
+            return
+
+        cur_d = from_dt.date()
+        end_d = to_dt.date()
+        approvals = load_approvals()
+
+        count = 0
+        while cur_d <= end_d:
+            d_str = cur_d.strftime("%Y-%m-%d")
+            app_key = f"{ip}:{port}:{slave_id_part}_{d_str}"
+            approvals[app_key] = {
+                "status": "APPROVED",
+                "approved_by": self.current_user,
+                "approved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "notes": f"Approved via View Data ({from_dt.strftime('%H:%M')} to {to_dt.strftime('%H:%M')})"
+            }
+            cur_d += timedelta(days=1)
+            count += 1
+
+        save_approvals(approvals)
+        self.log_audit("DATA_APPROVAL", "APPROVE", f"Approved data for device '{dev_alias}' from {from_dt} to {to_dt}")
+        messagebox.showinfo("Success", f"Data for '{dev_alias}' ({from_dt.strftime('%Y-%m-%d')} to {to_dt.strftime('%Y-%m-%d')}) has been APPROVED and moved to 'Approve Data'!")
+        self.load_view_data_records()
+
+    def load_view_data_records(self):
+        if not hasattr(self, 'view_tree'): return
+        for i in self.view_tree.get_children():
+            self.view_tree.delete(i)
+
+        idx = self.view_node_cb.current()
+        if idx < 0 or idx >= len(self.devices):
+            return
+
+        dev = self.devices[idx]
+        ip, port, slave_id_part = dev['ip'], dev['port'], dev.get('slave_id', 1)
+        dev_alias = dev.get('device_name', ip)
+        dev_names = dev.get('names', {})
+        dev_units = dev.get('units', {})
+        dev_decimals = dev.get('decimals', {})
+
+        try:
+            get_dt = lambda s: datetime.strptime(f"{s['y'].get()}-{s['m'].get()}-{s['d'].get()} {s['h'].get()}:{s['min'].get()}:00", "%Y-%m-%d %H:%M:%S")
+            from_dt = get_dt(self.view_from_dt)
+            to_dt = get_dt(self.view_to_dt)
+        except Exception as e:
+            messagebox.showerror("Error", f"Invalid date selection: {e}")
+            return
+
+        approvals = load_approvals()
+
+        # Read CSV logs
+        prefix = f"{ip.replace('.', '_')}_{port}_s{slave_id_part}"
+        live_dir = os.path.join(DATA_PATH, "live")
+        all_files = []
+        if os.path.exists(live_dir):
+            for f in os.listdir(live_dir):
+                if f.startswith(prefix) and f.endswith(".csv"):
+                    all_files.append(os.path.join(live_dir, f))
+
+        pivoted_data = {}
+        interval_str = self.view_interval_cb.get()
+        interval_map = {"1 Min": 60, "5 Min": 300, "15 Min": 900, "30 Min": 1800, "1 Hour": 3600}
+        interval_sec = interval_map.get(interval_str, 0)
+
+        skipped_approved_count = 0
+
+        for source_file in all_files:
+            try:
+                with open(source_file, 'r', encoding='utf-8', errors='replace') as f_in:
+                    reader = csv.reader((line.replace('\0', '') for line in f_in))
+                    next(reader, None)
+                    for row in reader:
+                        try:
+                            row_dt = datetime.strptime(row[0], "%Y-%m-%d %H:%M:%S")
+                            if from_dt <= row_dt <= to_dt:
+                                row_date_str = row_dt.strftime("%Y-%m-%d")
+                                row_app_key = f"{ip}:{port}:{slave_id_part}_{row_date_str}"
+                                
+                                # EXCLUDE APPROVED DATA FROM VIEW DATA AREA!
+                                if approvals.get(row_app_key, {}).get("status") == "APPROVED":
+                                    skipped_approved_count += 1
+                                    continue
+
+                                ts = row[0]
+                                if interval_sec > 0:
+                                    rounded_ts = int(row_dt.timestamp() // interval_sec * interval_sec)
+                                    ts = datetime.fromtimestamp(rounded_ts).strftime("%Y-%m-%d %H:%M:%S")
+                                reg_addr = str(row[4])
+                                reg_name = dev_names.get(reg_addr, f"Reg {reg_addr}")
+                                unit = dev_units.get(reg_addr, "")
+                                if ts not in pivoted_data: pivoted_data[ts] = {}
+                                
+                                val_str = row[5]
+                                if dev.get('types', {}).get(reg_addr) == "BOOLEAN":
+                                    label_0 = dev.get('ops', {}).get(reg_addr, "OFF")
+                                    label_1 = dev.get('factors', {}).get(reg_addr, "ON")
+                                    try: val_str = label_0 if int(float(row[5])) == 0 else label_1
+                                    except: pass
+                                else:
+                                    try:
+                                        prec = int(dev_decimals.get(reg_addr, 3))
+                                        val_str = f"{float(row[5]):.{prec}f}"
+                                    except: pass
+                                
+                                pivoted_data[ts][reg_name] = f"{val_str}{unit}"
+                        except: continue
+            except: continue
+
+        if pivoted_data:
+            self.view_status_lbl.config(
+                text="VIEW DATA AREA: DRAFT / UNAPPROVED RECORDS ONLY ⚠️ (Select range and click 'APPROVE DATA' to move data to Approve Data)",
+                fg="#FF9800"
+            )
+            for ts in sorted(pivoted_data.keys()):
+                items_str = ", ".join([f"{k}: {v}" for k, v in pivoted_data[ts].items()])
+                self.view_tree.insert("", "end", values=(ts, dev_alias, items_str, "DRAFT"))
+        else:
+            if skipped_approved_count > 0:
+                self.view_status_lbl.config(
+                    text="NOTICE: All data for this selection has been APPROVED and stored in 'Approve Data' section.",
+                    fg=self.COLORS["success"]
+                )
+            else:
+                self.view_status_lbl.config(
+                    text="NO UNAPPROVED DRAFT LOGS FOUND FOR THIS RANGE",
+                    fg=self.COLORS["text_dim"]
+                )
+
+    # -------------------------
+    # VIEW: APPROVE DATA (EXCLUSIVELY FOR APPROVED DATA & EXPORT)
+    # -------------------------
+    def show_approve_data(self):
+        user_perms = self.users.get(self.current_user, {}).get("permissions", [])
+        if "approve_data" not in user_perms:
+            messagebox.showerror("Access Denied", "You do not have permission to access Approve Data.")
+            self.navigate("live_data")
+            return
+
+        layout = tk.Frame(self.content_frame, bg=self.COLORS["bg_dark"])
+        layout.pack(fill="both", expand=True, padx=30, pady=20)
+
+        # Top Control Card (Device, Date Range, Interval & Export Options)
+        card = tk.Frame(layout, bg=self.COLORS["bg_surface"], padx=20, pady=15,
+                        highlightbackground=self.COLORS["bg_highlight"], highlightthickness=1)
+        card.pack(fill="x", pady=(0, 15))
+
+        top_row = tk.Frame(card, bg=self.COLORS["bg_surface"])
+        top_row.pack(fill="x", pady=5)
+
+        # Device Combobox
+        f_dev = tk.Frame(top_row, bg=self.COLORS["bg_surface"])
+        f_dev.pack(side="left", padx=(0, 20))
+        tk.Label(f_dev, text="SELECT DEVICE", font=("Segoe UI", 8, "bold"), 
+                 bg=self.COLORS["bg_surface"], fg=self.COLORS["text_dim"]).pack(anchor="w")
+        display_names = [d.get('device_name') if d.get('device_name') else f"{d['ip']} @ {d.get('slave_id', 1)}" for d in self.devices]
+        self.app_node_cb = ttk.Combobox(f_dev, values=display_names, style="TCombobox", font=self.FONTS["body"], width=22)
+        if display_names: self.app_node_cb.current(0)
+        self.app_node_cb.pack(pady=(5, 0), ipady=4)
+
+        # Date Selectors Helper
+        dt_cnt = tk.Frame(top_row, bg=self.COLORS["bg_surface"])
+        dt_cnt.pack(side="left", fill="x", expand=True)
+
+        def dt_selector(parent, label, initial_dt):
+            f = tk.Frame(parent, bg=self.COLORS["bg_surface"])
+            f.pack(side="left", padx=10)
+            tk.Label(f, text=label, font=("Segoe UI", 8, "bold"), 
+                     bg=self.COLORS["bg_surface"], fg=self.COLORS["text_dim"]).pack(anchor="w")
+            box = tk.Frame(f, bg=self.COLORS["bg_dark"], padx=5, pady=3)
+            box.pack(pady=(5, 0))
+            
+            years = [str(y) for y in range(2024, 2031)]
+            months = [f"{i:02d}" for i in range(1, 13)]
+            days = [f"{i:02d}" for i in range(1, 32)]
+            hours = [f"{i:02d}" for i in range(0, 24)]
+            mins = [f"{i:02d}" for i in range(0, 61)]
+            
+            sel = {}
+            y_cb = ttk.Combobox(box, values=years, width=5, font=("Consolas", 9))
+            y_cb.set(initial_dt.strftime("%Y"))
+            y_cb.pack(side="left")
+            tk.Label(box, text="-", bg=self.COLORS["bg_dark"], fg="white").pack(side="left")
+            m_cb = ttk.Combobox(box, values=months, width=3, font=("Consolas", 9))
+            m_cb.set(initial_dt.strftime("%m"))
+            m_cb.pack(side="left")
+            tk.Label(box, text="-", bg=self.COLORS["bg_dark"], fg="white").pack(side="left")
+            d_cb = ttk.Combobox(box, values=days, width=3, font=("Consolas", 9))
+            d_cb.set(initial_dt.strftime("%d"))
+            d_cb.pack(side="left")
+            
+            tk.Label(box, text="  ", bg=self.COLORS["bg_dark"]).pack(side="left")
+            h_cb = ttk.Combobox(box, values=hours, width=3, font=("Consolas", 9))
+            h_cb.set(initial_dt.strftime("%H"))
+            h_cb.pack(side="left")
+            tk.Label(box, text=":", bg=self.COLORS["bg_dark"], fg="white").pack(side="left")
+            min_cb = ttk.Combobox(box, values=mins, width=3, font=("Consolas", 9))
+            min_cb.set(initial_dt.strftime("%M"))
+            min_cb.pack(side="left")
+            
+            sel['y'], sel['m'], sel['d'], sel['h'], sel['min'] = y_cb, m_cb, d_cb, h_cb, min_cb
+            return sel
+
+        now = datetime.now()
+        start_of_day = now.replace(hour=0, minute=0, second=0)
+        self.app_from_dt = dt_selector(dt_cnt, "FROM DATE & TIME", start_of_day)
+        self.app_to_dt = dt_selector(dt_cnt, "TO DATE & TIME", now)
+
+        # Interval and Export Buttons Row (ONLY EXPORT OPTIONS!)
+        action_row = tk.Frame(card, bg=self.COLORS["bg_surface"])
+        action_row.pack(fill="x", pady=(15, 0))
+
+        f_int = tk.Frame(action_row, bg=self.COLORS["bg_surface"])
+        f_int.pack(side="left")
+        tk.Label(f_int, text="INTERVAL", font=("Segoe UI", 8, "bold"), 
+                 bg=self.COLORS["bg_surface"], fg=self.COLORS["text_dim"]).pack(side="left", padx=(0, 5))
+        self.app_interval_cb = ttk.Combobox(f_int, values=["Raw", "1 Min", "5 Min", "15 Min", "30 Min", "1 Hour"], width=10, style="TCombobox")
+        self.app_interval_cb.set("Raw")
+        self.app_interval_cb.pack(side="left", padx=5)
+
+        tk.Button(action_row, text="🔍 LOAD APPROVED DATA", bg=self.COLORS["accent"], fg="black", 
+                  font=self.FONTS["button"], relief="flat", cursor="hand2", padx=15, pady=6,
+                  command=self.load_approve_data_records).pack(side="left", padx=15)
+
+        # EXPORT OPTIONS FOR APPROVED DATA ONLY
+        if "export_data" in user_perms:
+            tk.Button(action_row, text="📥 EXPORT TO EXCEL", bg=self.COLORS["success"], fg="white", 
+                      font=self.FONTS["button"], relief="flat", cursor="hand2", padx=15, pady=6,
+                      command=lambda: self.perform_export_from_approved("excel")).pack(side="right", padx=5)
+
+            tk.Button(action_row, text="📄 EXPORT TO PDF", bg="#0288D1", fg="white", 
+                      font=self.FONTS["button"], relief="flat", cursor="hand2", padx=15, pady=6,
+                      command=lambda: self.perform_export_from_approved("pdf")).pack(side="right", padx=5)
+
+        # Status Banner
+        self.app_status_lbl = tk.Label(layout, text="APPROVED DATA STORED AREA ✓", 
+                                       font=("Segoe UI", 10, "bold"), fg=self.COLORS["success"], bg=self.COLORS["bg_surface"],
+                                       padx=15, pady=8, highlightbackground=self.COLORS["bg_highlight"], highlightthickness=1)
+        self.app_status_lbl.pack(fill="x", pady=(0, 10))
+
+        # Approved Data Table
+        table_frame = tk.Frame(layout, bg=self.COLORS["bg_surface"])
+        table_frame.pack(fill="both", expand=True)
+
+        self.app_tree = ttk.Treeview(table_frame, columns=("ts", "dev", "details", "status"), show="headings", style="Treeview")
+        self.app_tree.heading("ts", text="TIMESTAMP")
+        self.app_tree.heading("dev", text="DEVICE NAME")
+        self.app_tree.heading("details", text="APPROVED PARAMETER READINGS")
+        self.app_tree.heading("status", text="APPROVAL STATUS")
+
+        self.app_tree.column("ts", width=160, anchor="center")
+        self.app_tree.column("dev", width=160, anchor="w")
+        self.app_tree.column("details", width=450, anchor="w")
+        self.app_tree.column("status", width=150, anchor="center")
+
+        v_sb = ttk.Scrollbar(table_frame, orient="vertical", command=self.app_tree.yview, style="Vertical.TScrollbar")
+        h_sb = ttk.Scrollbar(table_frame, orient="horizontal", command=self.app_tree.xview, style="Horizontal.TScrollbar")
+        self.app_tree.configure(yscrollcommand=v_sb.set, xscrollcommand=h_sb.set)
+
+        v_sb.pack(side="right", fill="y")
+        h_sb.pack(side="bottom", fill="x")
+        self.app_tree.pack(side="left", fill="both", expand=True)
+
+        self.load_approve_data_records()
+
+    def load_approve_data_records(self):
+        if not hasattr(self, 'app_tree'): return
+        for i in self.app_tree.get_children():
+            self.app_tree.delete(i)
+
+        idx = self.app_node_cb.current()
+        if idx < 0 or idx >= len(self.devices): return
+
+        dev = self.devices[idx]
+        ip, port, slave_id_part = dev['ip'], dev['port'], dev.get('slave_id', 1)
+        dev_alias = dev.get('device_name', ip)
+        dev_names = dev.get('names', {})
+        dev_units = dev.get('units', {})
+        dev_decimals = dev.get('decimals', {})
+
+        try:
+            get_dt = lambda s: datetime.strptime(f"{s['y'].get()}-{s['m'].get()}-{s['d'].get()} {s['h'].get()}:{s['min'].get()}:00", "%Y-%m-%d %H:%M:%S")
+            from_dt = get_dt(self.app_from_dt)
+            to_dt = get_dt(self.app_to_dt)
+        except Exception as e:
+            messagebox.showerror("Error", f"Invalid date selection: {e}")
+            return
+
+        approvals = load_approvals()
+
+        prefix = f"{ip.replace('.', '_')}_{port}_s{slave_id_part}"
+        live_dir = os.path.join(DATA_PATH, "live")
+        all_files = []
+        if os.path.exists(live_dir):
+            for f in os.listdir(live_dir):
+                if f.startswith(prefix) and f.endswith(".csv"):
+                    all_files.append(os.path.join(live_dir, f))
+
+        pivoted_data = {}
+        interval_str = self.app_interval_cb.get()
+        interval_map = {"1 Min": 60, "5 Min": 300, "15 Min": 900, "30 Min": 1800, "1 Hour": 3600}
+        interval_sec = interval_map.get(interval_str, 0)
+
+        for source_file in all_files:
+            try:
+                with open(source_file, 'r', encoding='utf-8', errors='replace') as f_in:
+                    reader = csv.reader((line.replace('\0', '') for line in f_in))
+                    next(reader, None)
+                    for row in reader:
+                        try:
+                            row_dt = datetime.strptime(row[0], "%Y-%m-%d %H:%M:%S")
+                            if from_dt <= row_dt <= to_dt:
+                                row_date_str = row_dt.strftime("%Y-%m-%d")
+                                row_app_key = f"{ip}:{port}:{slave_id_part}_{row_date_str}"
+                                
+                                # INCLUDE ONLY APPROVED DATA IN APPROVE DATA AREA!
+                                if approvals.get(row_app_key, {}).get("status") != "APPROVED":
+                                    continue
+
+                                ts = row[0]
+                                if interval_sec > 0:
+                                    rounded_ts = int(row_dt.timestamp() // interval_sec * interval_sec)
+                                    ts = datetime.fromtimestamp(rounded_ts).strftime("%Y-%m-%d %H:%M:%S")
+                                reg_addr = str(row[4])
+                                reg_name = dev_names.get(reg_addr, f"Reg {reg_addr}")
+                                unit = dev_units.get(reg_addr, "")
+                                if ts not in pivoted_data: pivoted_data[ts] = {}
+                                
+                                val_str = row[5]
+                                if dev.get('types', {}).get(reg_addr) == "BOOLEAN":
+                                    label_0 = dev.get('ops', {}).get(reg_addr, "OFF")
+                                    label_1 = dev.get('factors', {}).get(reg_addr, "ON")
+                                    try: val_str = label_0 if int(float(row[5])) == 0 else label_1
+                                    except: pass
+                                else:
+                                    try:
+                                        prec = int(dev_decimals.get(reg_addr, 3))
+                                        val_str = f"{float(row[5]):.{prec}f}"
+                                    except: pass
+                                
+                                pivoted_data[ts][reg_name] = f"{val_str}{unit}"
+                        except: continue
+            except: continue
+
+        if pivoted_data:
+            self.app_status_lbl.config(
+                text="APPROVED DATA STORED AREA ✓ (OFFICIAL APPROVED LOGS)",
+                fg=self.COLORS["success"]
+            )
+            for ts in sorted(pivoted_data.keys()):
+                items_str = ", ".join([f"{k}: {v}" for k, v in pivoted_data[ts].items()])
+                self.app_tree.insert("", "end", values=(ts, dev_alias, items_str, "APPROVED ✓"))
+        else:
+            self.app_status_lbl.config(
+                text="NO APPROVED DATA FOUND FOR THIS RANGE. (Approve data from View Data screen to store data here).",
+                fg=self.COLORS["text_dim"]
+            )
+
+    def perform_export_from_approved(self, fmt="excel"):
+        if hasattr(self, 'export_node') and hasattr(self, 'app_node_cb'):
+            self.export_node.current(self.app_node_cb.current())
+        if hasattr(self, 'export_from_selectors') and hasattr(self, 'app_from_dt'):
+            for k in ['y', 'm', 'd', 'h', 'min']:
+                self.export_from_selectors[k].set(self.app_from_dt[k].get())
+        if hasattr(self, 'export_to_selectors') and hasattr(self, 'app_to_dt'):
+            for k in ['y', 'm', 'd', 'h', 'min']:
+                self.export_to_selectors[k].set(self.app_to_dt[k].get())
+        if hasattr(self, 'export_interval_cb') and hasattr(self, 'app_interval_cb'):
+            self.export_interval_cb.set(self.app_interval_cb.get())
+        
+        self.perform_export(fmt)
+
+    # -------------------------
     # VIEW: DATA EXPORT
     # -------------------------
     def show_export_data(self):
+        user_perms = self.users.get(self.current_user, {}).get("permissions", [])
+        if "export_data" not in user_perms:
+            messagebox.showerror("Access Denied", "You do not have permission to access Data Export.")
+            self.navigate("live_data")
+            return
         layout = tk.Frame(self.content_frame, bg=self.COLORS["bg_dark"])
         layout.pack(fill="both", expand=True)
 
@@ -4758,18 +6223,50 @@ class ModbusApp:
                     messagebox.showwarning("No Data", "No records found for the range.")
                     return
 
+                # Check approval status of target device and date range
+                date_str = from_dt.strftime("%Y-%m-%d")
+                app_key = f"{ip}:{port}:{slave_id_part}_{date_str}"
+                is_approved = (load_approvals().get(app_key, {}).get("status") == "APPROVED")
+
                 # Generate Optimized PDF
                 c = canvas.Canvas(target_file, pagesize=letter)
                 w, h = letter
                 
+                def draw_draft_watermark(canvas_obj):
+                    if not is_approved:
+                        canvas_obj.saveState()
+                        canvas_obj.setFont("Helvetica-Bold", 64)
+                        canvas_obj.setFillColorRGB(0.88, 0.88, 0.88)
+                        canvas_obj.translate(w / 2.0, h / 2.0)
+                        canvas_obj.rotate(45)
+                        canvas_obj.drawCentredString(0, 0, "DRAFT")
+                        canvas_obj.restoreState()
+
                 def draw_report_header(canvas_obj, page_num):
                     # Background
                     canvas_obj.setFillColorRGB(1, 1, 1); canvas_obj.rect(0, 0, w, h, fill=1)
                     
+                    # DRAFT Diagonal Watermark (only if not approved)
+                    draw_draft_watermark(canvas_obj)
+
                     # Title
                     canvas_obj.setFillColorRGB(0.01, 0.35, 0.73); canvas_obj.setFont("Helvetica-Bold", 18)
                     canvas_obj.drawString(40, h-50, "TempTrek Environmental Monitoring System")
                     
+                    # Header Stamp Badge (Top Right)
+                    if is_approved:
+                        canvas_obj.setFillColorRGB(0.15, 0.65, 0.25)
+                        canvas_obj.rect(w - 150, h - 55, 110, 24, fill=1, stroke=0)
+                        canvas_obj.setFillColorRGB(1, 1, 1)
+                        canvas_obj.setFont("Helvetica-Bold", 11)
+                        canvas_obj.drawCentredString(w - 95, h - 48, "APPROVED ✓")
+                    else:
+                        canvas_obj.setFillColorRGB(0.9, 0.25, 0.15)
+                        canvas_obj.rect(w - 140, h - 55, 100, 24, fill=1, stroke=0)
+                        canvas_obj.setFillColorRGB(1, 1, 1)
+                        canvas_obj.setFont("Helvetica-Bold", 12)
+                        canvas_obj.drawCentredString(w - 90, h - 48, "DRAFT")
+
                     # Metadata
                     canvas_obj.setFont("Helvetica", 9); canvas_obj.setFillColorRGB(0.5, 0.5, 0.5)
                     canvas_obj.drawString(40, h-70, f"DEVICE: {dev_alias} | GENERATED: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
@@ -5455,23 +6952,26 @@ class ModbusApp:
         tree.heading("time", text="TIMESTAMP")
         tree.heading("device", text="DEVICE NAME")
         tree.heading("field", text="FIELD NAME")
-        tree.heading("reg", text="ADDR")
-        tree.heading("val", text="READING")
-        tree.heading("cond", text="COND")
-        tree.heading("thresh", text="THRESH")
+        tree.heading("reg", text="ADDRESS")
+        tree.heading("val", text="DATA READING")
+        tree.heading("cond", text="CONDITION")
+        tree.heading("thresh", text="THRESHOLD VALUE")
         
-        tree.column("time", width=140, anchor="center")
-        tree.column("device", width=140, anchor="w")
-        tree.column("field", width=160, anchor="w")
-        tree.column("reg", width=60, anchor="center")
-        tree.column("val", width=80, anchor="center")
-        tree.column("cond", width=60, anchor="center")
-        tree.column("thresh", width=80, anchor="center")
+        tree.column("time", width=160, minwidth=140, anchor="center", stretch=False)
+        tree.column("device", width=160, minwidth=130, anchor="w", stretch=True)
+        tree.column("field", width=180, minwidth=150, anchor="w", stretch=True)
+        tree.column("reg", width=100, minwidth=85, anchor="center", stretch=False)
+        tree.column("val", width=130, minwidth=110, anchor="center", stretch=False)
+        tree.column("cond", width=110, minwidth=95, anchor="center", stretch=False)
+        tree.column("thresh", width=160, minwidth=140, anchor="center", stretch=False)
         
-        v_sb = ttk.Scrollbar(cnt, orient="vertical", command=tree.yview)
-        tree.configure(yscrollcommand=v_sb.set)
+        v_sb = ttk.Scrollbar(cnt, orient="vertical", command=tree.yview, style="Vertical.TScrollbar")
+        h_sb = ttk.Scrollbar(cnt, orient="horizontal", command=tree.xview, style="Horizontal.TScrollbar")
+        tree.configure(yscrollcommand=v_sb.set, xscrollcommand=h_sb.set)
+        
         v_sb.pack(side="right", fill="y")
-        tree.pack(fill="both", expand=True)
+        h_sb.pack(side="bottom", fill="x")
+        tree.pack(side="left", fill="both", expand=True)
         self.alerts_live_tree = tree
 
         # Load Data
@@ -5529,21 +7029,24 @@ class ModbusApp:
         tree = ttk.Treeview(cnt, columns=cols, show="headings", style="Treeview")
         
         tree.heading("time", text="TIMESTAMP")
-        tree.heading("device", text="DEVICE")
-        tree.heading("field", text="FIELD")
-        tree.heading("recipient", text="RECIPIENT")
-        tree.heading("status", text="STATUS")
+        tree.heading("device", text="DEVICE NAME")
+        tree.heading("field", text="FIELD NAME")
+        tree.heading("recipient", text="RECIPIENT EMAIL")
+        tree.heading("status", text="DELIVERY STATUS")
         
-        tree.column("time", width=140, anchor="center")
-        tree.column("device", width=140, anchor="w")
-        tree.column("field", width=140, anchor="w")
-        tree.column("recipient", width=180, anchor="w")
-        tree.column("status", width=80, anchor="center")
+        tree.column("time", width=160, minwidth=140, anchor="center", stretch=False)
+        tree.column("device", width=160, minwidth=130, anchor="w", stretch=True)
+        tree.column("field", width=160, minwidth=130, anchor="w", stretch=True)
+        tree.column("recipient", width=220, minwidth=180, anchor="w", stretch=False)
+        tree.column("status", width=130, minwidth=100, anchor="center", stretch=False)
         
-        v_sb = ttk.Scrollbar(cnt, orient="vertical", command=tree.yview)
-        tree.configure(yscrollcommand=v_sb.set)
+        v_sb = ttk.Scrollbar(cnt, orient="vertical", command=tree.yview, style="Vertical.TScrollbar")
+        h_sb = ttk.Scrollbar(cnt, orient="horizontal", command=tree.xview, style="Horizontal.TScrollbar")
+        tree.configure(yscrollcommand=v_sb.set, xscrollcommand=h_sb.set)
+        
         v_sb.pack(side="right", fill="y")
-        tree.pack(fill="both", expand=True)
+        h_sb.pack(side="bottom", fill="x")
+        tree.pack(side="left", fill="both", expand=True)
         self.email_logs_live_tree = tree
 
         fn = os.path.join(DATA_PATH, "live", f"Email_Logs_{date_str}.csv")
@@ -5714,23 +7217,23 @@ class ModbusApp:
         
         self.log_tree.heading("sno", text="S.NO")
         self.log_tree.heading("device", text="DEVICE NAME")
-        self.log_tree.heading("node", text="NODE")
+        self.log_tree.heading("node", text="NODE ALIAS")
         self.log_tree.heading("name", text="FIELD NAME")
-        self.log_tree.heading("addr", text="ADDR")
+        self.log_tree.heading("addr", text="ADDRESS")
         self.log_tree.heading("val", text="DATA READING")
         self.log_tree.heading("unit", text="UNIT")
-        self.log_tree.heading("dtype", text="TYPE")
+        self.log_tree.heading("dtype", text="DATA TYPE")
         self.log_tree.heading("dt", text="TIMESTAMP")
         
-        self.log_tree.column("sno", width=60, anchor="center")
-        self.log_tree.column("device", width=140, anchor="w")
-        self.log_tree.column("node", width=140, anchor="w")
-        self.log_tree.column("name", width=180, anchor="w")
-        self.log_tree.column("addr", width=60, anchor="center")
-        self.log_tree.column("val", width=100, anchor="center")
-        self.log_tree.column("unit", width=60, anchor="center")
-        self.log_tree.column("dtype", width=80, anchor="center")
-        self.log_tree.column("dt", width=120, anchor="center")
+        self.log_tree.column("sno", width=65, minwidth=55, anchor="center", stretch=False)
+        self.log_tree.column("device", width=160, minwidth=130, anchor="w", stretch=True)
+        self.log_tree.column("node", width=160, minwidth=130, anchor="w", stretch=True)
+        self.log_tree.column("name", width=180, minwidth=150, anchor="w", stretch=True)
+        self.log_tree.column("addr", width=100, minwidth=85, anchor="center", stretch=False)
+        self.log_tree.column("val", width=130, minwidth=110, anchor="center", stretch=False)
+        self.log_tree.column("unit", width=75, minwidth=60, anchor="center", stretch=False)
+        self.log_tree.column("dtype", width=110, minwidth=90, anchor="center", stretch=False)
+        self.log_tree.column("dt", width=160, minwidth=140, anchor="center", stretch=False)
         
         v_sb = ttk.Scrollbar(cnt, orient="vertical", command=self.log_tree.yview, style="Vertical.TScrollbar")
         h_sb = ttk.Scrollbar(cnt, orient="horizontal", command=self.log_tree.xview, style="Horizontal.TScrollbar")
@@ -6056,16 +7559,19 @@ class ModbusApp:
         self.audit_tree.heading("category", text="CATEGORY")
         self.audit_tree.heading("details", text="DETAILS")
 
-        self.audit_tree.column("timestamp", width=140, anchor="center")
-        self.audit_tree.column("user", width=110, anchor="w")
-        self.audit_tree.column("action", width=130, anchor="w")
-        self.audit_tree.column("category", width=130, anchor="w")
-        self.audit_tree.column("details", width=420, anchor="w")
+        self.audit_tree.column("timestamp", width=160, minwidth=140, anchor="center", stretch=False)
+        self.audit_tree.column("user", width=130, minwidth=100, anchor="w", stretch=False)
+        self.audit_tree.column("action", width=150, minwidth=120, anchor="w", stretch=False)
+        self.audit_tree.column("category", width=150, minwidth=120, anchor="w", stretch=False)
+        self.audit_tree.column("details", width=450, minwidth=250, anchor="w", stretch=True)
 
-        v_sb = ttk.Scrollbar(cnt, orient="vertical", command=self.audit_tree.yview)
-        self.audit_tree.configure(yscrollcommand=v_sb.set)
+        v_sb = ttk.Scrollbar(cnt, orient="vertical", command=self.audit_tree.yview, style="Vertical.TScrollbar")
+        h_sb = ttk.Scrollbar(cnt, orient="horizontal", command=self.audit_tree.xview, style="Horizontal.TScrollbar")
+        self.audit_tree.configure(yscrollcommand=v_sb.set, xscrollcommand=h_sb.set)
+        
         v_sb.pack(side="right", fill="y")
-        self.audit_tree.pack(fill="both", expand=True)
+        h_sb.pack(side="bottom", fill="x")
+        self.audit_tree.pack(side="left", fill="both", expand=True)
 
         self.refresh_audit_log_view()
 
