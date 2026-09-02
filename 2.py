@@ -5,12 +5,13 @@ import threading
 import json
 import os
 import csv
+import re
 import webbrowser
 from datetime import datetime, timedelta
 from collections import deque
 import random
 import tkinter as tk
-from tkinter import ttk, messagebox, filedialog
+from tkinter import ttk, messagebox, filedialog, simpledialog
 
 try:
     from pymodbus.client.sync import ModbusTcpClient
@@ -312,6 +313,40 @@ def save_approvals(approvals_data):
     with open(APPROVALS_FILE, "w") as f:
         data_str = json.dumps(approvals_data, indent=4)
         f.write(obfuscate_data(data_str))
+
+def is_timestamp_approved(approvals, ip, port, slave_id, row_dt):
+    """Return whether one exact reading timestamp is inside an approved range."""
+    day_key = f"{ip}:{port}:{slave_id}_{row_dt.strftime('%Y-%m-%d')}"
+    entry = approvals.get(day_key, {})
+
+    # New format: one day may contain one or more exact From/To ranges.
+    for approved_range in entry.get("ranges", []):
+        try:
+            range_from = datetime.strptime(approved_range["from"], "%Y-%m-%d %H:%M:%S")
+            range_to = datetime.strptime(approved_range["to"], "%Y-%m-%d %H:%M:%S")
+            if range_from <= row_dt <= range_to:
+                return True
+        except (KeyError, TypeError, ValueError):
+            continue
+
+    # Older versions saved the selected times in the note but marked the whole
+    # date approved. Recover that original selection instead of approving every
+    # reading on the day.
+    if entry.get("status") == "APPROVED" and "ranges" not in entry:
+        note = str(entry.get("notes", ""))
+        match = re.search(r"\((\d{2}:\d{2}(?::\d{2})?)\s+to\s+(\d{2}:\d{2}(?::\d{2})?)\)", note)
+        if match:
+            try:
+                start_text = match.group(1) + (":00" if len(match.group(1)) == 5 else "")
+                end_text = match.group(2) + (":00" if len(match.group(2)) == 5 else "")
+                day_text = row_dt.strftime("%Y-%m-%d")
+                legacy_from = datetime.strptime(f"{day_text} {start_text}", "%Y-%m-%d %H:%M:%S")
+                legacy_to = datetime.strptime(f"{day_text} {end_text}", "%Y-%m-%d %H:%M:%S")
+                return legacy_from <= row_dt <= legacy_to
+            except ValueError:
+                return False
+        return True
+    return False
 
 def load_users():
     # Define default superadmin and admin in case of failure or first run
@@ -1634,7 +1669,11 @@ class ModbusApp:
         elif view_name == "email_logs_view":
             self.show_email_logs_history()
         elif view_name == "user_manager":
-            self.show_user_manager()
+            if "user_manager" in self.users.get(self.current_user, {}).get("permissions", []):
+                self.show_user_manager()
+            else:
+                messagebox.showerror("Access Denied", "You do not have permission to manage system users.")
+                self.navigate("live_data")
         elif view_name == "audit_log":
             self.show_audit_log()
 
@@ -2830,6 +2869,20 @@ class ModbusApp:
 
         self.u_manager_name = fld("USERNAME")
         self.u_manager_pass = fld("PASSWORD", show="*")
+
+        # Approval authority is a role, separate from screen permissions. Only
+        # Super Admin may grant or remove it.
+        self.u_manager_approver = tk.BooleanVar(value=False)
+        current_is_superadmin = (self.current_user == "superadmin") or self.users.get(self.current_user, {}).get("is_superadmin", False)
+        self.u_manager_approver_cb = tk.Checkbutton(
+            left, text="APPROVER (may approve data after password verification)",
+            variable=self.u_manager_approver, bg=self.COLORS["bg_surface"],
+            fg=self.COLORS["warning"], selectcolor=self.COLORS["bg_dark"],
+            activebackground=self.COLORS["bg_surface"], activeforeground="white",
+            font=("Segoe UI", 8, "bold"), relief="flat", borderwidth=0,
+            state="normal" if current_is_superadmin else "disabled"
+        )
+        self.u_manager_approver_cb.pack(anchor="w", pady=(10, 0))
         
         tk.Label(left, text="PERMISSIONS", font=("Segoe UI", 8, "bold"), fg=self.COLORS["text_dim"], bg=self.COLORS["bg_surface"]).pack(anchor="w", pady=(15, 5))
         
@@ -2837,8 +2890,6 @@ class ModbusApp:
         perms = [
             ("live_data", "Live Dashboard"),
             ("live_log", "Live Log"),
-            ("view_data", "View Data"),
-            ("approve_data", "Approve Data"),
             ("export_data", "Data Export"),
             ("email_config", "Email Alerts"),
             ("email_smtp_config", "Gmail Configuration"),
@@ -2847,6 +2898,10 @@ class ModbusApp:
             ("user_manager", "User Manager"),
             ("audit_log", "Audit Log")
         ]
+        if current_is_superadmin:
+            # Only Super Admin can see and assign these sensitive permissions.
+            perms.insert(2, ("view_data", "View Data (Super Admin grants only)"))
+            perms.insert(3, ("approve_data", "Approve Data (Super Admin grants only)"))
         
         for pid, pname in perms:
             var = tk.BooleanVar(value=True if pid != "user_manager" else False)
@@ -2920,8 +2975,11 @@ class ModbusApp:
                 utype = "SUPER ADMIN"
                 perms = "ALL MODULES (FULL ACCESS)"
             elif udata.get("is_admin") or uname == "admin":
-                utype = "ADMIN"
+                utype = "ADMIN / APPROVER" if udata.get("is_approver") else "ADMIN"
                 perms = "ALL MODULES (EXCEPT DEVICE MGR)"
+            elif udata.get("is_approver"):
+                utype = "APPROVER"
+                perms = "APPROVAL AUTHORITY; " + (f"{len(clean_perms)} MODULES ACCESS" if clean_perms else "NO MODULE ACCESS")
             else:
                 utype = "OPERATOR"
                 if len(clean_perms) >= 5:
@@ -2949,6 +3007,7 @@ class ModbusApp:
             up = udata.get("permissions", [])
             for pid, var in self.perm_vars.items():
                 var.set(True if pid in up else False)
+            self.u_manager_approver.set(bool(udata.get("is_approver", False)))
 
     def add_user_submit(self):
         uname = self.u_manager_name.get().lower().strip()
@@ -2974,6 +3033,18 @@ class ModbusApp:
         # Maintain superadmin / admin status if updating
         is_superadmin = self.users[uname].get("is_superadmin", False) if is_update else (uname == "superadmin")
         is_admin = self.users[uname].get("is_admin", False) if is_update else (uname in ["admin", "superadmin"])
+        manager_is_superadmin = (self.current_user == "superadmin") or self.users.get(self.current_user, {}).get("is_superadmin", False)
+        old_is_approver = self.users.get(uname, {}).get("is_approver", False)
+        is_approver = self.u_manager_approver.get() if manager_is_superadmin else old_is_approver
+
+        # An Admin may edit other account settings, but cannot grant or revoke
+        # View Data / Approve Data. Preserve those values exactly as assigned by
+        # Super Admin.
+        if not manager_is_superadmin and is_update:
+            old_sensitive_perms = self.users.get(uname, {}).get("permissions", [])
+            for sensitive_perm in ("view_data", "approve_data"):
+                if sensitive_perm in old_sensitive_perms and sensitive_perm not in selected_perms:
+                    selected_perms.append(sensitive_perm)
 
         # Device Manager (add_device) permission is strictly reserved for superadmin
         if is_superadmin or uname == "superadmin":
@@ -2995,6 +3066,8 @@ class ModbusApp:
                 changes.append(f"Added perms: [{', '.join(added)}]")
             if removed:
                 changes.append(f"Removed perms: [{', '.join(removed)}]")
+            if old_is_approver != is_approver:
+                changes.append(f"Approver role: {'enabled' if is_approver else 'disabled'}")
             diff_str = "; ".join(changes) if changes else "No permission/passcode changes"
             audit_msg = f"Updated user '{uname.upper()}': {diff_str}"
             act = "USER_UPDATE"
@@ -3006,7 +3079,8 @@ class ModbusApp:
             "password": h,
             "permissions": selected_perms,
             "is_admin": is_admin,
-            "is_superadmin": is_superadmin
+            "is_superadmin": is_superadmin,
+            "is_approver": is_approver
         }
         
         save_users(self.users)
@@ -3014,6 +3088,7 @@ class ModbusApp:
         self.refresh_user_list()
         self.u_manager_name.delete(0, tk.END)
         self.u_manager_pass.delete(0, tk.END)
+        self.u_manager_approver.set(False)
         
         msg = f"User {uname} updated successfully" if is_update else f"User {uname} created successfully"
         messagebox.showinfo("Success", msg)
@@ -5505,8 +5580,10 @@ class ModbusApp:
                   font=self.FONTS["button"], relief="flat", cursor="hand2", padx=15, pady=6,
                   command=self.load_view_data_records).pack(side="left", padx=10)
 
-        is_superadmin = (self.current_user == "superadmin") or self.users.get(self.current_user, {}).get("is_superadmin", False)
-        if "approve_data" in user_perms or is_superadmin:
+        current_user_data = self.users.get(self.current_user, {})
+        is_superadmin = (self.current_user == "superadmin") or current_user_data.get("is_superadmin", False)
+        is_approver = current_user_data.get("is_approver", False)
+        if is_approver or is_superadmin:
             tk.Button(action_row, text="✓ APPROVE DATA", bg=self.COLORS["success"], fg="white", 
                       font=self.FONTS["button"], relief="flat", cursor="hand2", padx=15, pady=6,
                       command=self.submit_data_approval_from_view_data).pack(side="left", padx=10)
@@ -5530,16 +5607,26 @@ class ModbusApp:
         table_frame = tk.Frame(layout, bg=self.COLORS["bg_surface"])
         table_frame.pack(fill="both", expand=True)
 
-        self.view_tree = ttk.Treeview(table_frame, columns=("ts", "dev", "details", "status"), show="headings", style="Treeview")
+        # Register columns are configured for the selected device when LOAD DATA
+        # is clicked. Up to eight readings are displayed as individual columns.
+        initial_reg_names = []
+        if self.devices:
+            first_dev = self.devices[0]
+            first_regs = sorted(first_dev.get("registers", []), key=lambda value: int(value))[:8]
+            initial_reg_names = [first_dev.get("names", {}).get(str(reg), f"Reg {reg}") for reg in first_regs]
+        register_columns = tuple(f"reg_{i}" for i in range(len(initial_reg_names)))
+        self.view_tree = ttk.Treeview(table_frame, columns=("ts", "dev") + register_columns + ("status",), show="headings", style="Treeview")
         self.view_tree.heading("ts", text="TIMESTAMP")
         self.view_tree.heading("dev", text="DEVICE NAME")
-        self.view_tree.heading("details", text="LOGGED READINGS / PARAMETERS")
         self.view_tree.heading("status", text="APPROVAL STATUS")
 
         self.view_tree.column("ts", width=160, anchor="center")
         self.view_tree.column("dev", width=160, anchor="w")
-        self.view_tree.column("details", width=450, anchor="w")
         self.view_tree.column("status", width=150, anchor="center")
+        for i, reg_name in enumerate(initial_reg_names):
+            col = f"reg_{i}"
+            self.view_tree.heading(col, text=str(reg_name).upper())
+            self.view_tree.column(col, width=125, minwidth=90, anchor="center")
 
         v_sb = ttk.Scrollbar(table_frame, orient="vertical", command=self.view_tree.yview, style="Vertical.TScrollbar")
         h_sb = ttk.Scrollbar(table_frame, orient="horizontal", command=self.view_tree.xview, style="Horizontal.TScrollbar")
@@ -5549,10 +5636,34 @@ class ModbusApp:
         h_sb.pack(side="bottom", fill="x")
         self.view_tree.pack(side="left", fill="both", expand=True)
 
-        # Auto-load initial data
-        self.load_view_data_records()
+        # Keep this view static until the operator explicitly clicks LOAD DATA.
+        # This avoids silently changing the displayed approval/export snapshot.
+        self.view_status_lbl.config(
+            text="SELECT DEVICE / DATE RANGE, THEN CLICK LOAD DATA",
+            fg=self.COLORS["text_dim"]
+        )
 
     def submit_data_approval_from_view_data(self):
+        current_user_data = self.users.get(self.current_user, {})
+        is_superadmin = (self.current_user == "superadmin") or current_user_data.get("is_superadmin", False)
+        if not is_superadmin and not current_user_data.get("is_approver", False):
+            self.log_audit("DATA_APPROVAL_DENIED", "SECURITY", f"Unauthorized approval attempt by '{self.current_user}'")
+            messagebox.showerror("Access Denied", "Only a designated Approver or Super Admin can approve data.")
+            return
+
+        entered_password = simpledialog.askstring(
+            "Approval Authentication",
+            f"Enter the password for '{self.current_user}' to approve this data:",
+            show="*", parent=self.root
+        )
+        if entered_password is None:
+            return
+        entered_hash = hashlib.sha256(entered_password.encode()).hexdigest()
+        if entered_hash != current_user_data.get("password", ""):
+            self.log_audit("DATA_APPROVAL_DENIED", "SECURITY", f"Incorrect approval password entered for '{self.current_user}'")
+            messagebox.showerror("Authentication Failed", "Incorrect password. Data was not approved.")
+            return
+
         idx = self.view_node_cb.current()
         if idx < 0 or idx >= len(self.devices):
             messagebox.showerror("Error", "Select a valid device.")
@@ -5566,6 +5677,9 @@ class ModbusApp:
             get_dt = lambda s: datetime.strptime(f"{s['y'].get()}-{s['m'].get()}-{s['d'].get()} {s['h'].get()}:{s['min'].get()}:00", "%Y-%m-%d %H:%M:%S")
             from_dt = get_dt(self.view_from_dt)
             to_dt = get_dt(self.view_to_dt)
+            if to_dt < from_dt:
+                messagebox.showwarning("Date Range", "TO date/time must be after FROM date/time.")
+                return
         except Exception as e:
             messagebox.showerror("Error", f"Invalid date selection: {e}")
             return
@@ -5578,12 +5692,19 @@ class ModbusApp:
         while cur_d <= end_d:
             d_str = cur_d.strftime("%Y-%m-%d")
             app_key = f"{ip}:{port}:{slave_id_part}_{d_str}"
-            approvals[app_key] = {
-                "status": "APPROVED",
+            entry = approvals.setdefault(app_key, {"ranges": []})
+            # Convert/replace new entries without marking the whole date approved.
+            entry.pop("status", None)
+            ranges = entry.setdefault("ranges", [])
+            range_record = {
+                "from": from_dt.strftime("%Y-%m-%d %H:%M:%S"),
+                "to": to_dt.strftime("%Y-%m-%d %H:%M:%S"),
                 "approved_by": self.current_user,
                 "approved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "notes": f"Approved via View Data ({from_dt.strftime('%H:%M')} to {to_dt.strftime('%H:%M')})"
+                "notes": f"Approved via View Data ({from_dt.strftime('%H:%M:%S')} to {to_dt.strftime('%H:%M:%S')})"
             }
+            if not any(r.get("from") == range_record["from"] and r.get("to") == range_record["to"] for r in ranges):
+                ranges.append(range_record)
             cur_d += timedelta(days=1)
             count += 1
 
@@ -5607,6 +5728,24 @@ class ModbusApp:
         dev_names = dev.get('names', {})
         dev_units = dev.get('units', {})
         dev_decimals = dev.get('decimals', {})
+
+        # Build stable register columns in configured address order. Values for
+        # each timestamp are placed below their corresponding register name.
+        configured_regs = sorted(dev.get("registers", []), key=lambda value: int(value))[:8]
+        configured_reg_keys = {str(reg) for reg in configured_regs}
+        register_names = [dev_names.get(str(reg), f"Reg {reg}") for reg in configured_regs]
+        register_columns = tuple(f"reg_{i}" for i in range(len(register_names)))
+        self.view_tree.configure(columns=("ts", "dev") + register_columns + ("status",))
+        self.view_tree.heading("ts", text="TIMESTAMP")
+        self.view_tree.heading("dev", text="DEVICE NAME")
+        self.view_tree.heading("status", text="APPROVAL STATUS")
+        self.view_tree.column("ts", width=160, minwidth=145, anchor="center", stretch=False)
+        self.view_tree.column("dev", width=140, minwidth=110, anchor="w", stretch=False)
+        self.view_tree.column("status", width=130, minwidth=105, anchor="center", stretch=False)
+        for i, reg_name in enumerate(register_names):
+            col = f"reg_{i}"
+            self.view_tree.heading(col, text=str(reg_name).upper())
+            self.view_tree.column(col, width=125, minwidth=90, anchor="center", stretch=True)
 
         try:
             get_dt = lambda s: datetime.strptime(f"{s['y'].get()}-{s['m'].get()}-{s['d'].get()} {s['h'].get()}:{s['min'].get()}:00", "%Y-%m-%d %H:%M:%S")
@@ -5647,7 +5786,7 @@ class ModbusApp:
                                 row_app_key = f"{ip}:{port}:{slave_id_part}_{row_date_str}"
                                 
                                 # EXCLUDE APPROVED DATA FROM VIEW DATA AREA!
-                                if approvals.get(row_app_key, {}).get("status") == "APPROVED":
+                                if is_timestamp_approved(approvals, ip, port, slave_id_part, row_dt):
                                     skipped_approved_count += 1
                                     continue
 
@@ -5656,6 +5795,8 @@ class ModbusApp:
                                     rounded_ts = int(row_dt.timestamp() // interval_sec * interval_sec)
                                     ts = datetime.fromtimestamp(rounded_ts).strftime("%Y-%m-%d %H:%M:%S")
                                 reg_addr = str(row[4])
+                                if reg_addr not in configured_reg_keys:
+                                    continue
                                 reg_name = dev_names.get(reg_addr, f"Reg {reg_addr}")
                                 unit = dev_units.get(reg_addr, "")
                                 if ts not in pivoted_data: pivoted_data[ts] = {}
@@ -5682,8 +5823,8 @@ class ModbusApp:
                 fg="#FF9800"
             )
             for ts in sorted(pivoted_data.keys()):
-                items_str = ", ".join([f"{k}: {v}" for k, v in pivoted_data[ts].items()])
-                self.view_tree.insert("", "end", values=(ts, dev_alias, items_str, "DRAFT"))
+                reading_values = [pivoted_data[ts].get(name, "-") for name in register_names]
+                self.view_tree.insert("", "end", values=(ts, dev_alias, *reading_values, "DRAFT"))
         else:
             if skipped_approved_count > 0:
                 self.view_status_lbl.config(
@@ -5811,16 +5952,24 @@ class ModbusApp:
         table_frame = tk.Frame(layout, bg=self.COLORS["bg_surface"])
         table_frame.pack(fill="both", expand=True)
 
-        self.app_tree = ttk.Treeview(table_frame, columns=("ts", "dev", "details", "status"), show="headings", style="Treeview")
+        initial_reg_names = []
+        if self.devices:
+            first_dev = self.devices[0]
+            first_regs = sorted(first_dev.get("registers", []), key=lambda value: int(value))[:8]
+            initial_reg_names = [first_dev.get("names", {}).get(str(reg), f"Reg {reg}") for reg in first_regs]
+        register_columns = tuple(f"reg_{i}" for i in range(len(initial_reg_names)))
+        self.app_tree = ttk.Treeview(table_frame, columns=("ts", "dev") + register_columns + ("status",), show="headings", style="Treeview")
         self.app_tree.heading("ts", text="TIMESTAMP")
         self.app_tree.heading("dev", text="DEVICE NAME")
-        self.app_tree.heading("details", text="APPROVED PARAMETER READINGS")
         self.app_tree.heading("status", text="APPROVAL STATUS")
 
         self.app_tree.column("ts", width=160, anchor="center")
         self.app_tree.column("dev", width=160, anchor="w")
-        self.app_tree.column("details", width=450, anchor="w")
         self.app_tree.column("status", width=150, anchor="center")
+        for i, reg_name in enumerate(initial_reg_names):
+            col = f"reg_{i}"
+            self.app_tree.heading(col, text=str(reg_name).upper())
+            self.app_tree.column(col, width=125, minwidth=90, anchor="center")
 
         v_sb = ttk.Scrollbar(table_frame, orient="vertical", command=self.app_tree.yview, style="Vertical.TScrollbar")
         h_sb = ttk.Scrollbar(table_frame, orient="horizontal", command=self.app_tree.xview, style="Horizontal.TScrollbar")
@@ -5846,6 +5995,22 @@ class ModbusApp:
         dev_names = dev.get('names', {})
         dev_units = dev.get('units', {})
         dev_decimals = dev.get('decimals', {})
+
+        configured_regs = sorted(dev.get("registers", []), key=lambda value: int(value))[:8]
+        configured_reg_keys = {str(reg) for reg in configured_regs}
+        register_names = [dev_names.get(str(reg), f"Reg {reg}") for reg in configured_regs]
+        register_columns = tuple(f"reg_{i}" for i in range(len(register_names)))
+        self.app_tree.configure(columns=("ts", "dev") + register_columns + ("status",))
+        self.app_tree.heading("ts", text="TIMESTAMP")
+        self.app_tree.heading("dev", text="DEVICE NAME")
+        self.app_tree.heading("status", text="APPROVAL STATUS")
+        self.app_tree.column("ts", width=160, minwidth=145, anchor="center", stretch=False)
+        self.app_tree.column("dev", width=140, minwidth=110, anchor="w", stretch=False)
+        self.app_tree.column("status", width=130, minwidth=105, anchor="center", stretch=False)
+        for i, reg_name in enumerate(register_names):
+            col = f"reg_{i}"
+            self.app_tree.heading(col, text=str(reg_name).upper())
+            self.app_tree.column(col, width=125, minwidth=90, anchor="center", stretch=True)
 
         try:
             get_dt = lambda s: datetime.strptime(f"{s['y'].get()}-{s['m'].get()}-{s['d'].get()} {s['h'].get()}:{s['min'].get()}:00", "%Y-%m-%d %H:%M:%S")
@@ -5883,7 +6048,7 @@ class ModbusApp:
                                 row_app_key = f"{ip}:{port}:{slave_id_part}_{row_date_str}"
                                 
                                 # INCLUDE ONLY APPROVED DATA IN APPROVE DATA AREA!
-                                if approvals.get(row_app_key, {}).get("status") != "APPROVED":
+                                if not is_timestamp_approved(approvals, ip, port, slave_id_part, row_dt):
                                     continue
 
                                 ts = row[0]
@@ -5891,6 +6056,8 @@ class ModbusApp:
                                     rounded_ts = int(row_dt.timestamp() // interval_sec * interval_sec)
                                     ts = datetime.fromtimestamp(rounded_ts).strftime("%Y-%m-%d %H:%M:%S")
                                 reg_addr = str(row[4])
+                                if reg_addr not in configured_reg_keys:
+                                    continue
                                 reg_name = dev_names.get(reg_addr, f"Reg {reg_addr}")
                                 unit = dev_units.get(reg_addr, "")
                                 if ts not in pivoted_data: pivoted_data[ts] = {}
@@ -5917,8 +6084,8 @@ class ModbusApp:
                 fg=self.COLORS["success"]
             )
             for ts in sorted(pivoted_data.keys()):
-                items_str = ", ".join([f"{k}: {v}" for k, v in pivoted_data[ts].items()])
-                self.app_tree.insert("", "end", values=(ts, dev_alias, items_str, "APPROVED ✓"))
+                reading_values = [pivoted_data[ts].get(name, "-") for name in register_names]
+                self.app_tree.insert("", "end", values=(ts, dev_alias, *reading_values, "APPROVED"))
         else:
             self.app_status_lbl.config(
                 text="NO APPROVED DATA FOUND FOR THIS RANGE. (Approve data from View Data screen to store data here).",
@@ -5926,17 +6093,7 @@ class ModbusApp:
             )
 
     def perform_export_from_approved(self, fmt="excel"):
-        if hasattr(self, 'export_node') and hasattr(self, 'app_node_cb'):
-            self.export_node.current(self.app_node_cb.current())
-        if hasattr(self, 'export_from_selectors') and hasattr(self, 'app_from_dt'):
-            for k in ['y', 'm', 'd', 'h', 'min']:
-                self.export_from_selectors[k].set(self.app_from_dt[k].get())
-        if hasattr(self, 'export_to_selectors') and hasattr(self, 'app_to_dt'):
-            for k in ['y', 'm', 'd', 'h', 'min']:
-                self.export_to_selectors[k].set(self.app_to_dt[k].get())
-        if hasattr(self, 'export_interval_cb') and hasattr(self, 'app_interval_cb'):
-            self.export_interval_cb.set(self.app_interval_cb.get())
-        
+        # perform_export reads the active APPROVE DATA controls directly.
         self.perform_export(fmt)
 
     # -------------------------
@@ -6050,8 +6207,33 @@ class ModbusApp:
                  font=("Segoe UI", 7), bg=self.COLORS["bg_surface"], fg=self.COLORS["text_dim"]).pack(pady=15)
 
     def perform_export(self, fmt="excel"):
-        idx = self.export_node.current()
-        if idx < 0: 
+        # The same exporter is available from both DATA EXPORT and VIEW DATA.
+        # Use the controls belonging to the currently displayed screen; widgets
+        # from the other screen are destroyed during navigation.
+        exporting_from_view_data = (self.active_view == "view_data")
+        exporting_from_approved = (self.active_view == "approve_data")
+        if exporting_from_view_data:
+            node_selector = getattr(self, "view_node_cb", None)
+            from_selectors = getattr(self, "view_from_dt", None)
+            to_selectors = getattr(self, "view_to_dt", None)
+            interval_selector = getattr(self, "view_interval_cb", None)
+        elif exporting_from_approved:
+            node_selector = getattr(self, "app_node_cb", None)
+            from_selectors = getattr(self, "app_from_dt", None)
+            to_selectors = getattr(self, "app_to_dt", None)
+            interval_selector = getattr(self, "app_interval_cb", None)
+        else:
+            node_selector = getattr(self, "export_node", None)
+            from_selectors = getattr(self, "export_from_selectors", None)
+            to_selectors = getattr(self, "export_to_selectors", None)
+            interval_selector = getattr(self, "export_interval_cb", None)
+
+        if node_selector is None or from_selectors is None or to_selectors is None:
+            messagebox.showerror("Export Error", "Export controls are not available. Please reopen the page and try again.")
+            return
+
+        idx = node_selector.current()
+        if idx < 0 or idx >= len(self.devices):
             messagebox.showwarning("Selection", "Please select a device.")
             return
         
@@ -6074,8 +6256,11 @@ class ModbusApp:
             
         try:
             get_dt = lambda s: datetime.strptime(f"{s['y'].get()}-{s['m'].get()}-{s['d'].get()} {s['h'].get()}:{s['min'].get()}:00", "%Y-%m-%d %H:%M:%S")
-            from_dt = get_dt(self.export_from_selectors)
-            to_dt = get_dt(self.export_to_selectors)
+            from_dt = get_dt(from_selectors)
+            to_dt = get_dt(to_selectors)
+            if to_dt < from_dt:
+                messagebox.showwarning("Date Range", "TO date/time must be after FROM date/time.")
+                return
         except Exception as e:
             messagebox.showerror("Error", f"Invalid date selection: {e}")
             return
@@ -6114,9 +6299,10 @@ class ModbusApp:
             pivoted_data = {} # {ts_string: {reg_name: val}}
             
             # Interval Logic
-            interval_str = self.export_interval_cb.get()
+            interval_str = interval_selector.get() if interval_selector is not None else "Raw"
             interval_map = {"1 Min": 60, "5 Min": 300, "15 Min": 900, "30 Min": 1800, "1 Hour": 3600}
             interval_sec = interval_map.get(interval_str, 0)
+            view_approvals = load_approvals() if (exporting_from_view_data or exporting_from_approved) else {}
 
             try:
                 for source_file in all_files:
@@ -6127,6 +6313,14 @@ class ModbusApp:
                             try:
                                 row_dt = datetime.strptime(row[0], "%Y-%m-%d %H:%M:%S")
                                 if from_dt <= row_dt <= to_dt:
+                                    if exporting_from_view_data:
+                                        row_key = f"{ip}:{port}:{slave_id_part}_{row_dt.strftime('%Y-%m-%d')}"
+                                        if is_timestamp_approved(view_approvals, ip, port, slave_id_part, row_dt):
+                                            continue
+                                    elif exporting_from_approved:
+                                        row_key = f"{ip}:{port}:{slave_id_part}_{row_dt.strftime('%Y-%m-%d')}"
+                                        if not is_timestamp_approved(view_approvals, ip, port, slave_id_part, row_dt):
+                                            continue
                                     ts = row[0]
                                     if interval_sec > 0:
                                         rounded_ts = int(row_dt.timestamp() // interval_sec * interval_sec)
@@ -6183,9 +6377,10 @@ class ModbusApp:
             reg_names_only = [dev_names.get(str(r), f"Reg {r}") for r in sorted_regs]
             
             # Interval Logic
-            interval_str = self.export_interval_cb.get()
+            interval_str = interval_selector.get() if interval_selector is not None else "Raw"
             interval_map = {"1 Min": 60, "5 Min": 300, "15 Min": 900, "30 Min": 1800, "1 Hour": 3600}
             interval_sec = interval_map.get(interval_str, 0)
+            view_approvals = load_approvals() if (exporting_from_view_data or exporting_from_approved) else {}
 
             try:
                 for source_file in all_files:
@@ -6196,6 +6391,14 @@ class ModbusApp:
                             try:
                                 row_dt = datetime.strptime(row[0], "%Y-%m-%d %H:%M:%S")
                                 if from_dt <= row_dt <= to_dt:
+                                    if exporting_from_view_data:
+                                        row_key = f"{ip}:{port}:{slave_id_part}_{row_dt.strftime('%Y-%m-%d')}"
+                                        if is_timestamp_approved(view_approvals, ip, port, slave_id_part, row_dt):
+                                            continue
+                                    elif exporting_from_approved:
+                                        row_key = f"{ip}:{port}:{slave_id_part}_{row_dt.strftime('%Y-%m-%d')}"
+                                        if not is_timestamp_approved(view_approvals, ip, port, slave_id_part, row_dt):
+                                            continue
                                     ts = row[0]
                                     if interval_sec > 0:
                                         rounded_ts = int(row_dt.timestamp() // interval_sec * interval_sec)
@@ -6221,6 +6424,21 @@ class ModbusApp:
 
                 if not pivoted_data:
                     messagebox.showwarning("No Data", "No records found for the range.")
+                    return
+
+                # VIEW DATA uses the controlled data-log layout represented by
+                # the supplied reference PDF.  Keep the graph report for the
+                # separate DATA EXPORT screen.
+                if exporting_from_view_data or exporting_from_approved:
+                    self._generate_view_data_log_pdf(
+                        target_file, dev, dev_alias, from_dt, to_dt,
+                        pivoted_data, sorted_regs, reg_names_only, dev_units,
+                        force_approved=exporting_from_approved
+                    )
+                    report_kind = "Approved Data" if exporting_from_approved else "View Data"
+                    messagebox.showinfo("Success", f"{report_kind} PDF log generated: {target_file}")
+                    self.log_audit("DATA_EXPORT", "EXPORT", f"Exported {report_kind} PDF log for device '{dev_alias}' ({len(pivoted_data)} records)")
+                    webbrowser.open(target_file)
                     return
 
                 # Check approval status of target device and date range
@@ -6441,6 +6659,171 @@ class ModbusApp:
                 self.log_audit("DATA_EXPORT", "EXPORT", f"Exported PDF report for device '{dev_alias}' ({len(sorted_ts)} records)")
                 webbrowser.open(target_file)
             except Exception as e: messagebox.showerror("Error", f"PDF Export failed: {e}")
+
+    def _generate_view_data_log_pdf(self, target_file, dev, dev_alias, from_dt, to_dt,
+                                    pivoted_data, sorted_regs, reg_names_only, dev_units,
+                                    force_approved=False):
+        """Create the VIEW DATA report in the supplied controlled data-log style."""
+        page_size = landscape((595.2756, 841.8898))  # A4 landscape
+        c = canvas.Canvas(target_file, pagesize=page_size)
+        w, h = page_size
+        rows_per_page = 14
+        sorted_ts = sorted(pivoted_data.keys())
+        data_pages = max(1, (len(sorted_ts) + rows_per_page - 1) // rows_per_page)
+        total_pages = 1 + data_pages
+        printed_at = datetime.now()
+
+        approvals = load_approvals()
+        ip, port, slave = dev['ip'], dev['port'], dev.get('slave_id', 1)
+        approved = force_approved
+        day_cursor = from_dt.date()
+        while not force_approved and day_cursor <= to_dt.date():
+            key = f"{ip}:{port}:{slave}_{day_cursor.strftime('%Y-%m-%d')}"
+            if approvals.get(key, {}).get("status") != "APPROVED":
+                approved = False
+                break
+            day_cursor += timedelta(days=1)
+
+        def box(x, y, bw, bh, fill=None, stroke=0.45):
+            if fill is not None:
+                c.setFillColorRGB(*fill)
+                c.rect(x, y, bw, bh, fill=1, stroke=0)
+            c.setStrokeColorRGB(stroke, stroke, stroke)
+            c.setLineWidth(0.5)
+            c.rect(x, y, bw, bh, fill=0, stroke=1)
+
+        def text(x, y, value, bold=False, size=8, centered=False):
+            c.setFillColorRGB(0, 0, 0)
+            c.setFont("Helvetica-Bold" if bold else "Helvetica", size)
+            value = str(value)
+            if centered:
+                c.drawCentredString(x, y, value)
+            else:
+                c.drawString(x, y, value)
+
+        def watermark():
+            if approved:
+                return
+            c.saveState()
+            c.setFillColorRGB(0.78, 0.78, 0.78)
+            c.setFont("Helvetica-Bold", 50)
+            c.translate(w / 2, h / 2)
+            c.rotate(45)
+            c.drawCentredString(0, 0, "DRAFT MODE")
+            c.restoreState()
+
+        def common_header(page_no):
+            watermark()
+            left, right = 25, w - 25
+            top, header_bottom = h - 12, h - 140
+            box(left, top - 66, right - left, 66)
+            box(left, top - 66, 158, 66)
+            box(right - 158, top - 66, 158, 66)
+            text(w / 2, top - 22, "TempTrek Environmental Monitoring System", True, 13, True)
+            text(w / 2, top - 38, "Environmental Monitoring Department", True, 9, True)
+            text(w / 2, top - 53, "Temperature and Humidity Report", False, 9, True)
+            text(left + 79, top - 38, "TEMPTREK", True, 13, True)
+            text(right - 79, top - 38, "DATA LOG", True, 12, True)
+
+            meta_top = top - 74
+            label_w, half_w = 142, (right - left) / 2
+            rows = [
+                ("Department", "Environmental Monitoring", "", ""),
+                ("Filter From", from_dt.strftime("%d/%m/%Y %H:%M:%S"), "Filter To", to_dt.strftime("%d/%m/%Y %H:%M:%S")),
+                ("Records From", sorted_ts[0] if sorted_ts else "-", "Records To", sorted_ts[-1] if sorted_ts else "-"),
+                ("Equipment", str(dev_alias).upper(), "Code", f"{ip}:{port} / Slave {slave}"),
+            ]
+            row_h = 14
+            for i, (l1, v1, l2, v2) in enumerate(rows):
+                yy = meta_top - ((i + 1) * row_h)
+                box(left, yy, right-left, row_h)
+                box(left, yy, label_w, row_h)
+                if i:
+                    box(left + half_w, yy, 95, row_h)
+                text(left + 3, yy + 4, l1, True, 8)
+                text(left + label_w + 3, yy + 4, v1, False, 8)
+                if l2:
+                    text(left + half_w + 3, yy + 4, l2, True, 8)
+                    text(left + half_w + 98, yy + 4, v2, False, 8)
+
+            c.setStrokeColorRGB(0.35, 0.35, 0.35)
+            c.line(left, 47, right, 47)
+            channel_codes = []
+            for i, name in enumerate(reg_names_only):
+                unit = dev_units.get(str(sorted_regs[i]), "")
+                channel_codes.append(f"{name} ({unit})" if unit else name)
+            footer_channels = ", ".join(channel_codes)
+            text(left + 2, 36, footer_channels[:145], False, 7)
+            text(left + 2, 20, "TempTrek 1.0", False, 8)
+            text(w / 2, 20, f"Printed By - {self.current_user} On {printed_at.strftime('%d/%m/%Y %H:%M:%S')}", False, 8, True)
+            c.setFillColorRGB(0, 0, 0)
+            c.setFont("Helvetica", 8)
+            c.drawRightString(right - 2, 20, f"Page {page_no} of {total_pages}")
+            return header_bottom - 12
+
+        # Page 1: channel statistics, matching the reference report summary.
+        y = common_header(1)
+        text(25, y, "CHANNEL SUMMARY", True, 10)
+        y -= 16
+        col_x = [25, 300, 375, 465, 555, 650]
+        col_w = [275, 75, 90, 90, 95, 167]
+        headers = ["Channel Name", "CH", "Minimum", "Maximum", "Average", "Unit"]
+        for x, cw, label in zip(col_x, col_w, headers):
+            box(x, y - 16, cw, 16, (0.83, 0.83, 0.83))
+            text(x + 3, y - 11, label, True, 8)
+        y -= 16
+        for i, name in enumerate(reg_names_only):
+            vals = []
+            for ts in sorted_ts:
+                try: vals.append(float(pivoted_data[ts].get(name)))
+                except (TypeError, ValueError): pass
+            minimum = f"{min(vals):.2f}" if vals else "-"
+            maximum = f"{max(vals):.2f}" if vals else "-"
+            average = f"{sum(vals)/len(vals):.2f}" if vals else "-"
+            unit = dev_units.get(str(sorted_regs[i]), "")
+            values = [name, f"CH{i+1}", minimum, maximum, average, unit]
+            for x, cw, value in zip(col_x, col_w, values):
+                box(x, y - 15, cw, 15)
+                text(x + 3, y - 10, str(value)[:34], False, 8)
+            y -= 15
+            if y < 62:
+                break
+        c.showPage()
+
+        # Remaining pages: bordered date/time/channel log table.
+        usable_w = w - 50
+        fixed = [42, 84, 52]
+        channel_w = (usable_w - sum(fixed)) / max(1, len(reg_names_only))
+        widths = fixed + [channel_w] * len(reg_names_only)
+        headers = ["Sr. No.", "Log Date", "Time"] + [n[:12] for n in reg_names_only]
+
+        for page_idx in range(data_pages):
+            page_no = page_idx + 2
+            y = common_header(page_no)
+            x = 25
+            for cw, label in zip(widths, headers):
+                box(x, y - 25, cw, 25, (0.83, 0.83, 0.83))
+                text(x + cw / 2, y - 16, label, True, 7, True)
+                x += cw
+            y -= 25
+            batch = sorted_ts[page_idx * rows_per_page:(page_idx + 1) * rows_per_page]
+            for row_offset, ts in enumerate(batch):
+                try: dt = datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
+                except ValueError: dt = None
+                values = [
+                    str(page_idx * rows_per_page + row_offset + 1),
+                    dt.strftime("%d/%m/%Y") if dt else ts[:10],
+                    dt.strftime("%H:%M:%S") if dt else ts[11:19],
+                ] + [pivoted_data[ts].get(name, "-") for name in reg_names_only]
+                x = 25
+                for cw, value in zip(widths, values):
+                    box(x, y - 21, cw, 21)
+                    text(x + cw / 2, y - 14, str(value)[:14], False, 7, True)
+                    x += cw
+                y -= 21
+            if page_idx < data_pages - 1:
+                c.showPage()
+        c.save()
 
     def add_reg_to_mini(self):
         addr = self.entry_reg_addr.get().strip()
