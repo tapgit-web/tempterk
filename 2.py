@@ -1,4 +1,5 @@
-import time 
+import time
+import math
 import base64
 import struct
 import threading
@@ -173,10 +174,11 @@ SMS_CONFIG_FILE = os.path.join(DATA_PATH, "config", "sms_settings.json")
 USERS_FILE = os.path.join(DATA_PATH, "config", "users.json")
 TREND_CONFIG_FILE = os.path.join(DATA_PATH, "config", "trend_settings.json")
 APPROVALS_FILE = os.path.join(DATA_PATH, "config", "approvals.json")
+COMPANY_CONFIG_FILE = os.path.join(DATA_PATH, "config", "company_details.json")
 
 def migrate_config_files():
     """Scan config folder and obfuscate any plain-text JSON files."""
-    files = [CONFIG_FILE, EMAIL_CONFIG_FILE, SMS_CONFIG_FILE, USERS_FILE, TREND_CONFIG_FILE, APPROVALS_FILE]
+    files = [CONFIG_FILE, EMAIL_CONFIG_FILE, SMS_CONFIG_FILE, USERS_FILE, TREND_CONFIG_FILE, APPROVALS_FILE, COMPANY_CONFIG_FILE]
     for filepath in files:
         if os.path.exists(filepath):
             try:
@@ -314,6 +316,34 @@ def save_approvals(approvals_data):
         data_str = json.dumps(approvals_data, indent=4)
         f.write(obfuscate_data(data_str))
 
+def load_company_details():
+    default_details = {
+        "company_name": "TempTrek Environmental Monitoring System",
+        "department_name": "Environmental Monitoring Department",
+        "report_title": "Temperature and Humidity Report"
+    }
+    if not os.path.exists(COMPANY_CONFIG_FILE):
+        return default_details
+    try:
+        with open(COMPANY_CONFIG_FILE, "r") as f:
+            content = f.read().strip()
+            decoded = deobfuscate_data(content)
+            if decoded:
+                data = json.loads(decoded)
+            else:
+                data = json.loads(content)
+            for k, v in default_details.items():
+                if k not in data:
+                    data[k] = v
+            return data
+    except:
+        return default_details
+
+def save_company_details(company_details):
+    with open(COMPANY_CONFIG_FILE, "w") as f:
+        data_str = json.dumps(company_details, indent=4)
+        f.write(obfuscate_data(data_str))
+
 def is_timestamp_approved(approvals, ip, port, slave_id, row_dt):
     """Return whether one exact reading timestamp is inside an approved range."""
     day_key = f"{ip}:{port}:{slave_id}_{row_dt.strftime('%Y-%m-%d')}"
@@ -353,8 +383,8 @@ def load_users():
     superadmin_h = hashlib.sha256("superadmin".encode()).hexdigest()
     admin_h = hashlib.sha256("admin".encode()).hexdigest()
     
-    all_perms = ["live_data", "add_device", "live_log", "view_data", "approve_data", "email_config", "email_smtp_config", "sms_config", "export_data", "data_trends", "user_manager", "audit_log"]
-    admin_perms = ["live_data", "live_log", "view_data", "approve_data", "email_config", "email_smtp_config", "sms_config", "export_data", "data_trends", "user_manager", "audit_log"]
+    all_perms = ["live_data", "add_device", "live_log", "view_data", "approve_data", "email_config", "email_smtp_config", "sms_config", "export_data", "data_trends", "user_manager", "audit_log", "company_details"]
+    admin_perms = ["live_data", "live_log", "view_data", "approve_data", "email_config", "email_smtp_config", "sms_config", "export_data", "data_trends", "user_manager", "audit_log", "company_details"]
     
     default_superadmin = {
         "password": superadmin_h,
@@ -475,6 +505,15 @@ def safe_format_val(val, prec=3):
         return s
 
 def write_csv(ip, port, slave_id, reg, value):
+    # Safety filter: Skip NaN, inf, or empty strings
+    try:
+        f_val = float(value)
+        if math.isnan(f_val) or math.isinf(f_val):
+            return
+    except (ValueError, TypeError):
+        if str(value).strip().lower() in ["nan", "none", "null", ""]:
+            return
+
     filename = csv_filename(ip, port, slave_id)
     for attempt in range(3):
         exists = os.path.exists(filename)
@@ -749,14 +788,15 @@ def read_modbus_device(host, port, registers, app, stop_event, unit_id=1, refres
                         param_name = 'slave' if PYMODBUS_V3 else 'unit'
                         kwargs = {param_name: unit_id}
 
+                        reg_num = int(''.join(filter(str.isdigit, str(reg)))) if any(c.isdigit() for c in str(reg)) else 0
                         if reg_mode == "FC03":
-                            result = client.read_holding_registers(address=reg, count=count_to_read, **kwargs)
+                            result = client.read_holding_registers(address=reg_num, count=count_to_read, **kwargs)
                         elif reg_mode == "FC01":
-                            result = client.read_coils(address=reg, count=count_to_read, **kwargs)
+                            result = client.read_coils(address=reg_num, count=count_to_read, **kwargs)
                         elif reg_mode == "FC02":
-                            result = client.read_discrete_inputs(address=reg, count=count_to_read, **kwargs)
+                            result = client.read_discrete_inputs(address=reg_num, count=count_to_read, **kwargs)
                         else:
-                            result = client.read_input_registers(address=reg, count=count_to_read, **kwargs)
+                            result = client.read_input_registers(address=reg_num, count=count_to_read, **kwargs)
 
                         if result is None:
                             log_ui(f"TIMEOUT @ {reg}")
@@ -848,8 +888,17 @@ def read_modbus_device(host, port, registers, app, stop_event, unit_id=1, refres
                             now = time.time()
                             last_t = last_csv_write.get(reg, 0.0)
                             if now - last_t >= poll_interval:
-                                write_csv(host, port, unit_id, reg, csv_val)
-                                last_csv_write[reg] = now
+                                is_lora = ("LORA" in str(d.get('node_type', '')).upper()) or ("LORA" in str(d.get('device_name', '')).upper())
+                                should_write = True
+                                if is_lora:
+                                    try:
+                                        if float(csv_val) <= 0:
+                                            should_write = False
+                                    except Exception:
+                                        pass
+                                if should_write:
+                                    write_csv(host, port, unit_id, reg, csv_val)
+                                    last_csv_write[reg] = now
                         except Exception as e:
                             log_ui(f"Decode Error @ {reg}: {e}")
                             log_ui(f"Reg {reg} \u2192 0")
@@ -957,8 +1006,19 @@ def read_dummy_device(host, port, registers, app, stop_event, unit_id=1, refresh
                 now = time.time()
                 last_t = last_csv_write.get(reg, 0.0)
                 if now - last_t >= poll_interval:
-                    write_csv(host, port, unit_id, reg, csv_val)
-                    last_csv_write[reg] = now
+                    is_lora = False
+                    if target_dev:
+                        is_lora = ("LORA" in str(target_dev.get('node_type', '')).upper()) or ("LORA" in str(target_dev.get('device_name', '')).upper())
+                    should_write = True
+                    if is_lora:
+                        try:
+                            if float(csv_val) <= 0:
+                                should_write = False
+                        except Exception:
+                            pass
+                    if should_write:
+                        write_csv(host, port, unit_id, reg, csv_val)
+                        last_csv_write[reg] = now
                 
                 # Check Email Alerts
                 for alert in app.email_settings.get('alerts', []):
@@ -1073,10 +1133,17 @@ class ModbusApp:
 
         # Load Icon
         try:
+            icon_ico = resource_path("icon.ico")
+            if os.path.exists(icon_ico):
+                self.root.wm_iconbitmap(default=icon_ico)
             self.icon_img = tk.PhotoImage(file=resource_path("icon.png"))
-            self.root.iconphoto(False, self.icon_img)
+            self.root.iconphoto(True, self.icon_img)
         except Exception as e:
-            self.icon_img = None
+            try:
+                self.icon_img = tk.PhotoImage(file=resource_path("icon.png"))
+                self.root.iconphoto(True, self.icon_img)
+            except:
+                self.icon_img = None
 
         self.devices = load_devices()
         self.device_threads = {}
@@ -1100,6 +1167,9 @@ class ModbusApp:
         self.sms_cooldowns = {}
         self.sms_active_alerts = {}
         self.sms_lock = threading.Lock()
+
+        # Company Details (Report Header Line 1, Line 2, Line 3)
+        self.company_details = load_company_details()
 
         # Communication Locks (per IP:Port) to prevent collisions
         self.comms_lock = threading.Lock()
@@ -1469,22 +1539,28 @@ class ModbusApp:
             self.create_nav_item("add_device", "Device Manager")
         if "live_log" in user_perms:
             self.create_nav_item("live_log", "Live Log")
-        if "view_data" in user_perms:
-            self.create_nav_item("view_data", "View Data")
-        if "approve_data" in user_perms:
-            self.create_nav_item("approve_data", "Approve Data")
-        if "email_config" in user_perms:
-            self.create_nav_item("email_config", "Alarm Configuration")
-        if "sms_config" in user_perms:
-            self.create_nav_item("sms_config", "SMS Alert")
         if "export_data" in user_perms:
             self.create_nav_item("export_data", "Data Export")
         if "data_trends" in user_perms:
             self.create_nav_item("data_trends", "Historic Trends")
         if "user_manager" in user_perms:
             self.create_nav_item("user_manager", "System Users")
-        if "audit_log" in user_perms:
-            self.create_nav_item("audit_log", "Audit Log")
+        if "company_details" in user_perms:
+            self.create_nav_item("company_details", "Company Details")
+
+        fda_perms = ["view_data", "approve_data", "sms_config", "email_config", "audit_log"]
+        if any(p in user_perms for p in fda_perms):
+            self.create_nav_header("FDA 21 CFR Part 11")
+            if "view_data" in user_perms:
+                self.create_nav_item("view_data", "View Data", indent=True)
+            if "approve_data" in user_perms:
+                self.create_nav_item("approve_data", "Approve Data", indent=True)
+            if "sms_config" in user_perms:
+                self.create_nav_item("sms_config", "SMS Alert", indent=True)
+            if "email_config" in user_perms:
+                self.create_nav_item("email_config", "Alarm Configuration", indent=True)
+            if "audit_log" in user_perms:
+                self.create_nav_item("audit_log", "Audit Log", indent=True)
 
         footer = tk.Frame(self.sidebar, bg=self.COLORS["bg_surface"], pady=20)
         footer.pack(side="bottom", fill="x")
@@ -1517,10 +1593,20 @@ class ModbusApp:
 
         self.navigate("live_data")
 
-    def create_nav_item(self, view_id, text):
+    def create_nav_header(self, text):
+        header_frame = tk.Frame(self.nav_container, bg=self.COLORS["bg_surface"])
+        header_frame.pack(fill="x", padx=20, pady=(15, 6))
+        lbl = tk.Label(header_frame, text=text, font=("Segoe UI", 8, "bold"), 
+                       fg=self.COLORS["accent"], bg=self.COLORS["bg_surface"], anchor="w")
+        lbl.pack(side="left")
+        sep = tk.Frame(header_frame, bg=self.COLORS["bg_highlight"], height=1)
+        sep.pack(side="left", fill="x", expand=True, padx=(8, 0))
+
+    def create_nav_item(self, view_id, text, indent=False):
+        left_pad = 35 if indent else 30
         btn = tk.Button(self.nav_container, text=text, font=("Segoe UI", 10), 
                         fg=self.COLORS["text_dim"], bg=self.COLORS["bg_surface"], 
-                        relief="flat", anchor="w", padx=30, pady=12, cursor="hand2",
+                        relief="flat", anchor="w", padx=left_pad, pady=10, cursor="hand2",
                         activebackground=self.COLORS["bg_highlight"], activeforeground="white",
                         command=lambda: self.navigate(view_id))
         btn.pack(fill="x")
@@ -1632,6 +1718,7 @@ class ModbusApp:
             "export_data": "DATA EXPORT",
             "data_trends": "HISTORIC TREND ANALYTICS",
             "user_manager": "USER MANAGEMENT",
+            "company_details": "COMPANY DETAILS",
             "email_alerts": "ALARM HISTORY",
             "email_logs_view": "EMAIL SEND LOGS",
             "audit_log": "USER AUDIT LOG"
@@ -1674,6 +1761,8 @@ class ModbusApp:
             else:
                 messagebox.showerror("Access Denied", "You do not have permission to manage system users.")
                 self.navigate("live_data")
+        elif view_name == "company_details":
+            self.show_company_details()
         elif view_name == "audit_log":
             self.show_audit_log()
 
@@ -1716,22 +1805,25 @@ class ModbusApp:
                    padx=25, pady=8, command=self.stop_all_devices).pack(side="left", padx=5)
 
         # -------------------------
-        # LIVE ANALYTICS SIDEBAR (Graph & Chat)
+        # LIVE TREND ANALYTICS (Bottom Panel)
         # -------------------------
-        analytics_sidebar = tk.Frame(self.content_frame, bg=self.COLORS["bg_dark"], width=380, 
-                                    highlightbackground=self.COLORS["bg_highlight"], highlightthickness=1)
-        analytics_sidebar.pack(side="right", fill="y", padx=(15, 0))
-        analytics_sidebar.pack_propagate(False)
+        graph_frame = tk.Frame(self.content_frame, bg=self.COLORS["bg_surface"], height=340,
+                               highlightbackground=self.COLORS["bg_highlight"], highlightthickness=1)
+        graph_frame.pack(side="bottom", fill="x", pady=(15, 0))
+        graph_frame.pack_propagate(False)
 
-        # 1. LIVE GRAPH SECTION
-        graph_frame = tk.Frame(analytics_sidebar, bg=self.COLORS["bg_surface"], highlightbackground=self.COLORS["bg_highlight"], highlightthickness=1)
-        graph_frame.pack(fill="x", pady=(0, 15))
-        
-        tk.Label(graph_frame, text="LIVE TREND ANALYTICS", font=("Segoe UI", 9, "bold"), 
-                 fg=self.COLORS["accent"], bg=self.COLORS["bg_surface"]).pack(pady=10)
-        
-        self.graph_canvas = tk.Canvas(graph_frame, bg=self.COLORS["bg_dark"], height=220, highlightthickness=0)
-        self.graph_canvas.pack(fill="x", padx=15, pady=(0, 10))
+        header_frame = tk.Frame(graph_frame, bg=self.COLORS["bg_surface"])
+        header_frame.pack(fill="x", padx=15, pady=(8, 4))
+
+        tk.Label(header_frame, text="LIVE TREND ANALYTICS", font=("Segoe UI", 9, "bold"), 
+                 fg=self.COLORS["accent"], bg=self.COLORS["bg_surface"]).pack(side="left")
+
+        self.graph_title = tk.Label(header_frame, text="SELECT A CARD TO VIEW TREND", font=("Segoe UI", 8, "bold"), 
+                                   fg=self.COLORS["text_dim"], bg=self.COLORS["bg_surface"])
+        self.graph_title.pack(side="right")
+
+        self.graph_canvas = tk.Canvas(graph_frame, bg=self.COLORS["bg_dark"], highlightthickness=0)
+        self.graph_canvas.pack(fill="both", expand=True, padx=15, pady=(0, 10))
         
         def _on_live_graph_resize(e):
             lid = getattr(self, 'selected_graph_lid', None)
@@ -1739,35 +1831,12 @@ class ModbusApp:
             if lid:
                 self.draw_live_graph(lid, nm)
         self.graph_canvas.bind("<Configure>", _on_live_graph_resize)
-        
-        self.graph_title = tk.Label(graph_frame, text="SELECT A CARD TO VIEW TREND", font=("Segoe UI", 7, "bold"), 
-                                   fg=self.COLORS["text_dim"], bg=self.COLORS["bg_surface"])
-        self.graph_title.pack(pady=(0, 10))
 
-        # 2. LIVE CHAT / ACTIVITY SECTION
-        chat_frame = tk.Frame(analytics_sidebar, bg=self.COLORS["bg_surface"], highlightbackground=self.COLORS["bg_highlight"], highlightthickness=1)
-        chat_frame.pack(fill="both", expand=True)
-
-        tk.Label(chat_frame, text="SYSTEM ACTIVITY LOG", font=("Segoe UI", 8, "bold"), 
-                 fg=self.COLORS["accent"], bg=self.COLORS["bg_surface"]).pack(pady=10)
-
-        chat_container = tk.Frame(chat_frame, bg=self.COLORS["bg_dark"])
-        chat_container.pack(fill="both", expand=True, padx=10, pady=(0, 10))
-
-        self.chat_box = tk.Text(chat_container, bg=self.COLORS["bg_dark"], fg=self.COLORS["text_main"],
-                                font=self.FONTS["code"], relief="flat", wrap="word", state="disabled")
-        self.chat_box.pack(side="left", fill="both", expand=True)
-        
-        chat_sb = ttk.Scrollbar(chat_container, orient="vertical", command=self.chat_box.yview, style="Vertical.TScrollbar")
-        self.chat_box.config(yscrollcommand=chat_sb.set)
-        chat_sb.pack(side="right", fill="y")
-
-        # Initial Chat Load
-        self.update_chat_from_history()
+        self.chat_box = None
 
         # Scrollable Area (Main Grid)
         container = tk.Frame(self.content_frame, bg=self.COLORS["bg_dark"])
-        container.pack(side="left", fill="both", expand=True)
+        container.pack(fill="both", expand=True)
 
         canvas = tk.Canvas(container, bg=self.COLORS["bg_dark"], highlightthickness=0)
         v_sb = ttk.Scrollbar(container, orient="vertical", style="Vertical.TScrollbar", command=canvas.yview)
@@ -2121,7 +2190,8 @@ class ModbusApp:
         
         reg_names = []
         for lid in lids:
-            r_addr = lid.split(":")[-1]
+            parts = str(lid).split(":", 3)
+            r_addr = parts[3] if len(parts) >= 4 else str(lid).split(":")[-1]
             reg_names.append(dev.get('names', {}).get(r_addr, f"Reg {r_addr}"))
 
         try:
@@ -2147,7 +2217,7 @@ class ModbusApp:
 
             # Header
             c.setFillColorRGB(0.0, 0.36, 0.72); c.setFont("Helvetica-Bold", 18)
-            c.drawString(40, h-50, "TempTrek Environmental Monitoring System")
+            c.drawString(40, h-50, self.company_details.get("company_name", "TempTrek Environmental Monitoring System"))
             c.setFont("Helvetica", 9); c.setFillColorRGB(0.5, 0.5, 0.5)
             c.drawString(40, h-70, f"DEVICE: {d_alias} | EXPORTED: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
             c.drawString(40, h-85, f"RANGE: {f_dt.strftime('%Y-%m-%d %H:%M')} TO {t_dt.strftime('%Y-%m-%d %H:%M')}")
@@ -2268,7 +2338,8 @@ class ModbusApp:
                     g_col = int(color[3:5], 16)/255.0
                     b_col = int(color[5:7], 16)/255.0
                     
-                    r_addr = lid.split(":")[-1]
+                    parts = str(lid).split(":", 3)
+                    r_addr = parts[3] if len(parts) >= 4 else str(lid).split(":")[-1]
                     leg_name = dev.get('names', {}).get(r_addr, f"Reg {r_addr}")
                     ly_leg = gy + gh - 50 - (idx * 15)
                     c.setFillColorRGB(r_col, g_col, b_col); c.rect(gx + gw - 140, ly_leg, 8, 8, fill=1, stroke=0)
@@ -2451,12 +2522,15 @@ class ModbusApp:
             f_dt, t_dt = datetime.min, datetime.max
 
         pivoted_data = {} # { timestamp: { reg_addr: value } }
-        target_regs = {lid.split(":")[-1]: lid for lid in lids}
-        
-        # We assume all selected lids are from the same device (based on how UI works)
-        # Get device info from first lid
-        first_lid = lids[0].split(":")
-        ip, port, slave = first_lid[0], first_lid[1], first_lid[2]
+        target_regs = {}
+        for lid in lids:
+            parts = str(lid).split(":", 3)
+            r_id = parts[3] if len(parts) >= 4 else str(lid).split(":")[-1]
+            target_regs[r_id] = lid
+
+        # We assume all selected lids are from the same device
+        first_lid_parts = str(lids[0]).split(":", 3)
+        ip, port, slave = first_lid_parts[0], first_lid_parts[1], first_lid_parts[2]
         
         # Find device object to get names
         active_dev = None
@@ -2503,21 +2577,31 @@ class ModbusApp:
                     next(reader, None) 
                     for row in reader:
                         if len(row) > 5:
-                            r_addr = str(row[4])
-                            if r_addr in target_regs:
+                            r_addr_raw = str(row[4]).strip()
+                            matched_addr = None
+
+                            if r_addr_raw in target_regs:
+                                matched_addr = r_addr_raw
+                            else:
+                                r_digits = ''.join(filter(str.isdigit, r_addr_raw))
+                                for t_addr in target_regs:
+                                    t_digits = ''.join(filter(str.isdigit, str(t_addr)))
+                                    if r_addr_raw == str(t_addr) or (r_digits and r_digits == t_digits):
+                                        matched_addr = t_addr
+                                        break
+
+                            if matched_addr:
                                 try:
                                     row_dt = datetime.strptime(row[0], "%Y-%m-%d %H:%M:%S")
                                     if f_dt <= row_dt <= t_dt:
                                         ts_key = row[0]
                                         if interval_sec > 0:
-                                            # Round to interval
                                             rounded_ts = int(row_dt.timestamp() // interval_sec * interval_sec)
                                             ts_key = datetime.fromtimestamp(rounded_ts).strftime("%Y-%m-%d %H:%M:%S")
                                         
                                         val = float(row[5])
                                         if ts_key not in pivoted_data: pivoted_data[ts_key] = {}
-                                        # Use latest value in interval
-                                        pivoted_data[ts_key][r_addr] = val
+                                        pivoted_data[ts_key][matched_addr] = val
                                 except: pass
             except: continue
 
@@ -2526,8 +2610,20 @@ class ModbusApp:
         self.trend_timestamps = sorted_ts[-300:] 
         
         for lid in lids:
-            r_addr = lid.split(":")[-1]
-            self.data_history[lid] = [pivoted_data[ts].get(r_addr, 0.0) for ts in self.trend_timestamps]
+            parts = str(lid).split(":", 3)
+            r_addr = parts[3] if len(parts) >= 4 else str(lid).split(":")[-1]
+            
+            matched_key = r_addr
+            if pivoted_data:
+                sample_p = next(iter(pivoted_data.values()))
+                if r_addr not in sample_p:
+                    r_digits = ''.join(filter(str.isdigit, str(r_addr)))
+                    for pk in sample_p.keys():
+                        if ''.join(filter(str.isdigit, str(pk))) == r_digits:
+                            matched_key = pk
+                            break
+
+            self.data_history[lid] = [pivoted_data[ts].get(matched_key, pivoted_data[ts].get(r_addr, 0.0)) for ts in self.trend_timestamps]
 
         self.trend_addr_to_name = addr_to_name
         self.draw_large_graph(lids)
@@ -2694,7 +2790,8 @@ class ModbusApp:
                 self.large_graph_canvas.create_oval(curr_x-4, curr_y-4, curr_x+4, curr_y+4, fill=color, outline=self.COLORS["bg_surface"], width=1)
 
             # Draw Legend Item
-            reg_addr = lid.split(":")[-1]
+            parts = str(lid).split(":", 3)
+            reg_addr = parts[3] if len(parts) >= 4 else str(lid).split(":")[-1]
             display_name = getattr(self, 'trend_addr_to_name', {}).get(reg_addr, f"REG {reg_addr}")
             self.large_graph_canvas.create_rectangle(w-padding_r+30, legend_y, w-padding_r+45, legend_y+15, fill=color, outline="")
             self.large_graph_canvas.create_text(w-padding_r+55, legend_y+7, text=display_name.upper(), anchor="w", fill=self.COLORS["text_main"], font=("Segoe UI", 9, "bold"))
@@ -2842,7 +2939,8 @@ class ModbusApp:
                                                       fill=color, outline="", tags=f"bar_{idx}")
 
             # Draw Legend Item
-            reg_addr = lid.split(":")[-1]
+            parts = str(lid).split(":", 3)
+            reg_addr = parts[3] if len(parts) >= 4 else str(lid).split(":")[-1]
             display_name = getattr(self, 'trend_addr_to_name', {}).get(reg_addr, f"REG {reg_addr}")
             self.bar_chart_canvas.create_rectangle(w-padding_r+30, legend_y, w-padding_r+45, legend_y+15, fill=color, outline="")
             self.bar_chart_canvas.create_text(w-padding_r+55, legend_y+7, text=display_name.upper(), anchor="w", fill=self.COLORS["text_main"], font=("Segoe UI", 9, "bold"))
@@ -2870,17 +2968,20 @@ class ModbusApp:
         self.u_manager_name = fld("USERNAME")
         self.u_manager_pass = fld("PASSWORD", show="*")
 
-        # Approval authority is a role, separate from screen permissions. Only
-        # Super Admin may grant or remove it.
+        # Approval authority can be granted if current user is Super Admin or possesses approve_data permission.
         self.u_manager_approver = tk.BooleanVar(value=False)
         current_is_superadmin = (self.current_user == "superadmin") or self.users.get(self.current_user, {}).get("is_superadmin", False)
+        manager_perms = self.users.get(self.current_user, {}).get("permissions", [])
+        can_assign_view = current_is_superadmin or ("view_data" in manager_perms)
+        can_assign_approve = current_is_superadmin or ("approve_data" in manager_perms)
+
         self.u_manager_approver_cb = tk.Checkbutton(
             left, text="APPROVER (may approve data after password verification)",
             variable=self.u_manager_approver, bg=self.COLORS["bg_surface"],
             fg=self.COLORS["warning"], selectcolor=self.COLORS["bg_dark"],
             activebackground=self.COLORS["bg_surface"], activeforeground="white",
             font=("Segoe UI", 8, "bold"), relief="flat", borderwidth=0,
-            state="normal" if current_is_superadmin else "disabled"
+            state="normal" if can_assign_approve else "disabled"
         )
         self.u_manager_approver_cb.pack(anchor="w", pady=(10, 0))
         
@@ -2898,10 +2999,11 @@ class ModbusApp:
             ("user_manager", "User Manager"),
             ("audit_log", "Audit Log")
         ]
-        if current_is_superadmin:
-            # Only Super Admin can see and assign these sensitive permissions.
-            perms.insert(2, ("view_data", "View Data (Super Admin grants only)"))
-            perms.insert(3, ("approve_data", "Approve Data (Super Admin grants only)"))
+        if can_assign_view:
+            perms.insert(2, ("view_data", "View Data"))
+        if can_assign_approve:
+            insert_idx = 3 if can_assign_view else 2
+            perms.insert(insert_idx, ("approve_data", "Approve Data"))
         
         for pid, pname in perms:
             var = tk.BooleanVar(value=True if pid != "user_manager" else False)
@@ -3034,17 +3136,21 @@ class ModbusApp:
         is_superadmin = self.users[uname].get("is_superadmin", False) if is_update else (uname == "superadmin")
         is_admin = self.users[uname].get("is_admin", False) if is_update else (uname in ["admin", "superadmin"])
         manager_is_superadmin = (self.current_user == "superadmin") or self.users.get(self.current_user, {}).get("is_superadmin", False)
+        manager_perms = self.users.get(self.current_user, {}).get("permissions", [])
+        can_manage_approver = manager_is_superadmin or ("approve_data" in manager_perms)
         old_is_approver = self.users.get(uname, {}).get("is_approver", False)
-        is_approver = self.u_manager_approver.get() if manager_is_superadmin else old_is_approver
+        is_approver = self.u_manager_approver.get() if can_manage_approver else old_is_approver
 
-        # An Admin may edit other account settings, but cannot grant or revoke
-        # View Data / Approve Data. Preserve those values exactly as assigned by
-        # Super Admin.
-        if not manager_is_superadmin and is_update:
-            old_sensitive_perms = self.users.get(uname, {}).get("permissions", [])
-            for sensitive_perm in ("view_data", "approve_data"):
-                if sensitive_perm in old_sensitive_perms and sensitive_perm not in selected_perms:
-                    selected_perms.append(sensitive_perm)
+        # Preserve existing sensitive permissions if current manager cannot assign them
+        if not (manager_is_superadmin or "view_data" in manager_perms) and is_update:
+            old_perms = self.users.get(uname, {}).get("permissions", [])
+            if "view_data" in old_perms and "view_data" not in selected_perms:
+                selected_perms.append("view_data")
+
+        if not (manager_is_superadmin or "approve_data" in manager_perms) and is_update:
+            old_perms = self.users.get(uname, {}).get("permissions", [])
+            if "approve_data" in old_perms and "approve_data" not in selected_perms:
+                selected_perms.append("approve_data")
 
         # Device Manager (add_device) permission is strictly reserved for superadmin
         if is_superadmin or uname == "superadmin":
@@ -3188,10 +3294,11 @@ class ModbusApp:
                     unit = self.DEFAULT_REGISTER_UNITS[i]
 
             tk.Label(r_frame, text=str(name).upper(), font=("Segoe UI", 11, "bold"), 
-                     fg=self.COLORS["text_dim"], bg=self.COLORS["bg_surface"]).pack(pady=(15, 0))
+                     fg=self.COLORS["text_dim"], bg=self.COLORS["bg_surface"]).pack(pady=(10, 0))
             
             val_id = f"{ip}:{port}:{slave_id}:{reg}"
             cached_val = self.last_values.get(val_id, "---")
+            cached_ts = self.last_update_times.get(val_id, "")
             
             val_container = tk.Frame(r_frame, bg=self.COLORS["bg_surface"])
             val_container.pack(expand=True)
@@ -3204,7 +3311,13 @@ class ModbusApp:
                 tk.Label(val_container, text=unit, font=("Segoe UI", 12, "bold"), 
                          fg=self.COLORS["text_dim"], bg=self.COLORS["bg_surface"]).pack(side="left", padx=(5, 0), pady=(8, 0))
             
+            ts_text = f"Last Update: {cached_ts}" if cached_ts else "Last Update: --"
+            time_lbl = tk.Label(r_frame, text=ts_text, font=("Segoe UI", 8), 
+                                fg=self.COLORS["text_dim"], bg=self.COLORS["bg_surface"])
+            time_lbl.pack(pady=(0, 6))
+
             self.live_labels[val_id] = lbl
+            self.live_labels[f"{val_id}:time"] = time_lbl
             
             # Graph Selection Support
             def _select_graph(e, lid=val_id, nm=name):
@@ -3273,7 +3386,23 @@ class ModbusApp:
             tk.Frame(f, bg=self.COLORS["bg_highlight"], height=1).pack(fill="x")
             return e
 
-        self.entry_device_name = fld("DEVICE ALIAS / NAME")
+        f_row0 = tk.Frame(left, bg=self.COLORS["bg_surface"])
+        f_row0.pack(fill="x", pady=4)
+        
+        f_name_cnt = tk.Frame(f_row0, bg=self.COLORS["bg_surface"])
+        f_name_cnt.pack(side="left", fill="x", expand=True, padx=(0, 5))
+        tk.Label(f_name_cnt, text="DEVICE ALIAS / NAME", font=("Segoe UI", 8, "bold"), fg=self.COLORS["text_dim"], bg=self.COLORS["bg_surface"]).pack(anchor="w")
+        self.entry_device_name = tk.Entry(f_name_cnt, bg=self.COLORS["bg_dark"], fg=self.COLORS["text_main"], relief="flat", font=self.FONTS["body"], insertbackground="black")
+        self.entry_device_name.pack(fill="x", pady=(2, 0), ipady=6)
+        tk.Frame(f_name_cnt, bg=self.COLORS["bg_highlight"], height=1).pack(fill="x")
+
+        f_node_type = tk.Frame(f_row0, bg=self.COLORS["bg_surface"])
+        f_node_type.pack(side="left", fill="x", padx=(5, 0))
+        tk.Label(f_node_type, text="NODE TYPE", font=("Segoe UI", 8, "bold"), fg=self.COLORS["text_dim"], bg=self.COLORS["bg_surface"]).pack(anchor="w")
+        self.entry_node_type = ttk.Combobox(f_node_type, values=["Standard / PLC Node", "LORA NODE"], style="TCombobox", width=18, font=self.FONTS["body"])
+        self.entry_node_type.set("Standard / PLC Node")
+        self.entry_node_type.pack(fill="x", pady=(2, 0))
+        tk.Frame(f_node_type, bg=self.COLORS["bg_highlight"], height=1).pack(fill="x")
 
         # Horizontal row for IP Address and Port
         f_row1 = tk.Frame(left, bg=self.COLORS["bg_surface"])
@@ -3318,9 +3447,18 @@ class ModbusApp:
         map_row1 = tk.Frame(left, bg=self.COLORS["bg_surface"])
         map_row1.pack(fill="x", pady=2)
 
+        # Address Type (null / MKT / MKRH)
+        f_addr_prefix = tk.Frame(map_row1, bg=self.COLORS["bg_surface"])
+        f_addr_prefix.pack(side="left", fill="x", padx=(0, 4))
+        tk.Label(f_addr_prefix, text="ADDR TYPE", font=("Segoe UI", 8, "bold"), fg=self.COLORS["text_dim"], bg=self.COLORS["bg_surface"]).pack(anchor="w")
+        self.entry_reg_addr_prefix = ttk.Combobox(f_addr_prefix, values=["null", "MKT", "MKRH"], style="TCombobox", width=6, font=self.FONTS["body"])
+        self.entry_reg_addr_prefix.set("null")
+        self.entry_reg_addr_prefix.pack(fill="x", pady=(2, 0))
+        tk.Frame(f_addr_prefix, bg=self.COLORS["bg_highlight"], height=1).pack(fill="x")
+
         # Address
         f_addr = tk.Frame(map_row1, bg=self.COLORS["bg_surface"])
-        f_addr.pack(side="left", fill="x", padx=(0, 4))
+        f_addr.pack(side="left", fill="x", padx=2)
         tk.Label(f_addr, text="ADDR", font=("Segoe UI", 8, "bold"), fg=self.COLORS["text_dim"], bg=self.COLORS["bg_surface"]).pack(anchor="w")
         self.entry_reg_addr = tk.Entry(f_addr, bg=self.COLORS["bg_dark"], fg=self.COLORS["text_main"], relief="flat", font=self.FONTS["body"], insertbackground="black", width=6)
         self.entry_reg_addr.pack(fill="x", pady=(2, 0), ipady=4)
@@ -3517,17 +3655,17 @@ class ModbusApp:
         self.node_tree.heading("prec", text="DECIMALS")
         self.node_tree.heading("status", text="STATUS")
         
-        self.node_tree.column("id", width=60, minwidth=50, anchor="center", stretch=False)
-        self.node_tree.column("addr", width=160, minwidth=140, anchor="w", stretch=True)
-        self.node_tree.column("slave", width=110, minwidth=100, anchor="center", stretch=False)
-        self.node_tree.column("reg_name", width=180, minwidth=160, anchor="w", stretch=True)
-        self.node_tree.column("reg_addr", width=110, minwidth=100, anchor="center", stretch=False)
-        self.node_tree.column("reg_unit", width=85, minwidth=75, anchor="center", stretch=False)
-        self.node_tree.column("reg_type", width=120, minwidth=100, anchor="center", stretch=False)
-        self.node_tree.column("math", width=200, minwidth=180, anchor="center", stretch=False)
-        self.node_tree.column("mode", width=170, minwidth=150, anchor="w", stretch=True)
-        self.node_tree.column("prec", width=110, minwidth=100, anchor="center", stretch=False)
-        self.node_tree.column("status", width=140, minwidth=120, anchor="center", stretch=False)
+        self.node_tree.column("id", width=45, minwidth=40, anchor="center", stretch=False)
+        self.node_tree.column("addr", width=130, minwidth=110, anchor="w", stretch=False)
+        self.node_tree.column("slave", width=70, minwidth=60, anchor="center", stretch=False)
+        self.node_tree.column("reg_name", width=140, minwidth=120, anchor="w", stretch=False)
+        self.node_tree.column("reg_addr", width=95, minwidth=80, anchor="center", stretch=False)
+        self.node_tree.column("reg_unit", width=60, minwidth=50, anchor="center", stretch=False)
+        self.node_tree.column("reg_type", width=95, minwidth=80, anchor="center", stretch=False)
+        self.node_tree.column("math", width=130, minwidth=100, anchor="center", stretch=False)
+        self.node_tree.column("mode", width=130, minwidth=110, anchor="w", stretch=False)
+        self.node_tree.column("prec", width=80, minwidth=65, anchor="center", stretch=False)
+        self.node_tree.column("status", width=100, minwidth=85, anchor="center", stretch=False)
         
         v_sb = ttk.Scrollbar(tree_cnt, orient="vertical", command=self.node_tree.yview, style="Vertical.TScrollbar")
         h_sb = ttk.Scrollbar(tree_cnt, orient="horizontal", command=self.node_tree.xview, style="Horizontal.TScrollbar")
@@ -3536,17 +3674,22 @@ class ModbusApp:
         v_sb.pack(side="right", fill="y")
         h_sb.pack(side="bottom", fill="x")
         self.node_tree.pack(side="left", fill="both", expand=True)
+        self.node_tree.bind("<Double-1>", self.view_all_device_details)
 
         acts = tk.Frame(right, bg=self.COLORS["bg_dark"], pady=20)
         acts.pack(side="bottom", fill="x", padx=30)
         
         tk.Button(acts, text="🗑 DELETE NODE", bg=self.COLORS["danger"], fg="white", 
-                  font=self.FONTS["button"], relief="flat", padx=25, pady=10, 
+                  font=self.FONTS["button"], relief="flat", padx=15, pady=8, 
                   cursor="hand2", command=self.remove_device_submit).pack(side="right", padx=5)
         
         tk.Button(acts, text="📝 EDIT NODE", bg=self.COLORS["bg_highlight"], fg=self.COLORS["accent"], 
-                  font=self.FONTS["button"], relief="flat", padx=25, pady=10, 
+                  font=self.FONTS["button"], relief="flat", padx=15, pady=8, 
                   cursor="hand2", command=self.load_edit_device).pack(side="right", padx=5)
+
+        tk.Button(acts, text="👁 VIEW ALL DETAILS", bg=self.COLORS["accent"], fg="black", 
+                  font=self.FONTS["button"], relief="flat", padx=15, pady=8, 
+                  cursor="hand2", command=self.view_all_device_details).pack(side="right", padx=5)
 
         self.refresh_device_list()
 
@@ -5196,9 +5339,10 @@ class ModbusApp:
                 live_dir = os.path.join(DATA_PATH, "live")
 
                 device_list = list(self.devices)
+                comp_info = load_company_details()
                 if not device_list:
                     c.setFillColorRGB(0.0, 0.36, 0.72); c.setFont("Helvetica-Bold", 18)
-                    c.drawString(40, h-50, "TempTrek Environmental Monitoring System")
+                    c.drawString(40, h-50, comp_info.get("company_name", "TempTrek Environmental Monitoring System"))
                     c.setFont("Helvetica", 9); c.setFillColorRGB(0.5, 0.5, 0.5)
                     c.drawString(40, h-70, f"SCHEDULED REPORT ({interval_str.upper()}) | GENERATED: {to_dt.strftime('%Y-%m-%d %H:%M:%S')}")
                     c.drawString(40, h-85, f"RANGE: {from_dt.strftime('%Y-%m-%d %H:%M')} TO {to_dt.strftime('%Y-%m-%d %H:%M')}")
@@ -5220,7 +5364,7 @@ class ModbusApp:
 
                         # Header
                         c.setFillColorRGB(0.0, 0.36, 0.72); c.setFont("Helvetica-Bold", 18)
-                        c.drawString(40, h-50, "TempTrek Environmental Monitoring System")
+                        c.drawString(40, h-50, comp_info.get("company_name", "TempTrek Environmental Monitoring System"))
                         c.setFont("Helvetica", 9); c.setFillColorRGB(0.5, 0.5, 0.5)
                         c.drawString(40, h-70, f"DEVICE: {d_alias} ({ip}:{port} @ Slave {slave}) | EXPORTED: {to_dt.strftime('%Y-%m-%d %H:%M:%S')}")
                         c.drawString(40, h-85, f"PERIODIC REPORT ({interval_str.upper()}) | RANGE: {from_dt.strftime('%Y-%m-%d %H:%M')} TO {to_dt.strftime('%Y-%m-%d %H:%M')}")
@@ -5612,7 +5756,7 @@ class ModbusApp:
         initial_reg_names = []
         if self.devices:
             first_dev = self.devices[0]
-            first_regs = sorted(first_dev.get("registers", []), key=lambda value: int(value))[:8]
+            first_regs = sorted(first_dev.get("registers", []), key=lambda value: (int(''.join(filter(str.isdigit, str(value)))) if any(c.isdigit() for c in str(value)) else 0, str(value)))[:8]
             initial_reg_names = [first_dev.get("names", {}).get(str(reg), f"Reg {reg}") for reg in first_regs]
         register_columns = tuple(f"reg_{i}" for i in range(len(initial_reg_names)))
         self.view_tree = ttk.Treeview(table_frame, columns=("ts", "dev") + register_columns + ("status",), show="headings", style="Treeview")
@@ -5731,7 +5875,7 @@ class ModbusApp:
 
         # Build stable register columns in configured address order. Values for
         # each timestamp are placed below their corresponding register name.
-        configured_regs = sorted(dev.get("registers", []), key=lambda value: int(value))[:8]
+        configured_regs = sorted(dev.get("registers", []), key=lambda value: (int(''.join(filter(str.isdigit, str(value)))) if any(c.isdigit() for c in str(value)) else 0, str(value)))[:8]
         configured_reg_keys = {str(reg) for reg in configured_regs}
         register_names = [dev_names.get(str(reg), f"Reg {reg}") for reg in configured_regs]
         register_columns = tuple(f"reg_{i}" for i in range(len(register_names)))
@@ -5801,30 +5945,51 @@ class ModbusApp:
                                 unit = dev_units.get(reg_addr, "")
                                 if ts not in pivoted_data: pivoted_data[ts] = {}
                                 
-                                val_str = row[5]
+                                is_lora = ("LORA" in str(dev.get('node_type', '')).upper()) or ("LORA" in str(dev.get('device_name', '')).upper())
+                                val_str = str(row[5]).strip()
+                                is_valid = True
+                                try:
+                                    f_val = float(val_str)
+                                    if math.isnan(f_val) or math.isinf(f_val):
+                                        is_valid = False
+                                    elif is_lora and f_val <= 0:
+                                        is_valid = False
+                                except Exception:
+                                    if val_str.lower() in ["nan", "none", "null", ""]:
+                                        is_valid = False
+
+                                if not is_valid:
+                                    continue
+
                                 if dev.get('types', {}).get(reg_addr) == "BOOLEAN":
                                     label_0 = dev.get('ops', {}).get(reg_addr, "OFF")
                                     label_1 = dev.get('factors', {}).get(reg_addr, "ON")
-                                    try: val_str = label_0 if int(float(row[5])) == 0 else label_1
+                                    try: val_str = label_0 if int(float(val_str)) == 0 else label_1
                                     except: pass
                                 else:
                                     try:
                                         prec = int(dev_decimals.get(reg_addr, 3))
-                                        val_str = f"{float(row[5]):.{prec}f}"
+                                        val_str = f"{float(val_str):.{prec}f}"
                                     except: pass
                                 
                                 pivoted_data[ts][reg_name] = f"{val_str}{unit}"
                         except: continue
             except: continue
 
+        inserted_count = 0
         if pivoted_data:
+            for ts in sorted(pivoted_data.keys()):
+                reading_values = [pivoted_data[ts].get(name, "-") for name in register_names]
+                if all(v == "-" or v == "" for v in reading_values):
+                    continue
+                self.view_tree.insert("", "end", values=(ts, dev_alias, *reading_values, "DRAFT"))
+                inserted_count += 1
+
+        if inserted_count > 0:
             self.view_status_lbl.config(
                 text="VIEW DATA AREA: DRAFT / UNAPPROVED RECORDS ONLY ⚠️ (Select range and click 'APPROVE DATA' to move data to Approve Data)",
                 fg="#FF9800"
             )
-            for ts in sorted(pivoted_data.keys()):
-                reading_values = [pivoted_data[ts].get(name, "-") for name in register_names]
-                self.view_tree.insert("", "end", values=(ts, dev_alias, *reading_values, "DRAFT"))
         else:
             if skipped_approved_count > 0:
                 self.view_status_lbl.config(
@@ -5955,7 +6120,7 @@ class ModbusApp:
         initial_reg_names = []
         if self.devices:
             first_dev = self.devices[0]
-            first_regs = sorted(first_dev.get("registers", []), key=lambda value: int(value))[:8]
+            first_regs = sorted(first_dev.get("registers", []), key=lambda value: (int(''.join(filter(str.isdigit, str(value)))) if any(c.isdigit() for c in str(value)) else 0, str(value)))[:8]
             initial_reg_names = [first_dev.get("names", {}).get(str(reg), f"Reg {reg}") for reg in first_regs]
         register_columns = tuple(f"reg_{i}" for i in range(len(initial_reg_names)))
         self.app_tree = ttk.Treeview(table_frame, columns=("ts", "dev") + register_columns + ("status",), show="headings", style="Treeview")
@@ -5996,7 +6161,7 @@ class ModbusApp:
         dev_units = dev.get('units', {})
         dev_decimals = dev.get('decimals', {})
 
-        configured_regs = sorted(dev.get("registers", []), key=lambda value: int(value))[:8]
+        configured_regs = sorted(dev.get("registers", []), key=lambda value: (int(''.join(filter(str.isdigit, str(value)))) if any(c.isdigit() for c in str(value)) else 0, str(value)))[:8]
         configured_reg_keys = {str(reg) for reg in configured_regs}
         register_names = [dev_names.get(str(reg), f"Reg {reg}") for reg in configured_regs]
         register_columns = tuple(f"reg_{i}" for i in range(len(register_names)))
@@ -6062,30 +6227,51 @@ class ModbusApp:
                                 unit = dev_units.get(reg_addr, "")
                                 if ts not in pivoted_data: pivoted_data[ts] = {}
                                 
-                                val_str = row[5]
+                                is_lora = ("LORA" in str(dev.get('node_type', '')).upper()) or ("LORA" in str(dev.get('device_name', '')).upper())
+                                val_str = str(row[5]).strip()
+                                is_valid = True
+                                try:
+                                    f_val = float(val_str)
+                                    if math.isnan(f_val) or math.isinf(f_val):
+                                        is_valid = False
+                                    elif is_lora and f_val <= 0:
+                                        is_valid = False
+                                except Exception:
+                                    if val_str.lower() in ["nan", "none", "null", ""]:
+                                        is_valid = False
+
+                                if not is_valid:
+                                    continue
+
                                 if dev.get('types', {}).get(reg_addr) == "BOOLEAN":
                                     label_0 = dev.get('ops', {}).get(reg_addr, "OFF")
                                     label_1 = dev.get('factors', {}).get(reg_addr, "ON")
-                                    try: val_str = label_0 if int(float(row[5])) == 0 else label_1
+                                    try: val_str = label_0 if int(float(val_str)) == 0 else label_1
                                     except: pass
                                 else:
                                     try:
                                         prec = int(dev_decimals.get(reg_addr, 3))
-                                        val_str = f"{float(row[5]):.{prec}f}"
+                                        val_str = f"{float(val_str):.{prec}f}"
                                     except: pass
                                 
                                 pivoted_data[ts][reg_name] = f"{val_str}{unit}"
                         except: continue
             except: continue
 
+        inserted_count = 0
         if pivoted_data:
+            for ts in sorted(pivoted_data.keys()):
+                reading_values = [pivoted_data[ts].get(name, "-") for name in register_names]
+                if all(v == "-" or v == "" for v in reading_values):
+                    continue
+                self.app_tree.insert("", "end", values=(ts, dev_alias, *reading_values, "APPROVED"))
+                inserted_count += 1
+
+        if inserted_count > 0:
             self.app_status_lbl.config(
                 text="APPROVED DATA STORED AREA ✓ (OFFICIAL APPROVED LOGS)",
                 fg=self.COLORS["success"]
             )
-            for ts in sorted(pivoted_data.keys()):
-                reading_values = [pivoted_data[ts].get(name, "-") for name in register_names]
-                self.app_tree.insert("", "end", values=(ts, dev_alias, *reading_values, "APPROVED"))
         else:
             self.app_status_lbl.config(
                 text="NO APPROVED DATA FOUND FOR THIS RANGE. (Approve data from View Data screen to store data here).",
@@ -6284,7 +6470,7 @@ class ModbusApp:
             clean_alias = clean_alias.replace(char, '_')
 
         # Prepare Register Headers (Sorted by address)
-        sorted_regs = sorted([int(r) for r in dev_names.keys()])
+        sorted_regs = sorted(dev_names.keys(), key=lambda value: (int(''.join(filter(str.isdigit, str(value)))) if any(c.isdigit() for c in str(value)) else 0, str(value)))
         reg_headers = [dev_names.get(str(r), f"Reg {r}") for r in sorted_regs]
         
         # Select Export Folder
@@ -6327,21 +6513,37 @@ class ModbusApp:
                                         ts = datetime.fromtimestamp(rounded_ts).strftime("%Y-%m-%d %H:%M:%S")
                                     
                                     reg_addr = str(row[4])
+                                    is_lora = ("LORA" in str(dev.get('node_type', '')).upper()) or ("LORA" in str(dev.get('device_name', '')).upper())
+                                    val_str = str(row[5]).strip()
+                                    is_valid = True
+                                    try:
+                                        f_val = float(val_str)
+                                        if math.isnan(f_val) or math.isinf(f_val):
+                                            is_valid = False
+                                        elif is_lora and f_val <= 0:
+                                            is_valid = False
+                                    except Exception:
+                                        if val_str.lower() in ["nan", "none", "null", ""]:
+                                            is_valid = False
+
+                                    if not is_valid:
+                                        continue
+
                                     reg_name = dev_names.get(reg_addr, f"Reg {reg_addr}")
                                     if ts not in pivoted_data: pivoted_data[ts] = {}
                                     if dev.get('types', {}).get(reg_addr) == "BOOLEAN":
                                         label_0 = dev.get('ops', {}).get(reg_addr, "OFF")
                                         label_1 = dev.get('factors', {}).get(reg_addr, "ON")
                                         try:
-                                            pivoted_data[ts][reg_name] = label_0 if int(float(row[5])) == 0 else label_1
+                                            pivoted_data[ts][reg_name] = label_0 if int(float(val_str)) == 0 else label_1
                                         except:
-                                            pivoted_data[ts][reg_name] = row[5]
+                                            pivoted_data[ts][reg_name] = val_str
                                     else:
                                         try:
                                             prec = int(dev_decimals.get(reg_addr, 3))
-                                            pivoted_data[ts][reg_name] = f"{float(row[5]):.{prec}f}"
+                                            pivoted_data[ts][reg_name] = f"{float(val_str):.{prec}f}"
                                         except:
-                                            pivoted_data[ts][reg_name] = row[5]
+                                            pivoted_data[ts][reg_name] = val_str
                             except: continue
 
                 if pivoted_data:
@@ -6355,6 +6557,8 @@ class ModbusApp:
                             row_vals = [ts, dev_alias]
                             for rname in reg_headers:
                                 row_vals.append(pivoted_data[ts].get(rname, ""))
+                            if all(v == "" or v == "-" for v in row_vals[2:]):
+                                continue
                             writer.writerow(row_vals)
                     
                     messagebox.showinfo("Success", f"Data pivoted and exported to {target_file}")
@@ -6469,7 +6673,7 @@ class ModbusApp:
 
                     # Title
                     canvas_obj.setFillColorRGB(0.01, 0.35, 0.73); canvas_obj.setFont("Helvetica-Bold", 18)
-                    canvas_obj.drawString(40, h-50, "TempTrek Environmental Monitoring System")
+                    canvas_obj.drawString(40, h-50, self.company_details.get("company_name", "TempTrek Environmental Monitoring System"))
                     
                     # Header Stamp Badge (Top Right)
                     if is_approved:
@@ -6719,11 +6923,67 @@ class ModbusApp:
             box(left, top - 66, right - left, 66)
             box(left, top - 66, 158, 66)
             box(right - 158, top - 66, 158, 66)
-            text(w / 2, top - 22, "TempTrek Environmental Monitoring System", True, 13, True)
-            text(w / 2, top - 38, "Environmental Monitoring Department", True, 9, True)
-            text(w / 2, top - 53, "Temperature and Humidity Report", False, 9, True)
-            text(left + 79, top - 38, "TEMPTREK", True, 13, True)
-            text(right - 79, top - 38, "DATA LOG", True, 12, True)
+            comp_info = load_company_details()
+            text(w / 2, top - 22, comp_info.get("company_name", "TempTrek Environmental Monitoring System"), True, 13, True)
+            text(w / 2, top - 38, comp_info.get("department_name", "Environmental Monitoring Department"), True, 9, True)
+            text(w / 2, top - 53, comp_info.get("report_title", "Temperature and Humidity Report"), False, 9, True)
+            
+            # Left side icon + Temp Trek logo
+            icon_path = resource_path("icon.png")
+            if not os.path.exists(icon_path):
+                icon_path = resource_path("icon.ico")
+            
+            icon_drawn = False
+            if os.path.exists(icon_path):
+                try:
+                    c.drawImage(icon_path, left + 8, top - 54, width=38, height=42, mask='auto', preserveAspectRatio=True)
+                    icon_drawn = True
+                except Exception:
+                    pass
+
+            left_text_x = (left + 48) if icon_drawn else (left + 10)
+            left_text_w = 102 if icon_drawn else 138
+
+            left_logo_path = None
+            for candidate in [resource_path("temptrek_logo.png"), resource_path("left_logo.png")]:
+                if os.path.exists(candidate) and candidate != icon_path:
+                    left_logo_path = candidate
+                    break
+
+            logo_drawn = False
+            if left_logo_path:
+                try:
+                    c.drawImage(left_logo_path, left_text_x, top - 56, width=left_text_w, height=46, mask='auto', preserveAspectRatio=True)
+                    logo_drawn = True
+                except Exception:
+                    pass
+
+            if not logo_drawn:
+                sx = left_text_x + (5 if icon_drawn else 30)
+                c.setFillColorRGB(0.0, 0.36, 0.72)
+                c.setFont("Helvetica-Bold", 14)
+                c.drawString(sx, top - 38, "Temp")
+                c.setFillColorRGB(0.11, 0.12, 0.13)
+                c.setFont("Helvetica", 14)
+                c.drawString(sx + 38, top - 38, "Trek")
+
+            # Right side logo option (draws uploaded logo image, or fallback DATA LOG text)
+            right_logo_path = None
+            for candidate in [os.path.join(DATA_PATH, "logo.png"), os.path.join(DATA_PATH, "config", "logo.png"), resource_path("logo.png"), resource_path("company_logo.png")]:
+                if os.path.exists(candidate) and candidate != icon_path:
+                    right_logo_path = candidate
+                    break
+
+            right_image_drawn = False
+            if right_logo_path:
+                try:
+                    c.drawImage(right_logo_path, right - 148, top - 58, width=138, height=50, mask='auto', preserveAspectRatio=True)
+                    right_image_drawn = True
+                except Exception:
+                    pass
+
+            if not right_image_drawn:
+                text(right - 79, top - 38, "DATA LOG", True, 12, True)
 
             meta_top = top - 74
             label_w, half_w = 142, (right - left) / 2
@@ -6731,14 +6991,14 @@ class ModbusApp:
                 ("Department", "Environmental Monitoring", "", ""),
                 ("Filter From", from_dt.strftime("%d/%m/%Y %H:%M:%S"), "Filter To", to_dt.strftime("%d/%m/%Y %H:%M:%S")),
                 ("Records From", sorted_ts[0] if sorted_ts else "-", "Records To", sorted_ts[-1] if sorted_ts else "-"),
-                ("Equipment", str(dev_alias).upper(), "Code", f"{ip}:{port} / Slave {slave}"),
+                ("Equipment", str(dev_alias).upper(), "", ""),
             ]
             row_h = 14
             for i, (l1, v1, l2, v2) in enumerate(rows):
                 yy = meta_top - ((i + 1) * row_h)
                 box(left, yy, right-left, row_h)
                 box(left, yy, label_w, row_h)
-                if i:
+                if l2:
                     box(left + half_w, yy, 95, row_h)
                 text(left + 3, yy + 4, l1, True, 8)
                 text(left + label_w + 3, yy + 4, v1, False, 8)
@@ -6761,33 +7021,128 @@ class ModbusApp:
             c.drawRightString(right - 2, 20, f"Page {page_no} of {total_pages}")
             return header_bottom - 12
 
-        # Page 1: channel statistics, matching the reference report summary.
+        # Page 1: Side-by-side MKT (Left Table) & MKRH (Right Table) Summary Report
         y = common_header(1)
-        text(25, y, "CHANNEL SUMMARY", True, 10)
+        text(25, y, "CHANNEL SUMMARY REPORT", True, 10)
         y -= 16
-        col_x = [25, 300, 375, 465, 555, 650]
-        col_w = [275, 75, 90, 90, 95, 167]
-        headers = ["Channel Name", "CH", "Minimum", "Maximum", "Average", "Unit"]
-        for x, cw, label in zip(col_x, col_w, headers):
-            box(x, y - 16, cw, 16, (0.83, 0.83, 0.83))
-            text(x + 3, y - 11, label, True, 8)
-        y -= 16
+
+        def _calc_mkt(val_list):
+            if not val_list: return "-"
+            try:
+                DH_R = 10000.0
+                sum_e = sum(math.exp(-DH_R / (v + 273.15)) for v in val_list)
+                avg_e = sum_e / len(val_list)
+                if avg_e <= 0: return "-"
+                mkt_k = -DH_R / math.log(avg_e)
+                return f"{(mkt_k - 273.15):.2f}"
+            except:
+                return "-"
+
+        def _calc_mkrh(val_list):
+            if not val_list: return "-"
+            try:
+                return f"{(sum(val_list)/len(val_list)):.2f}"
+            except:
+                return "-"
+
+        mkt_channels = []
+        mkrh_channels = []
+
         for i, name in enumerate(reg_names_only):
+            unit = dev_units.get(str(sorted_regs[i]), "")
+            reg_id_str = str(sorted_regs[i])
+
             vals = []
             for ts in sorted_ts:
                 try: vals.append(float(pivoted_data[ts].get(name)))
                 except (TypeError, ValueError): pass
+
             minimum = f"{min(vals):.2f}" if vals else "-"
             maximum = f"{max(vals):.2f}" if vals else "-"
             average = f"{sum(vals)/len(vals):.2f}" if vals else "-"
-            unit = dev_units.get(str(sorted_regs[i]), "")
-            values = [name, f"CH{i+1}", minimum, maximum, average, unit]
-            for x, cw, value in zip(col_x, col_w, values):
+
+            is_humidity = ("MKRH" in reg_id_str.upper() or 
+                           unit.upper() in ["%", "%RH", "RH"] or 
+                           "HUM" in name.upper() or 
+                           "RH" in name.upper())
+
+            chan_info = {
+                "name": name,
+                "unit": unit,
+                "vals": vals,
+                "min": minimum,
+                "max": maximum,
+                "avg": average,
+            }
+
+            if is_humidity:
+                chan_info["code"] = f"RH{len(mkrh_channels)+1}"
+                mkrh_channels.append(chan_info)
+            else:
+                chan_info["code"] = f"T{len(mkt_channels)+1}"
+                mkt_channels.append(chan_info)
+
+        left_x = [25, 171, 221, 281, 346]
+        left_w = [146, 50, 60, 65, 65]
+        right_x = [431, 577, 627, 687, 752]
+        right_w = [146, 50, 60, 65, 65]
+        table_headers = ["Channel Name", "CH", "Minimum", "Maximum", "Average"]
+
+        # Draw Headers
+        for x, cw, label in zip(left_x, left_w, table_headers):
+            box(x, y - 16, cw, 16, (0.83, 0.83, 0.83))
+            text(x + 3, y - 11, label, True, 8)
+
+        for x, cw, label in zip(right_x, right_w, table_headers):
+            box(x, y - 16, cw, 16, (0.83, 0.83, 0.83))
+            text(x + 3, y - 11, label, True, 8)
+
+        y -= 16
+        max_rows = max(len(mkt_channels), len(mkrh_channels), 1)
+
+        for r in range(max_rows):
+            # Left Table Row (MKT / Temperature)
+            if r < len(mkt_channels):
+                ch = mkt_channels[r]
+                l_vals = [ch["name"], ch["code"], ch["min"], ch["max"], ch["avg"]]
+            else:
+                l_vals = ["-", "-", "-", "-", "-"]
+
+            for x, cw, val in zip(left_x, left_w, l_vals):
                 box(x, y - 15, cw, 15)
-                text(x + 3, y - 10, str(value)[:34], False, 8)
+                text(x + 3, y - 10, str(val)[:24], False, 8)
+
+            # Right Table Row (MKRH / Humidity)
+            if r < len(mkrh_channels):
+                ch = mkrh_channels[r]
+                r_vals = [ch["name"], ch["code"], ch["min"], ch["max"], ch["avg"]]
+            else:
+                r_vals = ["-", "-", "-", "-", "-"]
+
+            for x, cw, val in zip(right_x, right_w, r_vals):
+                box(x, y - 15, cw, 15)
+                text(x + 3, y - 10, str(val)[:24], False, 8)
+
             y -= 15
-            if y < 62:
+            if y < 80:
                 break
+
+        # Overall MKT / MKRH summary boxes
+        all_mkt_vals = []
+        for ch in mkt_channels: all_mkt_vals.extend(ch["vals"])
+        overall_mkt = _calc_mkt(all_mkt_vals) if all_mkt_vals else "-"
+
+        all_mkrh_vals = []
+        for ch in mkrh_channels: all_mkrh_vals.extend(ch["vals"])
+        overall_mkrh = _calc_mkrh(all_mkrh_vals) if all_mkrh_vals else "-"
+
+        y -= 6
+        box(25, y - 15, 386, 15, (0.92, 0.94, 0.98))
+        text(30, y - 10, f"MKT: {overall_mkt} °C", True, 8)
+
+        box(431, y - 15, 386, 15, (0.92, 0.94, 0.98))
+        text(436, y - 10, f"MKRH: {overall_mkrh} %", True, 8)
+
         c.showPage()
 
         # Remaining pages: bordered date/time/channel log table.
@@ -6826,7 +7181,8 @@ class ModbusApp:
         c.save()
 
     def add_reg_to_mini(self):
-        addr = self.entry_reg_addr.get().strip()
+        raw_addr = self.entry_reg_addr.get().strip()
+        prefix = self.entry_reg_addr_prefix.get().strip() if hasattr(self, 'entry_reg_addr_prefix') else "null"
         name = self.entry_reg_name.get().strip()
         unit = self.entry_reg_unit.get().strip()
         dtype = self.entry_reg_type.get().strip() or "FLOAT32"
@@ -6842,9 +7198,13 @@ class ModbusApp:
             math_str = f"{math_op} {math_factor}"
         dec_prec = self.entry_reg_prec.get().strip() or "2"
         
+        if prefix in ["MKT", "MKRH"]:
+            addr = f"{prefix}:{raw_addr}" if raw_addr else prefix
+        else:
+            addr = raw_addr
+            
         if not addr: return
         try:
-            int(addr)
             sel = self.mini_tree.selection()
             
             # If name is empty, try to get from defaults
@@ -6868,6 +7228,7 @@ class ModbusApp:
             else:
                 self.mini_tree.insert("", "end", values=(addr, name, unit, dtype, reg_mode, math_str, dec_prec))
             
+            if hasattr(self, 'entry_reg_addr_prefix'): self.entry_reg_addr_prefix.set("null")
             self.entry_reg_addr.delete(0, tk.END)
             self.entry_reg_name.set("")
             self.entry_reg_unit.set("")
@@ -6878,11 +7239,12 @@ class ModbusApp:
             self.entry_reg_factor.insert(0, "1")
             self.entry_reg_prec.set("3")
             self.entry_reg_addr.focus()
-        except: messagebox.showerror("Error", "Address must be integer")
+        except Exception as err: messagebox.showerror("Error", f"Invalid Address: {err}")
 
     def on_mini_select(self, event):
         sel = self.mini_tree.selection()
         if not sel:
+            if hasattr(self, 'entry_reg_addr_prefix'): self.entry_reg_addr_prefix.set("null")
             self.entry_reg_addr.delete(0, tk.END)
             self.entry_reg_name.set("")
             self.entry_reg_unit.set("")
@@ -6896,8 +7258,21 @@ class ModbusApp:
             return
         item = self.mini_tree.item(sel[0])
         vals = item['values']
-        addr = vals[0] if len(vals) > 0 else ""
+        addr_val = str(vals[0]) if len(vals) > 0 else ""
         name = vals[1] if len(vals) > 1 else ""
+        
+        prefix = "null"
+        clean_addr = addr_val
+        if addr_val.startswith("MKT:") or addr_val == "MKT":
+            prefix = "MKT"
+            clean_addr = addr_val.replace("MKT:", "").replace("MKT", "")
+        elif addr_val.startswith("MKRH:") or addr_val == "MKRH":
+            prefix = "MKRH"
+            clean_addr = addr_val.replace("MKRH:", "").replace("MKRH", "")
+            
+        if hasattr(self, 'entry_reg_addr_prefix'): self.entry_reg_addr_prefix.set(prefix)
+        self.entry_reg_addr.delete(0, tk.END)
+        self.entry_reg_addr.insert(0, clean_addr)
         unit = vals[2] if len(vals) > 2 else ""
         dtype = vals[3] if len(vals) > 3 else "FLOAT32"
         reg_mode = vals[4] if len(vals) > 4 else "Input Register"
@@ -6911,8 +7286,6 @@ class ModbusApp:
         math_str = vals[5] if len(vals) > 5 else "/ 1"
         dec_prec = vals[6] if len(vals) > 6 else "2"
         
-        self.entry_reg_addr.delete(0, tk.END)
-        self.entry_reg_addr.insert(0, addr)
         self.entry_reg_name.set(name)
         self.entry_reg_unit.set(unit)
         self.entry_reg_type.set(dtype)
@@ -7033,6 +7406,7 @@ class ModbusApp:
 
     def add_device_submit(self):
         d_name = self.entry_device_name.get().strip()
+        node_type_val = self.entry_node_type.get().strip() if hasattr(self, 'entry_node_type') else "Standard / PLC Node"
         ip, port = self.entry_ip.get().strip(), self.entry_port.get().strip()
         slave_id_raw = self.entry_slave_id.get().strip()
         poll_interval_raw = self.entry_poll_interval.get().strip()
@@ -7070,8 +7444,8 @@ class ModbusApp:
             rl, rn, ru, rt, rm, rop, rf, rdec = [], {}, {}, {}, {}, {}, {}, {}
             for item in mini_items:
                 vals = self.mini_tree.item(item)['values']
-                addr, name, unit, dtype, reg_mode_ui, math_str, dec_prec = vals[0], vals[1], vals[2], vals[3], str(vals[4]), str(vals[5]), str(vals[6])
-                rl.append(int(addr))
+                addr, name, unit, dtype, reg_mode_ui, math_str, dec_prec = str(vals[0]), vals[1], vals[2], vals[3], str(vals[4]), str(vals[5]), str(vals[6])
+                rl.append(addr)
                 if dtype == "BOOLEAN":
                     unit = "na"
                 if name: rn[str(addr)] = name
@@ -7115,6 +7489,7 @@ class ModbusApp:
                 
                 dev = {
                     "device_name": final_name,
+                    "node_type": node_type_val,
                     "ip": ip, 
                     "port": p, 
                     "slave_id": sid,
@@ -7180,6 +7555,8 @@ class ModbusApp:
         """ Resets the entire form to 'Add' mode """
         self.edit_index = None
         self.entry_device_name.delete(0, tk.END)
+        if hasattr(self, 'entry_node_type'):
+            self.entry_node_type.set("Standard / PLC Node")
         self.entry_ip.delete(0, tk.END)
         self.entry_port.delete(0, tk.END)
         self.entry_port.insert(0, "502")
@@ -7206,6 +7583,132 @@ class ModbusApp:
         for item in self.mini_tree.get_children(): self.mini_tree.delete(item)
         self.btn_add.config(text="SAVE NODE", bg=self.COLORS["accent"])
 
+    def view_all_device_details(self, event=None):
+        sel = self.node_tree.selection()
+        if not sel:
+            messagebox.showinfo("View Details", "Please select a device node from the Stored Devices table to view full details.")
+            return
+
+        tags = self.node_tree.item(sel[0], "tags")
+        dev_idx = None
+        for t in tags:
+            if t.startswith("dev_idx_"):
+                dev_idx = int(t.split("_")[-1])
+                break
+
+        if dev_idx is None or dev_idx >= len(self.devices):
+            return
+
+        d = self.devices[dev_idx]
+        ip, port, slave = d['ip'], d['port'], d.get('slave_id', 1)
+        d_name = d.get('device_name', f"{ip}:{port}")
+        key = f"{ip}:{port}:{slave}"
+        is_running = key in self.device_threads and self.device_threads[key].is_alive()
+        status_str = "ACTIVE" if is_running else "INACTIVE"
+
+        top = tk.Toplevel(self.root)
+        top.title(f"FULL NODE DETAILS - {d_name.upper()}")
+        top.geometry("920x600")
+        top.configure(bg=self.COLORS["bg_dark"])
+        top.transient(self.root)
+        top.grab_set()
+
+        # Header Info Card
+        hdr_frame = tk.Frame(top, bg=self.COLORS["bg_surface"], padx=20, pady=15, 
+                             highlightbackground=self.COLORS["bg_highlight"], highlightthickness=1)
+        hdr_frame.pack(fill="x", padx=20, pady=15)
+
+        tk.Label(hdr_frame, text=f"NODE CONFIGURATION: {d_name.upper()}", font=("Segoe UI", 12, "bold"), 
+                 fg=self.COLORS["accent"], bg=self.COLORS["bg_surface"]).pack(anchor="w", pady=(0, 10))
+
+        info_grid = tk.Frame(hdr_frame, bg=self.COLORS["bg_surface"])
+        info_grid.pack(fill="x")
+
+        details = [
+            ("IP Address:", f"{ip}"),
+            ("Port:", f"{port}"),
+            ("Slave ID:", f"{slave}"),
+            ("Poll Interval:", f"{d.get('poll_interval', 1.0)} sec"),
+            ("Node Type:", f"{d.get('node_type', 'Standard / PLC Node')}"),
+            ("Status:", status_str),
+            ("Total Registers:", f"{len(d.get('registers', []))}")
+        ]
+
+        for i, (k, v) in enumerate(details):
+            col = i % 3
+            row = i // 3
+            cell = tk.Frame(info_grid, bg=self.COLORS["bg_surface"])
+            cell.grid(row=row, column=col, sticky="w", padx=15, pady=4)
+            tk.Label(cell, text=k, font=("Segoe UI", 8, "bold"), fg=self.COLORS["text_dim"], bg=self.COLORS["bg_surface"]).pack(side="left", padx=(0, 5))
+            val_fg = self.COLORS["success"] if v == "ACTIVE" else (self.COLORS["danger"] if v == "INACTIVE" else self.COLORS["text_main"])
+            tk.Label(cell, text=v, font=("Segoe UI", 9, "bold"), fg=val_fg, bg=self.COLORS["bg_surface"]).pack(side="left")
+
+        # Register Mapping Table Header
+        reg_title_frame = tk.Frame(top, bg=self.COLORS["bg_dark"])
+        reg_title_frame.pack(fill="x", padx=20, pady=(10, 5))
+        tk.Label(reg_title_frame, text="REGISTER MAPPING DETAILS", font=("Segoe UI", 10, "bold"), 
+                 fg=self.COLORS["text_main"], bg=self.COLORS["bg_dark"]).pack(side="left")
+
+        table_cnt = tk.Frame(top, bg=self.COLORS["bg_surface"], highlightbackground=self.COLORS["bg_highlight"], highlightthickness=1)
+        table_cnt.pack(fill="both", expand=True, padx=20, pady=(0, 15))
+
+        cols = ("addr", "name", "unit", "type", "mode", "math", "prec")
+        tree = ttk.Treeview(table_cnt, columns=cols, show="headings", style="Treeview")
+
+        tree.heading("addr", text="ADDRESS")
+        tree.heading("name", text="REGISTER NAME")
+        tree.heading("unit", text="UNIT")
+        tree.heading("type", text="DATA TYPE")
+        tree.heading("mode", text="REGISTER MODE")
+        tree.heading("math", text="MATH (OP/FACTOR)")
+        tree.heading("prec", text="DECIMALS")
+
+        tree.column("addr", width=110, anchor="center")
+        tree.column("name", width=180, anchor="w")
+        tree.column("unit", width=80, anchor="center")
+        tree.column("type", width=120, anchor="center")
+        tree.column("mode", width=160, anchor="w")
+        tree.column("math", width=180, anchor="center")
+        tree.column("prec", width=90, anchor="center")
+
+        v_sb = ttk.Scrollbar(table_cnt, orient="vertical", command=tree.yview, style="Vertical.TScrollbar")
+        h_sb = ttk.Scrollbar(table_cnt, orient="horizontal", command=tree.xview, style="Horizontal.TScrollbar")
+        tree.configure(yscrollcommand=v_sb.set, xscrollcommand=h_sb.set)
+
+        v_sb.pack(side="right", fill="y")
+        h_sb.pack(side="bottom", fill="x")
+        tree.pack(side="left", fill="both", expand=True)
+
+        names = d.get('names', {})
+        units = d.get('units', {})
+        types = d.get('types', {})
+        modes = d.get('modes', {})
+        ops = d.get('ops', {})
+        facts = d.get('factors', {})
+        decimals = d.get('decimals', {})
+
+        for i, reg in enumerate(d.get('registers', [])):
+            nm = names.get(str(reg), "")
+            if not nm and i < len(self.DEFAULT_REGISTER_NAMES): nm = self.DEFAULT_REGISTER_NAMES[i]
+            un = units.get(str(reg), "")
+            dt = types.get(str(reg), "FLOAT32")
+            if dt == "BOOLEAN": un = "na"
+            md_code = modes.get(str(reg), "FC04")
+            code_map = {"FC01": "Output Coil", "FC02": "Input Coil", "FC03": "Holding Register", "FC04": "Input Register"}
+            md = code_map.get(md_code, "Input Register")
+            op = ops.get(str(reg), "/")
+            fact = facts.get(str(reg), "1")
+            math_str = f"0={op} / 1={fact}" if dt == "BOOLEAN" else f"{op} {fact}"
+            dp = decimals.get(str(reg), "3")
+
+            tree.insert("", "end", values=(reg, str(nm).upper() if nm else f"REG {reg}", un, dt, md, math_str, dp))
+
+        # Close Button
+        btn_bar = tk.Frame(top, bg=self.COLORS["bg_dark"], pady=10)
+        btn_bar.pack(fill="x", padx=20)
+        tk.Button(btn_bar, text="CLOSE", bg=self.COLORS["bg_highlight"], fg=self.COLORS["text_main"],
+                  font=self.FONTS["button"], relief="flat", padx=25, pady=6, cursor="hand2", command=top.destroy).pack(side="right")
+
     def load_edit_device(self):
         sel = self.node_tree.selection()
         if not sel: return
@@ -7222,6 +7725,8 @@ class ModbusApp:
         d = self.devices[dev_idx]
         
         self.entry_device_name.delete(0, tk.END); self.entry_device_name.insert(0, d.get('device_name', ''))
+        if hasattr(self, 'entry_node_type'):
+            self.entry_node_type.set(d.get('node_type', 'Standard / PLC Node'))
         self.entry_ip.delete(0, tk.END); self.entry_ip.insert(0, d['ip'])
         self.entry_port.delete(0, tk.END); self.entry_port.insert(0, str(d['port']))
         self.entry_slave_id.delete(0, tk.END); self.entry_slave_id.insert(0, str(d.get('slave_id', 1)))
@@ -7536,7 +8041,7 @@ class ModbusApp:
             def draw_header(curr_page):
                 c.setFillColorRGB(0.05, 0.08, 0.12); c.rect(0, 0, w, h, fill=1)
                 c.setFillColorRGB(0, 0.7, 1.0); c.setFont("Helvetica-Bold", 20)
-                c.drawString(40, h-45, "TempTrek Environmental Monitoring System")
+                c.drawString(40, h-45, self.company_details.get("company_name", "TempTrek Environmental Monitoring System"))
                 c.setFillColorRGB(1, 1, 1); c.setFont("Helvetica", 10)
                 c.drawString(40, h-65, f"COMPLETE DAILY LOG | Date: {datetime.now().strftime('%Y-%m-%d')} | Page: {curr_page}")
                 c.setStrokeColorRGB(0, 0.7, 1.0); c.setLineWidth(1.5); c.line(40, h-75, w-40, h-75)
@@ -7743,19 +8248,36 @@ class ModbusApp:
                             dtype = d.get("types", {}).get(rn, "INT32")
                             divisor = d.get("divisors", {}).get(rn, "1") # Get divisor
                             # If name still empty, check defaults
-                            if not nm:
-                                try:
+                            try:
+                                if str(rn) in [str(x) for x in d['registers']]:
+                                    idx = [str(x) for x in d['registers']].index(str(rn))
+                                elif str(rn).isdigit() and int(rn) in d['registers']:
                                     idx = d['registers'].index(int(rn))
-                                    if idx < len(self.DEFAULT_REGISTER_NAMES):
-                                        nm = self.DEFAULT_REGISTER_NAMES[idx]
-                                        if not unit: unit = self.DEFAULT_REGISTER_UNITS[idx]
-                                        dtype = self.DEFAULT_REGISTER_TYPES[idx]
-                                except: pass
+                                else:
+                                    idx = -1
+                                if idx != -1 and idx < len(self.DEFAULT_REGISTER_NAMES):
+                                    if not nm: nm = self.DEFAULT_REGISTER_NAMES[idx]
+                                    if not unit: unit = self.DEFAULT_REGISTER_UNITS[idx]
+                                    if dtype == "INT32": dtype = self.DEFAULT_REGISTER_TYPES[idx]
+                            except: pass
                             break
                     
                     # Update live dash
                     lid = f"{ip}:{port}:{slave}:{rn}"
-                    if lid in self.live_labels:
+                    
+                    is_lora = False
+                    if found_dev:
+                        is_lora = ("LORA" in str(found_dev.get('node_type', '')).upper()) or ("LORA" in str(found_dev.get('device_name', '')).upper())
+                    
+                    should_update_ui = True
+                    if is_lora:
+                        try:
+                            if float(vn) <= 0:
+                                should_update_ui = False
+                        except Exception:
+                            pass
+
+                    if should_update_ui and lid in self.live_labels:
                         try:
                             # Match view: Auto-format based on perceived type or value
                             display_val = vn
@@ -7778,6 +8300,13 @@ class ModbusApp:
                             # Persistence
                             self.last_values[lid] = display_val
                             
+                            # Update Register Card Last Update Date & Time
+                            full_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                            self.last_update_times[lid] = full_ts
+                            time_lid = f"{lid}:time"
+                            if time_lid in self.live_labels:
+                                self.live_labels[time_lid].config(text=f"Last Update: {full_ts}")
+
                             # Update Sync Time on Header
                             k_sync = f"{ip}:{port}:{slave}:sync"
                             if k_sync in self.live_labels:
@@ -7927,8 +8456,7 @@ class ModbusApp:
         tk.Button(bar, text="🔍 FILTER", bg=self.COLORS["accent"], fg="black", font=self.FONTS["button"], relief="flat", padx=10, command=self.refresh_audit_log_view).pack(side="left", padx=5)
         tk.Button(bar, text="↺ RESET", bg=self.COLORS["bg_surface"], fg=self.COLORS["text_dim"], font=self.FONTS["button"], relief="flat", padx=10, command=lambda: (self.audit_cat_cb.set("ALL"), self.audit_search_entry.delete(0, tk.END), self.refresh_audit_log_view())).pack(side="left", padx=5)
 
-        tk.Button(bar, text="📁 FOLDER", bg=self.COLORS["bg_surface"], fg=self.COLORS["text_dim"], font=self.FONTS["button"], relief="flat", padx=12, command=self.open_logs_folder).pack(side="right", padx=5)
-        tk.Button(bar, text="💾 EXPORT CSV", bg=self.COLORS["success"], fg="white", font=self.FONTS["button"], relief="flat", padx=12, command=self.export_audit_log_to_csv).pack(side="right", padx=5)
+        tk.Button(bar, text="📄 EXPORT PDF", bg=self.COLORS["success"], fg="white", font=self.FONTS["button"], relief="flat", padx=12, command=self.export_audit_log_to_pdf).pack(side="right", padx=5)
 
         cnt = tk.Frame(self.content_frame, bg=self.COLORS["bg_surface"], highlightbackground=self.COLORS["bg_highlight"], highlightthickness=1)
         cnt.pack(fill="both", expand=True, padx=30, pady=(0, 20))
@@ -7958,6 +8486,243 @@ class ModbusApp:
 
         self.refresh_audit_log_view()
 
+    def upload_report_logo(self):
+        filepath = filedialog.askopenfilename(
+            title="Select Right Header Logo Image for PDF Reports",
+            filetypes=[
+                ("Image Files", "*.png *.jpg *.jpeg *.bmp *.ico"),
+                ("PNG Images", "*.png"),
+                ("All Files", "*.*")
+            ]
+        )
+        if not filepath:
+            return
+
+        try:
+            target_png = os.path.join(DATA_PATH, "logo.png")
+            config_dir = os.path.join(DATA_PATH, "config")
+            os.makedirs(config_dir, exist_ok=True)
+            config_png = os.path.join(config_dir, "logo.png")
+
+            try:
+                img = Image.open(filepath)
+                img.save(target_png, "PNG")
+                img.save(config_png, "PNG")
+            except Exception:
+                shutil.copy(filepath, target_png)
+                shutil.copy(filepath, config_png)
+
+            self.log_audit("LOGO_UPLOAD", "CONFIG", f"Uploaded new PDF report header logo '{os.path.basename(filepath)}'")
+            messagebox.showinfo("Success", "Report logo updated successfully!\n\nIt will now appear on the right side of all exported PDF report headers.")
+        except Exception as e:
+            messagebox.showerror("Upload Error", f"Failed to save logo image: {e}")
+
+    # -------------------------
+    # VIEW: COMPANY DETAILS
+    # -------------------------
+    def show_company_details(self):
+        container = tk.Frame(self.content_frame, bg=self.COLORS["bg_dark"])
+        container.pack(fill="both", expand=True, padx=30, pady=20)
+
+        # Header / Intro
+        header_frame = tk.Frame(container, bg=self.COLORS["bg_dark"])
+        header_frame.pack(fill="x", pady=(0, 20))
+        
+        tk.Label(header_frame, text="COMPANY & REPORT HEADER CONFIGURATION", font=self.FONTS["h2"], 
+                 fg=self.COLORS["text_main"], bg=self.COLORS["bg_dark"]).pack(anchor="w")
+        tk.Label(header_frame, text="Configure the three header lines rendered at the top of PDF reports and system documents.", 
+                 font=self.FONTS["body"], fg=self.COLORS["text_dim"], bg=self.COLORS["bg_dark"]).pack(anchor="w", pady=(4, 0))
+
+        # Main Layout Frame (2 Columns: Form Card on Left, Live Preview on Right)
+        main_layout = tk.Frame(container, bg=self.COLORS["bg_dark"])
+        main_layout.pack(fill="both", expand=True)
+
+        # Form Card (Left Column)
+        form_card = tk.Frame(main_layout, bg=self.COLORS["bg_surface"], padx=30, pady=25,
+                             highlightbackground=self.COLORS["accent_glow"], highlightthickness=1)
+        form_card.pack(side="left", fill="both", expand=True, padx=(0, 15))
+
+        tk.Label(form_card, text="HEADER DETAILS FORM", font=("Segoe UI", 12, "bold"), 
+                 bg=self.COLORS["bg_surface"], fg=self.COLORS["accent"]).pack(anchor="w", pady=(0, 20))
+
+        # Line 1: System / Company Name
+        tk.Label(form_card, text="Header Line 1 (System / Company Title):", font=self.FONTS["body"], 
+                 bg=self.COLORS["bg_surface"], fg=self.COLORS["text_dim"]).pack(anchor="w")
+        self.comp_line1_entry = tk.Entry(form_card, font=self.FONTS["body"], bg=self.COLORS["bg_dark"], 
+                                         fg=self.COLORS["text_main"], relief="flat", insertbackground="black")
+        self.comp_line1_entry.insert(0, self.company_details.get("company_name", "TempTrek Environmental Monitoring System"))
+        self.comp_line1_entry.pack(fill="x", pady=(5, 18), ipady=8)
+
+        # Line 2: Department Name
+        tk.Label(form_card, text="Header Line 2 (Department / Subtitle):", font=self.FONTS["body"], 
+                 bg=self.COLORS["bg_surface"], fg=self.COLORS["text_dim"]).pack(anchor="w")
+        self.comp_line2_entry = tk.Entry(form_card, font=self.FONTS["body"], bg=self.COLORS["bg_dark"], 
+                                         fg=self.COLORS["text_main"], relief="flat", insertbackground="black")
+        self.comp_line2_entry.insert(0, self.company_details.get("department_name", "Environmental Monitoring Department"))
+        self.comp_line2_entry.pack(fill="x", pady=(5, 18), ipady=8)
+
+        # Line 3: Report Title / Description
+        tk.Label(form_card, text="Header Line 3 (Report Title / Description):", font=self.FONTS["body"], 
+                 bg=self.COLORS["bg_surface"], fg=self.COLORS["text_dim"]).pack(anchor="w")
+        self.comp_line3_entry = tk.Entry(form_card, font=self.FONTS["body"], bg=self.COLORS["bg_dark"], 
+                                         fg=self.COLORS["text_main"], relief="flat", insertbackground="black")
+        self.comp_line3_entry.insert(0, self.company_details.get("report_title", "Temperature and Humidity Report"))
+        self.comp_line3_entry.pack(fill="x", pady=(5, 18), ipady=8)
+
+        # PDF Report Logo Upload Section
+        tk.Label(form_card, text="PDF Report Header Logo:", font=self.FONTS["body"], 
+                 bg=self.COLORS["bg_surface"], fg=self.COLORS["text_dim"]).pack(anchor="w")
+        logo_frame = tk.Frame(form_card, bg=self.COLORS["bg_surface"])
+        logo_frame.pack(fill="x", pady=(5, 20))
+        
+        logo_btn = tk.Button(logo_frame, text="🖼 UPLOAD REPORT LOGO", bg=self.COLORS["bg_highlight"], fg=self.COLORS["text_main"], 
+                             font=self.FONTS["button"], relief="flat", cursor="hand2", padx=15,
+                             activebackground=self.COLORS["accent_glow"], command=self.upload_company_logo_action)
+        logo_btn.pack(side="left", ipady=6)
+        
+        self.lbl_logo_status = tk.Label(logo_frame, text="", font=("Segoe UI", 9, "italic"), 
+                                        bg=self.COLORS["bg_surface"], fg=self.COLORS["accent"])
+        self.lbl_logo_status.pack(side="left", padx=15)
+
+        # Bind key events for live preview update
+        self.comp_line1_entry.bind("<KeyRelease>", lambda e: self.update_company_preview())
+        self.comp_line2_entry.bind("<KeyRelease>", lambda e: self.update_company_preview())
+        self.comp_line3_entry.bind("<KeyRelease>", lambda e: self.update_company_preview())
+
+        # Buttons Frame
+        btn_frame = tk.Frame(form_card, bg=self.COLORS["bg_surface"])
+        btn_frame.pack(fill="x", pady=(10, 0))
+
+        save_btn = tk.Button(btn_frame, text="💾 SAVE DETAILS", bg=self.COLORS["accent"], fg="black", 
+                             font=self.FONTS["button"], relief="flat", cursor="hand2", padx=20,
+                             activebackground=self.COLORS["accent_glow"], command=self.save_company_details_action)
+        save_btn.pack(side="left", ipady=8)
+
+        reset_btn = tk.Button(btn_frame, text="↺ RESET DEFAULTS", bg=self.COLORS["bg_dark"], fg=self.COLORS["text_dim"], 
+                              font=self.FONTS["button"], relief="flat", cursor="hand2", padx=15,
+                              command=self.reset_company_details_action)
+        reset_btn.pack(side="left", padx=15, ipady=8)
+
+        # Preview Card (Right Column)
+        preview_card = tk.Frame(main_layout, bg=self.COLORS["bg_surface"], padx=25, pady=25,
+                                highlightbackground=self.COLORS["bg_highlight"], highlightthickness=1, width=420)
+        preview_card.pack(side="right", fill="both", expand=False)
+        preview_card.pack_propagate(False)
+
+        tk.Label(preview_card, text="PDF REPORT HEADER PREVIEW", font=("Segoe UI", 11, "bold"), 
+                 bg=self.COLORS["bg_surface"], fg=self.COLORS["text_dim"]).pack(anchor="w", pady=(0, 20))
+
+        # Preview Box Container matching PDF box layout
+        self.preview_box = tk.Frame(preview_card, bg="white", highlightbackground="#888888", highlightthickness=1, padx=15, pady=15)
+        self.preview_box.pack(fill="x", pady=10)
+
+        self.lbl_prev_line1 = tk.Label(self.preview_box, text="", font=("Segoe UI", 12, "bold"), fg="black", bg="white")
+        self.lbl_prev_line1.pack()
+
+        self.lbl_prev_line2 = tk.Label(self.preview_box, text="", font=("Segoe UI", 9, "bold"), fg="#333333", bg="white")
+        self.lbl_prev_line2.pack(pady=2)
+
+        self.lbl_prev_line3 = tk.Label(self.preview_box, text="", font=("Segoe UI", 9), fg="#555555", bg="white")
+        self.lbl_prev_line3.pack()
+
+        tk.Label(preview_card, text="* This is a live preview of how the header box will appear at the top of exported PDF documents.", 
+                 font=("Segoe UI", 8, "italic"), fg=self.COLORS["text_dim"], bg=self.COLORS["bg_surface"], wraplength=350, justify="left").pack(anchor="w", pady=(20, 0))
+
+        self.update_company_preview()
+
+    def update_company_preview(self):
+        if hasattr(self, 'lbl_prev_line1'):
+            l1 = self.comp_line1_entry.get().strip() or "TempTrek Environmental Monitoring System"
+            l2 = self.comp_line2_entry.get().strip() or "Environmental Monitoring Department"
+            l3 = self.comp_line3_entry.get().strip() or "Temperature and Humidity Report"
+            self.lbl_prev_line1.config(text=l1)
+            self.lbl_prev_line2.config(text=l2)
+            self.lbl_prev_line3.config(text=l3)
+        if hasattr(self, 'lbl_logo_status'):
+            custom_logo = os.path.join(DATA_PATH, "logo.png")
+            if os.path.exists(custom_logo):
+                self.lbl_logo_status.config(text="✓ Custom logo active", fg=self.COLORS["success"])
+            else:
+                self.lbl_logo_status.config(text="Default logo active", fg=self.COLORS["text_dim"])
+
+    def upload_company_logo_action(self):
+        filepath = filedialog.askopenfilename(
+            title="Select Right Header Logo Image for PDF Reports",
+            filetypes=[
+                ("Image Files", "*.png *.jpg *.jpeg *.bmp *.ico"),
+                ("PNG Images", "*.png"),
+                ("All Files", "*.*")
+            ]
+        )
+        if not filepath:
+            return
+
+        try:
+            target_png = os.path.join(DATA_PATH, "logo.png")
+            config_dir = os.path.join(DATA_PATH, "config")
+            os.makedirs(config_dir, exist_ok=True)
+            config_png = os.path.join(config_dir, "logo.png")
+
+            try:
+                img = Image.open(filepath)
+                img.save(target_png, "PNG")
+                img.save(config_png, "PNG")
+            except Exception:
+                shutil.copy(filepath, target_png)
+                shutil.copy(filepath, config_png)
+
+            self.log_audit("LOGO_UPLOAD", "CONFIG", f"Uploaded new PDF report header logo '{os.path.basename(filepath)}'")
+            messagebox.showinfo("Success", "Report logo updated successfully!\n\nIt will now appear on all exported PDF report headers.")
+            self.update_company_preview()
+        except Exception as e:
+            messagebox.showerror("Upload Error", f"Failed to save logo image: {e}")
+
+    def save_company_details_action(self):
+        line1 = self.comp_line1_entry.get().strip()
+        line2 = self.comp_line2_entry.get().strip()
+        line3 = self.comp_line3_entry.get().strip()
+
+        if not line1:
+            line1 = "TempTrek Environmental Monitoring System"
+        if not line2:
+            line2 = "Environmental Monitoring Department"
+        if not line3:
+            line3 = "Temperature and Humidity Report"
+
+        self.company_details["company_name"] = line1
+        self.company_details["department_name"] = line2
+        self.company_details["report_title"] = line3
+
+        try:
+            save_company_details(self.company_details)
+            self.log_audit("UPDATE_COMPANY_DETAILS", "CONFIG", f"Updated company details: '{line1}' | '{line2}' | '{line3}'")
+            self.update_company_preview()
+            messagebox.showinfo("Success", "Company header details saved successfully.\n\nAll future PDF exports will use these updated titles.")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to save company details: {e}")
+
+    def reset_company_details_action(self):
+        if messagebox.askyesno("Confirm Reset", "Reset company details back to default values?"):
+            def_l1 = "TempTrek Environmental Monitoring System"
+            def_l2 = "Environmental Monitoring Department"
+            def_l3 = "Temperature and Humidity Report"
+            
+            self.comp_line1_entry.delete(0, tk.END)
+            self.comp_line1_entry.insert(0, def_l1)
+            self.comp_line2_entry.delete(0, tk.END)
+            self.comp_line2_entry.insert(0, def_l2)
+            self.comp_line3_entry.delete(0, tk.END)
+            self.comp_line3_entry.insert(0, def_l3)
+
+            self.company_details["company_name"] = def_l1
+            self.company_details["department_name"] = def_l2
+            self.company_details["report_title"] = def_l3
+
+            save_company_details(self.company_details)
+            self.log_audit("RESET_COMPANY_DETAILS", "CONFIG", "Reset company header details to defaults")
+            self.update_company_preview()
+            messagebox.showinfo("Success", "Company details reset to defaults.")
+
     def refresh_audit_log_view(self):
         if not hasattr(self, 'audit_tree') or not self.audit_tree.winfo_exists():
             return
@@ -7969,18 +8734,20 @@ class ModbusApp:
         search_query = self.audit_search_entry.get().strip().lower() if hasattr(self, 'audit_search_entry') else ""
 
         logs_to_display = []
-        date_str = datetime.now().strftime("%Y-%m-%d")
-        fn = os.path.join(DATA_PATH, "live", f"Audit_Logs_{date_str}.csv")
-        if os.path.exists(fn):
-            try:
-                with open(fn, "r", encoding='utf-8', errors='replace') as f:
-                    reader = csv.reader((line.replace('\0', '') for line in f))
-                    header = next(reader, None)
-                    for row in reader:
-                        if len(row) >= 5:
-                            logs_to_display.append(tuple(row[:5]))
-            except Exception:
-                pass
+        live_dir = os.path.join(DATA_PATH, "live")
+        if os.path.exists(live_dir):
+            audit_files = sorted([f for f in os.listdir(live_dir) if f.startswith("Audit_Logs_") and f.endswith(".csv")], reverse=True)
+            for fname in audit_files:
+                fn = os.path.join(live_dir, fname)
+                try:
+                    with open(fn, "r", encoding='utf-8', errors='replace') as f:
+                        reader = csv.reader((line.replace('\0', '') for line in f))
+                        header = next(reader, None)
+                        for row in reader:
+                            if len(row) >= 5:
+                                logs_to_display.append(tuple(row[:5]))
+                except Exception:
+                    pass
 
         # Also merge in-memory log entries for entries not yet on disk or fallback
         for entry in list(self.global_audit_log):
@@ -7999,6 +8766,180 @@ class ModbusApp:
                 if search_query not in combined:
                     continue
             self.audit_tree.insert("", "end", values=(ts, user, action, category, details))
+
+    def export_audit_log_to_pdf(self):
+        if not HAS_REPORTLAB:
+            messagebox.showerror("Error", "ReportLab library is missing. Cannot export PDF.")
+            return
+
+        date_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+        target_file = filedialog.asksaveasfilename(
+            defaultextension=".pdf", 
+            initialfile=f"Equipment_Audit_Trail_Equipment_Wise_{date_str}.pdf",
+            filetypes=[("PDF Files (*.pdf)", "*.pdf"), ("All Files", "*.*")]
+        )
+        if not target_file:
+            return
+            
+        try:
+            page_size = landscape((595.2756, 841.8898))  # A4 landscape
+            c = canvas.Canvas(target_file, pagesize=page_size)
+            w, h = page_size
+            printed_at = datetime.now()
+            
+            # Fetch table rows from UI tree
+            tree_items = self.audit_tree.get_children()
+            log_records = []
+            for item in tree_items:
+                row = self.audit_tree.item(item)['values']
+                if len(row) >= 5:
+                    log_records.append((str(row[0]), str(row[1]), str(row[2]), str(row[3]), str(row[4])))
+
+            rows_per_page = 20
+            total_pages = max(1, (len(log_records) + rows_per_page - 1) // rows_per_page)
+
+            def box(x, y, bw, bh, fill=None, stroke=0.45):
+                if fill is not None:
+                    c.setFillColorRGB(*fill)
+                    c.rect(x, y, bw, bh, fill=1, stroke=0)
+                c.setStrokeColorRGB(stroke, stroke, stroke)
+                c.setLineWidth(0.5)
+                c.rect(x, y, bw, bh, fill=0, stroke=1)
+
+            def text(x, y, value, bold=False, size=8, centered=False):
+                c.setFillColorRGB(0, 0, 0)
+                c.setFont("Helvetica-Bold" if bold else "Helvetica", size)
+                value = str(value)
+                if centered:
+                    c.drawCentredString(x, y, value)
+                else:
+                    c.drawString(x, y, value)
+
+            cat_filter = self.audit_cat_cb.get() if hasattr(self, 'audit_cat_cb') else "ALL"
+            search_filter = self.audit_search_entry.get().strip() if hasattr(self, 'audit_search_entry') else ""
+            if not search_filter:
+                search_filter = "None"
+
+            col_x = [25, 65, 185, 275, 395, 505]
+            col_w = [40, 120, 90, 120, 110, 311]
+            headers = ["S.No.", "Timestamp", "User", "Action", "Category", "Details"]
+
+            def draw_page_decorations(page_no):
+                left, right = 25, w - 25
+                top = h - 12
+                # Outer Title Box (66pt high)
+                box(left, top - 66, right - left, 66)
+                box(left, top - 66, 158, 66)
+                box(right - 158, top - 66, 158, 66)
+                
+                comp_info = load_company_details()
+                text(w / 2, top - 22, comp_info.get("company_name", "TempTrek Environmental Monitoring System"), True, 13, True)
+                text(w / 2, top - 38, comp_info.get("department_name", "Environmental Monitoring Department"), True, 9, True)
+                text(w / 2, top - 53, "EQUIPMENT AUDIT TRAIL (EQUIPMENT WISE)", True, 9, True)
+                
+                # Left side icon/logo (Temp Trek image format)
+                left_logo_path = None
+                for candidate in [resource_path("temptrek_logo.png"), resource_path("logo.png"), resource_path("left_logo.png"), resource_path("icon.png")]:
+                    if os.path.exists(candidate):
+                        left_logo_path = candidate
+                        break
+                left_image_drawn = False
+                if left_logo_path:
+                    try:
+                        c.drawImage(left_logo_path, left + 10, top - 58, width=138, height=50, mask='auto', preserveAspectRatio=True)
+                        left_image_drawn = True
+                    except Exception:
+                        pass
+                if not left_image_drawn:
+                    start_x = left + 40
+                    c.setFillColorRGB(0.0, 0.36, 0.72)
+                    c.setFont("Helvetica-Bold", 15)
+                    c.drawString(start_x, top - 38, "Temp")
+                    c.setFillColorRGB(0.11, 0.12, 0.13)
+                    c.setFont("Helvetica", 15)
+                    c.drawString(start_x + 41, top - 38, "Trek")
+
+                # Right side logo option
+                right_logo_path = None
+                for candidate in [os.path.join(DATA_PATH, "logo.png"), os.path.join(DATA_PATH, "config", "logo.png"), resource_path("logo.png"), resource_path("company_logo.png")]:
+                    if os.path.exists(candidate):
+                        right_logo_path = candidate
+                        break
+                right_image_drawn = False
+                if right_logo_path:
+                    try:
+                        c.drawImage(right_logo_path, right - 148, top - 57, width=48, height=48, mask='auto', preserveAspectRatio=True)
+                        text(right - 92, top - 38, "AUDIT TRAIL", True, 10, False)
+                        right_image_drawn = True
+                    except Exception:
+                        pass
+                if not right_image_drawn:
+                    text(right - 79, top - 38, "AUDIT TRAIL", True, 12, True)
+
+                # Metadata Box
+                meta_top = top - 74
+                label_w, half_w = 142, (right - left) / 2
+                meta_rows = [
+                    ("Department", "Environmental Monitoring", "Report Type", "Equipment Audit Trail (Equipment Wise)"),
+                    ("Category Filter", cat_filter, "Search Query", search_filter),
+                    ("Total Records", str(len(log_records)), "Generated On", printed_at.strftime("%d/%m/%Y %H:%M:%S")),
+                    ("Generated By", self.current_user, "System Version", "TempTrek 2.0")
+                ]
+                row_h = 14
+                for i, (l1, v1, l2, v2) in enumerate(meta_rows):
+                    yy = meta_top - ((i + 1) * row_h)
+                    box(left, yy, right - left, row_h)
+                    box(left, yy, label_w, row_h)
+                    box(left + half_w, yy, 95, row_h)
+                    text(left + 3, yy + 4, l1, True, 8)
+                    text(left + label_w + 3, yy + 4, str(v1)[:45], False, 8)
+                    text(left + half_w + 3, yy + 4, l2, True, 8)
+                    text(left + half_w + 98, yy + 4, str(v2)[:45], False, 8)
+
+                # Footer
+                c.setStrokeColorRGB(0.35, 0.35, 0.35)
+                c.line(left, 47, right, 47)
+                text(left + 2, 20, "TempTrek 2.0 - Equipment Audit Trail", False, 8)
+                text(w / 2, 20, f"Printed By - {self.current_user} On {printed_at.strftime('%d/%m/%Y %H:%M:%S')}", False, 8, True)
+                c.setFillColorRGB(0, 0, 0)
+                c.setFont("Helvetica", 8)
+                c.drawRightString(right - 2, 20, f"Page {page_no} of {total_pages}")
+
+                # Table Column Headers
+                y_hdr = meta_top - (4 * row_h) - 15
+                for x, cw, label in zip(col_x, col_w, headers):
+                    box(x, y_hdr - 16, cw, 16, (0.83, 0.83, 0.83))
+                    text(x + 3, y_hdr - 11, label, True, 8)
+                
+                return y_hdr - 16
+
+            current_page = 1
+            y_curr = draw_page_decorations(current_page)
+            row_height = 15
+
+            for idx, rec in enumerate(log_records):
+                if y_curr - row_height < 55:
+                    c.showPage()
+                    current_page += 1
+                    y_curr = draw_page_decorations(current_page)
+
+                sno = str(idx + 1)
+                ts, user, action, cat, details = rec
+                row_vals = [sno, ts, user, action, cat, details]
+                max_lens = [5, 22, 16, 20, 18, 60]
+
+                for x, cw, val, ml in zip(col_x, col_w, row_vals, max_lens):
+                    box(x, y_curr - row_height, cw, row_height)
+                    text(x + 3, y_curr - row_height + 4, str(val)[:ml], False, 8)
+
+                y_curr -= row_height
+
+            c.save()
+            self.log_audit("AUDIT_LOG_EXPORT", "EXPORT", f"Exported equipment audit trail PDF report to '{os.path.basename(target_file)}'")
+            messagebox.showinfo("Success", f"Equipment Audit Trail PDF exported successfully!\n\nFile: {target_file}")
+            webbrowser.open(target_file)
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to export equipment audit trail PDF: {e}")
 
     def export_audit_log_to_csv(self):
         date_str = datetime.now().strftime("%Y-%m-%d")
