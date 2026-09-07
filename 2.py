@@ -271,6 +271,9 @@ def load_sms_settings():
     default_settings = {
         "api_key": "",
         "route": "q",
+        "sender_id": "",
+        "template_id": "",
+        "entity_id": "",
         "recipient_numbers": "",
         "sms_enabled": True,
         "alerts": []
@@ -506,13 +509,15 @@ def safe_format_val(val, prec=3):
 
 def write_csv(ip, port, slave_id, reg, value):
     # Safety filter: Skip NaN, inf, or empty strings
+    val_str = str(value).strip().lower()
+    if val_str in ["nan", "none", "null", "", "inf", "-inf"]:
+        return
     try:
         f_val = float(value)
         if math.isnan(f_val) or math.isinf(f_val):
             return
     except (ValueError, TypeError):
-        if str(value).strip().lower() in ["nan", "none", "null", ""]:
-            return
+        return
 
     filename = csv_filename(ip, port, slave_id)
     for attempt in range(3):
@@ -571,7 +576,7 @@ def write_email_log_csv(dev_name, field_name, recipient, status):
         except Exception:
             time.sleep(0.1)
 
-def send_fast2sms(api_key, route, numbers, message_text):
+def send_fast2sms(api_key, route, numbers, message_text, sender_id="", template_id="", entity_id=""):
     if not api_key:
         return False, "API Key is missing"
     if not numbers:
@@ -590,47 +595,82 @@ def send_fast2sms(api_key, route, numbers, message_text):
         "authorization": api_key,
         "Content-Type": "application/json"
     }
-    payload = {
-        "route": route_val,
-        "message": message_text,
-        "language": "english",
-        "flash": 0,
-        "numbers": clean_numbers
-    }
-    
-    try:
-        res = requests.post(url, json=payload, headers=headers, timeout=15)
-        if res.status_code == 200:
-            res_json = res.json()
-            if res_json.get("return") == True or res_json.get("status_code") == 200:
-                msg = res_json.get("message", ["SMS sent successfully"])
-                msg_str = msg[0] if isinstance(msg, list) else str(msg)
-                return True, msg_str
+
+    def execute_api_call(r_val, is_get=False):
+        payload = {
+            "route": r_val,
+            "message": template_id.strip() if (r_val == "dlt" and template_id and template_id.strip()) else message_text,
+            "language": "english",
+            "flash": 0,
+            "numbers": clean_numbers
+        }
+        if r_val == "dlt":
+            if sender_id and sender_id.strip():
+                payload["sender_id"] = sender_id.strip()
+            if entity_id and entity_id.strip():
+                payload["entity_id"] = entity_id.strip()
+            if template_id and template_id.strip() and message_text:
+                payload["variables_values"] = message_text
+
+        try:
+            if is_get:
+                params = dict(payload)
+                params["authorization"] = api_key
+                res = requests.get(url, params=params, timeout=15)
             else:
-                err = res_json.get("message", "Fast2SMS API Error")
-                err_str = ", ".join(err) if isinstance(err, list) else str(err)
-                return False, f"API Error: {err_str}"
-        else:
-            params = {
-                "authorization": api_key,
-                "route": route_val,
-                "message": message_text,
-                "language": "english",
-                "flash": 0,
-                "numbers": clean_numbers
-            }
-            res_get = requests.get(url, params=params, timeout=15)
-            if res_get.status_code == 200:
-                res_json = res_get.json()
-                if res_json.get("return") == True:
-                    return True, "SMS sent successfully"
+                res = requests.post(url, json=payload, headers=headers, timeout=15)
+                
+            if res.status_code == 200:
+                res_json = res.json()
+                if res_json.get("return") == True or res_json.get("status_code") == 200:
+                    msg = res_json.get("message", ["SMS sent successfully"])
+                    msg_str = msg[0] if isinstance(msg, list) else str(msg)
+                    return True, msg_str
                 else:
-                    err = res_json.get("message", "Failed")
+                    err = res_json.get("message", "Fast2SMS Error")
                     err_str = ", ".join(err) if isinstance(err, list) else str(err)
-                    return False, f"API Error: {err_str}"
-            return False, f"HTTP Error {res.status_code}: {res.text}"
-    except Exception as e:
-        return False, f"Connection Exception: {e}"
+                    return False, err_str
+            else:
+                try:
+                    res_json = res.json()
+                    err = res_json.get("message", res.text)
+                    err_str = ", ".join(err) if isinstance(err, list) else str(err)
+                    return False, f"API Error ({res.status_code}): {err_str}"
+                except Exception:
+                    return False, f"HTTP Error {res.status_code}: {res.text}"
+        except Exception as e:
+            return False, f"Connection Exception: {e}"
+
+    # 1. Try requested route with POST
+    ok, msg = execute_api_call(route_val, is_get=False)
+    if ok:
+        return True, msg
+
+    # 2. Try requested route with GET
+    ok_get, msg_get = execute_api_call(route_val, is_get=True)
+    if ok_get:
+        return True, msg_get
+
+    # 3. If requested route was 'dlt' and failed (e.g. Invalid Sender ID / Message ID),
+    #    try automatic fallback to Quick SMS ('q') via POST and GET
+    if route_val == "dlt":
+        ok_q_post, msg_q_post = execute_api_call("q", is_get=False)
+        if ok_q_post:
+            return True, "SMS sent successfully via Quick SMS route (Fallback from DLT)."
+            
+        ok_q_get, msg_q_get = execute_api_call("q", is_get=True)
+        if ok_q_get:
+            return True, "SMS sent successfully via Quick SMS route (Fallback from DLT)."
+
+    # If all attempts failed, present clean actionable instructions to user
+    combined_err = f"{msg} | {msg_get}"
+    if "Sender ID" in combined_err or "406" in combined_err:
+        return False, "Invalid Sender ID.\n\nAction Required:\n1. Change FAST2SMS ROUTE to 'q (Quick SMS)' in the dropdown.\n2. Click 'SAVE SMS SETTINGS'.\n3. Click 'TEST FAST2SMS ALERT' again."
+
+    if "Message ID" in combined_err or "Template" in combined_err:
+        return False, "Invalid DLT Template / Message ID.\n\nAction Required:\n1. Change FAST2SMS ROUTE to 'q (Quick SMS)' in the dropdown.\n2. Click 'SAVE SMS SETTINGS'.\n3. Click 'TEST FAST2SMS ALERT' again."
+
+    return False, msg
 
 def write_sms_log_csv(dev_name, field_name, recipient, status, message_text=""):
     date_str = datetime.now().strftime("%Y-%m-%d")
@@ -1698,6 +1738,7 @@ class ModbusApp:
         self.root.option_add("*TCombobox*Listbox.font", self.FONTS["body"])
         self.root.option_add("*TCombobox*Listbox.relief", "flat")
         self.root.option_add("*TCombobox*Listbox.borderwidth", "0")
+        self.root.option_add("*TCombobox*Listbox.width", "25")
 
     def navigate(self, view_name):
         self.active_view = view_name
@@ -2407,8 +2448,18 @@ class ModbusApp:
                                 ts = datetime.fromtimestamp(rounded_ts).strftime("%Y-%m-%d %H:%M:%S")
                             
                             if r_addr in target_regs:
-                                if ts not in pivoted: pivoted[ts] = {}
-                                pivoted[ts][r_addr] = val
+                                is_lora = ("LORA" in str(dev.get('node_type', '')).upper()) or ("LORA" in str(dev.get('device_name', '')).upper())
+                                val_str = str(val).strip()
+                                is_v = True
+                                try:
+                                    fv = float(val_str)
+                                    if math.isnan(fv) or math.isinf(fv): is_v = False
+                                    elif is_lora and fv <= 0: is_v = False
+                                except Exception:
+                                    if val_str.lower() in ["nan", "none", "null", ""]: is_v = False
+                                if is_v:
+                                    if ts not in pivoted: pivoted[ts] = {}
+                                    pivoted[ts][r_addr] = val
                     except: continue
                 
                 # Get active email rules for the selected device
@@ -2420,19 +2471,7 @@ class ModbusApp:
                         active_alerts.append(alert)
 
                 for ts in sorted(pivoted.keys(), reverse=True):
-                    # Check if all values in this row are zero
-                    all_zero = True
-                    row_vals_only = []
-                    for r_addr in target_regs:
-                        v = pivoted[ts].get(r_addr, "---")
-                        row_vals_only.append(v)
-                        if v != "---":
-                            try:
-                                if float(v) != 0: all_zero = False
-                            except: pass
-                    
-                    if all_zero and any(v != "---" for v in row_vals_only):
-                        continue
+                    row_vals_only = [pivoted[ts].get(r_addr, "---") for r_addr in target_regs]
 
                     if curr_y < 60:
                         c.showPage(); curr_y = h - 60
@@ -2479,15 +2518,19 @@ class ModbusApp:
                     for i, r_addr in enumerate(target_regs):
                         v = pivoted[ts].get(r_addr, "---")
                         if v != "---":
-                            try:
-                                if dev.get('types', {}).get(str(r_addr)) == "BOOLEAN":
-                                    label_0 = dev.get('ops', {}).get(str(r_addr), "OFF")
-                                    label_1 = dev.get('factors', {}).get(str(r_addr), "ON")
-                                    v = label_0 if int(float(v)) == 0 else label_1
-                                else:
-                                    prec = int(dev.get('decimals', {}).get(str(r_addr), 3))
-                                    v = f"{float(v):.{prec}f}"
-                            except: pass
+                            if str(v).strip().lower() in ["nan", "none", "null", "", "inf", "-inf"]:
+                                v = "---"
+                            else:
+                                try:
+                                    if dev.get('types', {}).get(str(r_addr)) == "BOOLEAN":
+                                        label_0 = dev.get('ops', {}).get(str(r_addr), "OFF")
+                                        label_1 = dev.get('factors', {}).get(str(r_addr), "ON")
+                                        v = label_0 if int(float(v)) == 0 else label_1
+                                    else:
+                                        prec = int(dev.get('decimals', {}).get(str(r_addr), 3))
+                                        fv = float(v)
+                                        v = "---" if (math.isnan(fv) or math.isinf(fv)) else f"{fv:.{prec}f}"
+                                except: pass
                         c.drawString(180 + (i*col_spacing), curr_y, v)
                     curr_y -= 15
                     rows_found += 1
@@ -3474,21 +3517,13 @@ class ModbusApp:
 
         # Unit Selection
         f_unit = tk.Frame(map_row1, bg=self.COLORS["bg_surface"])
-        f_unit.pack(side="left", fill="x", padx=2)
+        f_unit.pack(side="left", fill="x", padx=(2, 0))
         tk.Label(f_unit, text="UNIT", font=("Segoe UI", 8, "bold"), fg=self.COLORS["text_dim"], bg=self.COLORS["bg_surface"]).pack(anchor="w")
         self.entry_reg_unit = ttk.Combobox(f_unit, values=self.COMMON_UNITS, style="TCombobox", width=6, font=self.FONTS["body"])
         self.entry_reg_unit.pack(fill="x", pady=(2, 0))
         tk.Frame(f_unit, bg=self.COLORS["bg_highlight"], height=1).pack(fill="x")
 
-        # Type Selection
-        f_type = tk.Frame(map_row1, bg=self.COLORS["bg_surface"])
-        f_type.pack(side="left", fill="x", padx=(2, 0))
-        tk.Label(f_type, text="TYPE", font=("Segoe UI", 8, "bold"), fg=self.COLORS["text_dim"], bg=self.COLORS["bg_surface"]).pack(anchor="w")
-        self.entry_reg_type = ttk.Combobox(f_type, values=self.DATA_TYPES, style="TCombobox", width=11, font=self.FONTS["body"])
-        self.entry_reg_type.set("FLOAT32")
-        self.entry_reg_type.pack(fill="x", pady=(2, 0))
-        tk.Frame(f_type, bg=self.COLORS["bg_highlight"], height=1).pack(fill="x")
-
+        # Row 2: Mode & Type Selection
         map_row2 = tk.Frame(left, bg=self.COLORS["bg_surface"])
         map_row2.pack(fill="x", pady=4)
 
@@ -3501,9 +3536,29 @@ class ModbusApp:
         self.entry_reg_mode.pack(fill="x", pady=(2, 0))
         tk.Frame(f_mode, bg=self.COLORS["bg_highlight"], height=1).pack(fill="x")
 
+        # Type Selection
+        f_type = tk.Frame(map_row2, bg=self.COLORS["bg_surface"])
+        f_type.pack(side="left", fill="x", expand=True, padx=(2, 0))
+        tk.Label(f_type, text="TYPE", font=("Segoe UI", 8, "bold"), fg=self.COLORS["text_dim"], bg=self.COLORS["bg_surface"]).pack(anchor="w")
+
+        def _fix_type_popdown():
+            try:
+                popdown = self.entry_reg_type.tk.call('ttk::combobox::PopdownWindow', self.entry_reg_type)
+                self.root.tk.call(f"{popdown}.f.l", 'configure', '-width', 25)
+            except: pass
+
+        self.entry_reg_type = ttk.Combobox(f_type, values=self.DATA_TYPES, style="TCombobox", width=24, font=self.FONTS["body"], postcommand=_fix_type_popdown)
+        self.entry_reg_type.set("FLOAT32")
+        self.entry_reg_type.pack(fill="x", pady=(2, 0))
+        tk.Frame(f_type, bg=self.COLORS["bg_highlight"], height=1).pack(fill="x")
+
+        # Row 3: Math & Decimals Section
+        map_row3 = tk.Frame(left, bg=self.COLORS["bg_surface"])
+        map_row3.pack(fill="x", pady=4)
+
         # Math Section
-        f_math = tk.Frame(map_row2, bg=self.COLORS["bg_surface"])
-        f_math.pack(side="left", fill="x", expand=True, padx=2)
+        f_math = tk.Frame(map_row3, bg=self.COLORS["bg_surface"])
+        f_math.pack(side="left", fill="x", expand=True, padx=(0, 4))
         tk.Label(f_math, text="MATH (OP/FACTOR)", font=("Segoe UI", 8, "bold"), fg=self.COLORS["text_dim"], bg=self.COLORS["bg_surface"]).pack(anchor="w")
         
         f_math_inner = tk.Frame(f_math, bg=self.COLORS["bg_surface"])
@@ -3519,14 +3574,14 @@ class ModbusApp:
         tk.Frame(f_math, bg=self.COLORS["bg_highlight"], height=1).pack(fill="x")
 
         # Decimal Point (Precision)
-        f_prec = tk.Frame(map_row2, bg=self.COLORS["bg_surface"])
+        f_prec = tk.Frame(map_row3, bg=self.COLORS["bg_surface"])
         f_prec.pack(side="left", fill="x", padx=(2, 0))
         tk.Label(f_prec, text="DECIMALS", font=("Segoe UI", 8, "bold"), fg=self.COLORS["text_dim"], bg=self.COLORS["bg_surface"]).pack(anchor="w")
         self.entry_reg_prec = ttk.Combobox(f_prec, values=["0", "1", "2", "3", "4"], style="TCombobox", width=5, font=self.FONTS["body"])
         self.entry_reg_prec.set("3")
         self.entry_reg_prec.pack(fill="x", pady=(2, 0))
         tk.Frame(f_prec, bg=self.COLORS["bg_highlight"], height=1).pack(fill="x")
-        self.map_frame = map_row2
+        self.map_frame = map_row3
 
         # Boolean Value Names (Only visible when BOOLEAN type is selected)
         self.f_bool_labels = tk.Frame(left, bg=self.COLORS["bg_surface"])
@@ -4528,6 +4583,9 @@ class ModbusApp:
         try:
             api_key = s.get('api_key', '').strip()
             route = s.get('route', 'q').strip()
+            sender_id = s.get('sender_id', '').strip()
+            template_id = s.get('template_id', '').strip()
+            entity_id = s.get('entity_id', '').strip()
             numbers = s.get('recipient_numbers', '').strip()
             
             if not api_key or not numbers:
@@ -4538,7 +4596,7 @@ class ModbusApp:
             tpl = alert.get('template', "Alert: {name} reached {value} at {time}")
             msg_text = tpl.replace("{name}", full_name).replace("{value}", formatted_val).replace("{time}", ts_str).replace("{ip}", alert.get('device_ip', '0.0.0.0'))
 
-            success, response_msg = send_fast2sms(api_key, route, numbers, msg_text)
+            success, response_msg = send_fast2sms(api_key, route, numbers, msg_text, sender_id=sender_id, template_id=template_id, entity_id=entity_id)
             status_str = "SUCCESS" if success else f"FAILED ({response_msg})"
             
             write_sms_log_csv(dev_alias, only_reg_name, numbers, status_str, msg_text)
@@ -4590,6 +4648,15 @@ class ModbusApp:
             self.sms_route_cb.set("q (Quick SMS)")
         self.sms_route_cb.pack(fill="x", pady=(2, 0))
 
+        # Sender ID entry (Optional/DLT Header)
+        self.sms_sender_id, _ = fld("FAST2SMS SENDER ID (DLT Header, e.g. FSTSMS)", initial=s.get('sender_id', ''))
+
+        # DLT Template ID entry
+        self.sms_template_id, _ = fld("DLT TEMPLATE ID (Message ID - Required for DLT Route)", initial=s.get('template_id', ''))
+
+        # DLT Entity ID entry
+        self.sms_entity_id, _ = fld("DLT ENTITY ID (Optional)", initial=s.get('entity_id', ''))
+
         # Recipient Numbers
         self.sms_recipients, _ = fld("RECIPIENT MOBILE NUMBERS (Comma Separated)", initial=s.get('recipient_numbers', ''))
 
@@ -4608,7 +4675,7 @@ class ModbusApp:
         tk.Button(left, text="📜 VIEW SMS SEND LOGS", bg="#0288D1", fg="white", font=self.FONTS["button"], 
                   relief="flat", padx=20, pady=8, command=self.show_sms_logs_history).pack(fill="x", pady=4)
 
-        info_text = "Note: Fast2SMS requires a valid API Key from fast2sms.com.\nMultiple numbers should be separated by commas (e.g. 9876543210, 9123456789)."
+        info_text = "Note: Fast2SMS requires a valid API Key from fast2sms.com.\nIf you do not have a registered DLT Sender ID & Template ID, please select 'q (Quick SMS)' route.\nMultiple numbers should be separated by commas (e.g. 9876543210, 9123456789)."
         info_lbl = tk.Label(left, text=info_text, 
                            font=("Segoe UI", 8, "italic"), fg=self.COLORS["warning"], bg=self.COLORS["bg_surface"], justify="left")
         info_lbl.pack(fill="x", pady=15)
@@ -4736,6 +4803,9 @@ class ModbusApp:
         route_val = self.sms_route_cb.get().split()[0].strip()
         self.sms_settings['api_key'] = self.sms_api_key.get().strip()
         self.sms_settings['route'] = route_val
+        self.sms_settings['sender_id'] = self.sms_sender_id.get().strip()
+        self.sms_settings['template_id'] = self.sms_template_id.get().strip()
+        self.sms_settings['entity_id'] = self.sms_entity_id.get().strip()
         self.sms_settings['recipient_numbers'] = self.sms_recipients.get().strip()
         self.sms_settings['sms_enabled'] = self.sms_enabled_var.get()
 
@@ -4747,6 +4817,9 @@ class ModbusApp:
     def test_sms_config(self):
         api_key = self.sms_api_key.get().strip()
         route = self.sms_route_cb.get().split()[0].strip()
+        sender_id = self.sms_sender_id.get().strip()
+        template_id = self.sms_template_id.get().strip()
+        entity_id = self.sms_entity_id.get().strip()
         numbers = self.sms_recipients.get().strip()
         
         if not api_key:
@@ -4759,7 +4832,7 @@ class ModbusApp:
         test_msg = f"TempTrek Test SMS Alert at {datetime.now().strftime('%H:%M:%S')}"
         
         def run_test():
-            success, result_msg = send_fast2sms(api_key, route, numbers, test_msg)
+            success, result_msg = send_fast2sms(api_key, route, numbers, test_msg, sender_id=sender_id, template_id=template_id, entity_id=entity_id)
             if success:
                 self.root.after(0, lambda: messagebox.showinfo("Test SMS Success", f"Fast2SMS Response:\n{result_msg}"))
             else:
@@ -4784,11 +4857,7 @@ class ModbusApp:
             messagebox.showerror("Error", "Please select a register.")
             return
             
-        try:
-            reg = int(reg_raw.split()[0])
-        except:
-            messagebox.showerror("Error", "Invalid register format.")
-            return
+        reg = reg_raw.split(" ")[0]
             
         cond = self.rule_sms_cond.get()
         cond_symbol = ">"
@@ -5408,8 +5477,18 @@ class ModbusApp:
                                 if from_dt <= row_dt <= to_dt:
                                     r_addr, val = str(row[4]), str(row[5])
                                     if r_addr in registers:
-                                        if ts_str not in pivoted: pivoted[ts_str] = {}
-                                        pivoted[ts_str][r_addr] = val
+                                        is_lora = ("LORA" in str(dev.get('node_type', '')).upper()) or ("LORA" in str(dev.get('device_name', '')).upper())
+                                        val_str = str(val).strip()
+                                        is_v = True
+                                        try:
+                                            fv = float(val_str)
+                                            if math.isnan(fv) or math.isinf(fv): is_v = False
+                                            elif is_lora and fv <= 0: is_v = False
+                                        except Exception:
+                                            if val_str.lower() in ["nan", "none", "null", ""]: is_v = False
+                                        if is_v:
+                                            if ts_str not in pivoted: pivoted[ts_str] = {}
+                                            pivoted[ts_str][r_addr] = val
                             except: pass
 
                         # Build series data for Graph Preview
@@ -5552,15 +5631,19 @@ class ModbusApp:
                             for i, r_addr in enumerate(registers):
                                 v = pivoted[ts].get(r_addr, "---")
                                 if v != "---":
-                                    try:
-                                        if dev.get('types', {}).get(str(r_addr)) == "BOOLEAN":
-                                            label_0 = dev.get('ops', {}).get(str(r_addr), "OFF")
-                                            label_1 = dev.get('factors', {}).get(str(r_addr), "ON")
-                                            v = label_0 if int(float(v)) == 0 else label_1
-                                        else:
-                                            prec = int(dev.get('decimals', {}).get(str(r_addr), 3))
-                                            v = f"{float(v):.{prec}f}"
-                                    except: pass
+                                    if str(v).strip().lower() in ["nan", "none", "null", "", "inf", "-inf"]:
+                                        v = "---"
+                                    else:
+                                        try:
+                                            if dev.get('types', {}).get(str(r_addr)) == "BOOLEAN":
+                                                label_0 = dev.get('ops', {}).get(str(r_addr), "OFF")
+                                                label_1 = dev.get('factors', {}).get(str(r_addr), "ON")
+                                                v = label_0 if int(float(v)) == 0 else label_1
+                                            else:
+                                                prec = int(dev.get('decimals', {}).get(str(r_addr), 3))
+                                                fv = float(v)
+                                                v = "---" if (math.isnan(fv) or math.isinf(fv)) else f"{fv:.{prec}f}"
+                                        except: pass
                                 c.drawString(180 + (i*col_spacing), curr_y, v)
 
                             curr_y -= 15
@@ -6609,21 +6692,37 @@ class ModbusApp:
                                         ts = datetime.fromtimestamp(rounded_ts).strftime("%Y-%m-%d %H:%M:%S")
                                     
                                     reg_addr = str(row[4])
+                                    is_lora = ("LORA" in str(dev.get('node_type', '')).upper()) or ("LORA" in str(dev.get('device_name', '')).upper())
+                                    val_str = str(row[5]).strip()
+                                    is_valid = True
+                                    try:
+                                        f_val = float(val_str)
+                                        if math.isnan(f_val) or math.isinf(f_val):
+                                            is_valid = False
+                                        elif is_lora and f_val <= 0:
+                                            is_valid = False
+                                    except Exception:
+                                        if val_str.lower() in ["nan", "none", "null", ""]:
+                                            is_valid = False
+
+                                    if not is_valid:
+                                        continue
+
                                     reg_name = dev_names.get(reg_addr, f"Reg {reg_addr}")
                                     if ts not in pivoted_data: pivoted_data[ts] = {}
                                     if dev.get('types', {}).get(reg_addr) == "BOOLEAN":
                                         label_0 = dev.get('ops', {}).get(reg_addr, "OFF")
                                         label_1 = dev.get('factors', {}).get(reg_addr, "ON")
                                         try:
-                                            pivoted_data[ts][reg_name] = label_0 if int(float(row[5])) == 0 else label_1
+                                            pivoted_data[ts][reg_name] = label_0 if int(float(val_str)) == 0 else label_1
                                         except:
-                                            pivoted_data[ts][reg_name] = row[5]
+                                            pivoted_data[ts][reg_name] = val_str
                                     else:
                                         try:
                                             prec = int(dev_decimals.get(reg_addr, 3))
-                                            pivoted_data[ts][reg_name] = f"{float(row[5]):.{prec}f}"
+                                            pivoted_data[ts][reg_name] = f"{float(val_str):.{prec}f}"
                                         except:
-                                            pivoted_data[ts][reg_name] = row[5]
+                                            pivoted_data[ts][reg_name] = val_str
                             except: continue
 
                 if not pivoted_data:
@@ -6871,8 +6970,25 @@ class ModbusApp:
         page_size = landscape((595.2756, 841.8898))  # A4 landscape
         c = canvas.Canvas(target_file, pagesize=page_size)
         w, h = page_size
+        # Purge timestamps where all requested channels are missing / "-" / empty / invalid
+        valid_ts = []
+        for ts in sorted(pivoted_data.keys()):
+            channel_vals = [pivoted_data[ts].get(name, "-") for name in reg_names_only]
+            has_valid = False
+            for v in channel_vals:
+                v_str = str(v).strip().lower()
+                if v_str not in ["-", "", "nan", "none", "null", "inf", "-inf"]:
+                    has_valid = True
+                    break
+            if has_valid:
+                valid_ts.append(ts)
+
+        sorted_ts = valid_ts
+        if not sorted_ts:
+            messagebox.showwarning("No Data", "No valid records found for the range.")
+            return
+
         rows_per_page = 14
-        sorted_ts = sorted(pivoted_data.keys())
         data_pages = max(1, (len(sorted_ts) + rows_per_page - 1) // rows_per_page)
         total_pages = 1 + data_pages
         printed_at = datetime.now()
@@ -7054,8 +7170,14 @@ class ModbusApp:
 
             vals = []
             for ts in sorted_ts:
-                try: vals.append(float(pivoted_data[ts].get(name)))
-                except (TypeError, ValueError): pass
+                raw_v = pivoted_data[ts].get(name)
+                if raw_v is not None and raw_v != "-":
+                    try:
+                        fv = float(raw_v)
+                        if not (math.isnan(fv) or math.isinf(fv)):
+                            vals.append(fv)
+                    except (TypeError, ValueError):
+                        pass
 
             minimum = f"{min(vals):.2f}" if vals else "-"
             maximum = f"{max(vals):.2f}" if vals else "-"
@@ -7082,18 +7204,19 @@ class ModbusApp:
                 chan_info["code"] = f"T{len(mkt_channels)+1}"
                 mkt_channels.append(chan_info)
 
-        left_x = [25, 171, 221, 281, 346]
-        left_w = [146, 50, 60, 65, 65]
-        right_x = [431, 577, 627, 687, 752]
-        right_w = [146, 50, 60, 65, 65]
-        table_headers = ["Channel Name", "CH", "Minimum", "Maximum", "Average"]
+        left_x = [25, 171, 231, 291, 351]
+        left_w = [146, 60, 60, 60, 60]
+        right_x = [431, 577, 637, 697, 757]
+        right_w = [146, 60, 60, 60, 60]
+        left_headers = ["Channel Name", "Minimum", "Maximum", "Average", "MKT"]
+        right_headers = ["Channel Name", "Minimum", "Maximum", "Average", "MKRH"]
 
         # Draw Headers
-        for x, cw, label in zip(left_x, left_w, table_headers):
+        for x, cw, label in zip(left_x, left_w, left_headers):
             box(x, y - 16, cw, 16, (0.83, 0.83, 0.83))
             text(x + 3, y - 11, label, True, 8)
 
-        for x, cw, label in zip(right_x, right_w, table_headers):
+        for x, cw, label in zip(right_x, right_w, right_headers):
             box(x, y - 16, cw, 16, (0.83, 0.83, 0.83))
             text(x + 3, y - 11, label, True, 8)
 
@@ -7104,7 +7227,7 @@ class ModbusApp:
             # Left Table Row (MKT / Temperature)
             if r < len(mkt_channels):
                 ch = mkt_channels[r]
-                l_vals = [ch["name"], ch["code"], ch["min"], ch["max"], ch["avg"]]
+                l_vals = [ch["name"], ch["min"], ch["max"], ch["avg"], _calc_mkt(ch["vals"])]
             else:
                 l_vals = ["-", "-", "-", "-", "-"]
 
@@ -7115,7 +7238,7 @@ class ModbusApp:
             # Right Table Row (MKRH / Humidity)
             if r < len(mkrh_channels):
                 ch = mkrh_channels[r]
-                r_vals = [ch["name"], ch["code"], ch["min"], ch["max"], ch["avg"]]
+                r_vals = [ch["name"], ch["min"], ch["max"], ch["avg"], _calc_mkrh(ch["vals"])]
             else:
                 r_vals = ["-", "-", "-", "-", "-"]
 
@@ -7126,22 +7249,6 @@ class ModbusApp:
             y -= 15
             if y < 80:
                 break
-
-        # Overall MKT / MKRH summary boxes
-        all_mkt_vals = []
-        for ch in mkt_channels: all_mkt_vals.extend(ch["vals"])
-        overall_mkt = _calc_mkt(all_mkt_vals) if all_mkt_vals else "-"
-
-        all_mkrh_vals = []
-        for ch in mkrh_channels: all_mkrh_vals.extend(ch["vals"])
-        overall_mkrh = _calc_mkrh(all_mkrh_vals) if all_mkrh_vals else "-"
-
-        y -= 6
-        box(25, y - 15, 386, 15, (0.92, 0.94, 0.98))
-        text(30, y - 10, f"MKT: {overall_mkt} °C", True, 8)
-
-        box(431, y - 15, 386, 15, (0.92, 0.94, 0.98))
-        text(436, y - 10, f"MKRH: {overall_mkrh} %", True, 8)
 
         c.showPage()
 
@@ -7165,11 +7272,25 @@ class ModbusApp:
             for row_offset, ts in enumerate(batch):
                 try: dt = datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
                 except ValueError: dt = None
+                row_cell_values = []
+                for name in reg_names_only:
+                    v = pivoted_data[ts].get(name, "-")
+                    if str(v).strip().lower() in ["nan", "none", "null", "", "inf", "-inf"]:
+                        v = "-"
+                    else:
+                        try:
+                            fv = float(v)
+                            if math.isnan(fv) or math.isinf(fv):
+                                v = "-"
+                        except (ValueError, TypeError):
+                            pass
+                    row_cell_values.append(v)
+
                 values = [
                     str(page_idx * rows_per_page + row_offset + 1),
                     dt.strftime("%d/%m/%Y") if dt else ts[:10],
                     dt.strftime("%H:%M:%S") if dt else ts[11:19],
-                ] + [pivoted_data[ts].get(name, "-") for name in reg_names_only]
+                ] + row_cell_values
                 x = 25
                 for cw, value in zip(widths, values):
                     box(x, y - 21, cw, 21)

@@ -12,7 +12,7 @@ python -m pip install pyinstaller Pillow reportlab requests pymodbus >nul
 
 rem Run PyInstaller
 echo [2/3] Generating Executable (this may take a minute)...
-python -m PyInstaller --noconfirm --onefile --windowed --icon "icon.ico" --add-data "icon.ico;." --add-data "icon.png;." --hidden-import=reportlab --name "TempTrek Environmental Monitoring System" 2.py
+python -m PyInstaller --noconfirm --onefile --windowed --icon "icon.ico" --add-data "icon.ico;." --add-data "icon.png;." --add-data "temptrek_logo.png;." --hidden-import=reportlab --name "TempTrek Environmental Monitoring System" 2.py
 
 if %errorlevel% neq 0 (
     echo [ERROR] Build failed during PyInstaller phase.
