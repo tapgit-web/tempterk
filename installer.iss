@@ -2,7 +2,7 @@
 [Setup]
 AppId={{D3B2C1A4-5F8A-4B2E-9C7D-8E1A2B3C4D5D}
 AppName=TempTrek Environmental Monitoring System
-AppVersion=2.5
+AppVersion=2.5.2
 AppPublisher=The Automation People
 DefaultDirName={autopf}\TempTrek Environmental Monitoring System
 DefaultGroupName=TempTrek Environmental Monitoring System
@@ -24,9 +24,8 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 Source: "dist\TempTrek Environmental Monitoring System.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "icon.ico"; DestDir: "{app}"; Flags: ignoreversion
 Source: "icon.png"; DestDir: "{app}"; Flags: ignoreversion
-Source: "export_bundle\config\*"; DestDir: "{userappdata}\TempTrek\config"; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist
-Source: "export_bundle\live\*"; DestDir: "{userappdata}\TempTrek\live"; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist
-Source: "export_bundle\reports\*"; DestDir: "{userappdata}\TempTrek\reports"; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist
+; User databases, credentials and records must never be distributed in installers.
+; Transfer installation data using an encrypted backup and authorized restoration.
 
 [Icons]
 Name: "{group}\TempTrek Environmental Monitoring System"; Filename: "{app}\TempTrek Environmental Monitoring System.exe"; IconFilename: "{app}\icon.ico"

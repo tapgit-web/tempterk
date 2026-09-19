@@ -44,6 +44,24 @@ import hashlib
 import uuid
 import requests
 import subprocess
+import platform
+import stat
+import tempfile
+import zipfile
+import getpass
+import io
+from backup_engine import BackupMixin
+import queue
+from pathlib import Path
+from storage_security import (
+    STORAGE_LOCK, STORAGE_FROZEN, STORAGE_ERRORS, storage_operation,
+    DPAPI_PREFIX, BACKUP_MAGIC, protect_text, unprotect_text, atomic_write,
+    hash_password, verify_password, encrypt_backup, decrypt_backup,
+    require_windows_admin, secure_backup_root, protect_admin_path, connect_smtp,
+    replace_folders, recover_restore, commit_restore,
+    recover_legacy_company_details,
+    recover_legacy_config,
+)
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.mime.application import MIMEApplication
@@ -83,14 +101,13 @@ def get_hwid():
         return hashlib.sha256(str(mac).encode()).hexdigest()[:16].upper()
 
 def obfuscate_data(data_str):
-    """Encodes string data with XOR obfuscation and Base64."""
-    key = get_hwid()
-    # Simple XOR byte-wise obfuscation
-    xor_data = "".join(chr(ord(c) ^ ord(key[i % len(key)])) for i, c in enumerate(data_str))
-    return base64.b64encode(xor_data.encode()).decode()
+    """Protect new settings with Windows user-bound encryption."""
+    return protect_text(data_str)
 
 def deobfuscate_data(encoded_str):
     """Decodes data encoded by obfuscate_data. Tries both stable and legacy keys."""
+    if encoded_str.startswith(DPAPI_PREFIX):
+        return unprotect_text(encoded_str)
     try:
         raw_data = base64.b64decode(encoded_str).decode()
         
@@ -163,10 +180,19 @@ else:
     # When running as script, keep it local for development
     DATA_PATH = os.path.dirname(os.path.abspath(__file__))
 
+# Recover an interrupted restore before reading configuration. Surface recovery
+# failure through the GUI instead of continuing with a partially restored state.
+STARTUP_STORAGE_ERROR = None
+try:
+    recover_restore(DATA_PATH)
+except Exception as exc:
+    STARTUP_STORAGE_ERROR = exc
+
 # Ensure directories exist
 os.makedirs(os.path.join(DATA_PATH, "config"), exist_ok=True)
 os.makedirs(os.path.join(DATA_PATH, "live"), exist_ok=True)
 os.makedirs(os.path.join(DATA_PATH, "reports"), exist_ok=True)
+os.makedirs(os.path.join(DATA_PATH, "backups"), exist_ok=True)
 
 CONFIG_FILE = os.path.join(DATA_PATH, "config", "devices.json")
 EMAIL_CONFIG_FILE = os.path.join(DATA_PATH, "config", "email_settings.json")
@@ -175,57 +201,26 @@ USERS_FILE = os.path.join(DATA_PATH, "config", "users.json")
 TREND_CONFIG_FILE = os.path.join(DATA_PATH, "config", "trend_settings.json")
 APPROVALS_FILE = os.path.join(DATA_PATH, "config", "approvals.json")
 COMPANY_CONFIG_FILE = os.path.join(DATA_PATH, "config", "company_details.json")
+VIEWED_FILE = os.path.join(DATA_PATH, "config", "viewed_records.json")
+BACKUP_SETTINGS_FILE = os.path.join(DATA_PATH, "config", "backup_settings.json")
+BACKUP_HISTORY_FILE = os.path.join(DATA_PATH, "config", "backup_history.json")
+
+# Explicit, validated application limits. These values keep generated reports
+# readable and prevent a single operation from exhausting the workstation.
+MAX_PDF_REGISTERS = 8
+MAX_PDF_RECORDS = 50000
+MAX_EMAIL_RECIPIENTS = 50
+AUDIT_WRITE_LOCK = threading.Lock()
 
 def migrate_config_files():
-    """Scan config folder and obfuscate any plain-text JSON files."""
-    files = [CONFIG_FILE, EMAIL_CONFIG_FILE, SMS_CONFIG_FILE, USERS_FILE, TREND_CONFIG_FILE, APPROVALS_FILE, COMPANY_CONFIG_FILE]
-    for filepath in files:
-        if os.path.exists(filepath):
-            try:
-                with open(filepath, "r") as f:
-                    content = f.read().strip()
-                if not content: continue
-                
-                # Check if already obfuscated
-                if deobfuscate_data(content) is None:
-                    # Likely plain text JSON, try parsing to confirm
-                    try:
-                        data = json.loads(content)
-                        # Re-save as obfuscated
-                        with open(filepath, "w") as f:
-                            f.write(obfuscate_data(json.dumps(data, indent=4)))
-                    except json.JSONDecodeError:
-                        pass # Not JSON, skip
-            except:
-                pass
-
-# Run migration on startup
-migrate_config_files()
-
-# -------------------------
-# JSON STORAGE
-# -------------------------
+    """Migration happens only after every configuration has loaded successfully."""
+    return
 
 def load_devices():
-    if not os.path.exists(CONFIG_FILE):
-        return []
-    try:
-        with open(CONFIG_FILE, "r") as f:
-            content = f.read().strip()
-            # Try deobfuscating first
-            decoded = deobfuscate_data(content)
-            if decoded:
-                return json.loads(decoded)
-            else:
-                # If not obfuscated, assume plain JSON and return
-                return json.loads(content)
-    except:
-        return []
+    return load_secure_json(CONFIG_FILE, [])
 
 def save_devices(devices):
-    with open(CONFIG_FILE, "w") as f:
-        data_str = json.dumps(devices, indent=4)
-        f.write(obfuscate_data(data_str))
+    save_secure_json(CONFIG_FILE, devices)
 
 def load_email_settings():
     default_settings = {
@@ -243,29 +238,12 @@ def load_email_settings():
         "email_enabled": True,
         "alerts": []
     }
-    if not os.path.exists(EMAIL_CONFIG_FILE):
-        return default_settings
-            
-    try:
-        with open(EMAIL_CONFIG_FILE, "r") as f:
-            content = f.read().strip()
-            decoded = deobfuscate_data(content)
-            if decoded:
-                data = json.loads(decoded)
-                # Ensure new keys exist in loaded data
-                for k, v in default_settings.items():
-                    if k not in data:
-                        data[k] = v
-                return data
-            else:
-                return json.loads(content)
-    except:
-        return default_settings
+    loaded = load_secure_json(EMAIL_CONFIG_FILE, {})
+    default_settings.update(loaded)
+    return default_settings
 
 def save_email_settings(settings):
-    with open(EMAIL_CONFIG_FILE, "w") as f:
-        data_str = json.dumps(settings, indent=4)
-        f.write(obfuscate_data(data_str))
+    save_secure_json(EMAIL_CONFIG_FILE, settings)
 
 def load_sms_settings():
     default_settings = {
@@ -278,46 +256,131 @@ def load_sms_settings():
         "sms_enabled": True,
         "alerts": []
     }
-    if not os.path.exists(SMS_CONFIG_FILE):
-        return default_settings
-            
-    try:
-        with open(SMS_CONFIG_FILE, "r") as f:
-            content = f.read().strip()
-            decoded = deobfuscate_data(content)
-            if decoded:
-                data = json.loads(decoded)
-                for k, v in default_settings.items():
-                    if k not in data:
-                        data[k] = v
-                return data
-            else:
-                return json.loads(content)
-    except:
-        return default_settings
+    loaded = load_secure_json(SMS_CONFIG_FILE, {})
+    default_settings.update(loaded)
+    return default_settings
 
 def save_sms_settings(settings):
-    with open(SMS_CONFIG_FILE, "w") as f:
-        data_str = json.dumps(settings, indent=4)
-        f.write(obfuscate_data(data_str))
+    save_secure_json(SMS_CONFIG_FILE, settings)
 
 def load_approvals():
-    if not os.path.exists(APPROVALS_FILE):
-        return {}
-    try:
-        with open(APPROVALS_FILE, "r") as f:
-            content = f.read().strip()
-            decoded = deobfuscate_data(content)
-            if decoded:
-                return json.loads(decoded)
-            return json.loads(content)
-    except:
-        return {}
+    return load_secure_json(APPROVALS_FILE, {})
 
 def save_approvals(approvals_data):
-    with open(APPROVALS_FILE, "w") as f:
-        data_str = json.dumps(approvals_data, indent=4)
-        f.write(obfuscate_data(data_str))
+    save_secure_json(APPROVALS_FILE, approvals_data)
+
+def load_secure_json(filepath, default_value):
+    if not os.path.exists(filepath):
+        return default_value.copy() if isinstance(default_value, dict) else list(default_value)
+    content = ""
+    try:
+        with open(filepath, "r", encoding="utf-8") as stream:
+            content = stream.read().strip()
+        decoded = deobfuscate_data(content)
+        value = json.loads(decoded if decoded is not None else content)
+        if not isinstance(value, type(default_value)):
+            raise ValueError("Unexpected configuration type")
+        return value
+    except Exception as exc:
+        # Some shipped settings use the same old machine key as the company
+        # header. Recover exact JSON, never defaults, and retain the source.
+        if not content.startswith(DPAPI_PREFIX):
+            for reference_path in (COMPANY_CONFIG_FILE + ".legacy-original", COMPANY_CONFIG_FILE):
+                try:
+                    reference = Path(reference_path).read_text(encoding="utf-8")
+                    value = recover_legacy_config(content, reference)
+                    if not isinstance(value, type(default_value)):
+                        continue
+                    original_path = filepath + ".legacy-original"
+                    if not os.path.exists(original_path):
+                        atomic_write(original_path, Path(filepath).read_bytes())
+                    return value
+                except (ValueError, OSError, UnicodeError):
+                    continue
+        raise RuntimeError(f"Cannot read {os.path.basename(filepath)}. Original file preserved; restore a valid backup. {exc}") from exc
+
+def save_secure_json(filepath, value):
+    atomic_write(filepath, obfuscate_data(json.dumps(value, indent=4)))
+
+def load_viewed_records():
+    return load_secure_json(VIEWED_FILE, {})
+
+def save_viewed_records(records):
+    save_secure_json(VIEWED_FILE, records)
+
+def load_backup_settings():
+    defaults = {
+        "enabled": True,
+        "interval": "6 Hours",
+        "storage_location": secure_backup_root(),
+        "backup_password": "",
+        "max_history": 30,
+        "max_storage_mb": 2048,
+        "last_success": "",
+        "last_attempt": "",
+        "last_status": "NOT RUN",
+        "last_error": ""
+    }
+    loaded = load_secure_json(BACKUP_SETTINGS_FILE, {})
+    defaults.update(loaded if isinstance(loaded, dict) else {})
+    root = os.path.abspath(secure_backup_root())
+    location = os.path.abspath(str(defaults.get("storage_location") or root))
+    try:
+        protected_location = os.path.commonpath([root, location]) == root
+    except ValueError:
+        protected_location = False
+    if not protected_location:
+        defaults["previous_storage_location"] = location
+        defaults["storage_location"] = root
+    return defaults
+
+def save_backup_settings(settings):
+    save_secure_json(BACKUP_SETTINGS_FILE, settings)
+
+def load_backup_history():
+    history = load_secure_json(BACKUP_HISTORY_FILE, [])
+    return history if isinstance(history, list) else []
+
+def save_backup_history(history):
+    save_secure_json(BACKUP_HISTORY_FILE, history)
+
+def parse_email_recipients(raw_value):
+    """Return a unique validated recipient list or raise a user-facing error."""
+    recipients = []
+    seen = set()
+    for value in str(raw_value or "").replace(";", ",").split(","):
+        address = value.strip()
+        if not address:
+            continue
+        lowered = address.lower()
+        if lowered in seen:
+            continue
+        if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", address):
+            raise ValueError(f"Invalid recipient email address: {address}")
+        seen.add(lowered)
+        recipients.append(address)
+    if len(recipients) > MAX_EMAIL_RECIPIENTS:
+        raise ValueError(f"A maximum of {MAX_EMAIL_RECIPIENTS} recipient email addresses is supported.")
+    return recipients
+
+def remove_readonly_file(function, path, _exc_info):
+    """Allow controlled restore cleanup of application-created read-only files."""
+    os.chmod(path, stat.S_IREAD | stat.S_IWRITE)
+    function(path)
+
+def protect_local_path(path, is_directory=False):
+    """Restrict backup files to the current operating-system user when possible."""
+    try:
+        if os.name == "nt":
+            username = getpass.getuser()
+            permission = f"{username}:(OI)(CI)F" if is_directory else f"{username}:F"
+            subprocess.run(["icacls", path, "/inheritance:r", "/grant:r", permission],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           timeout=15, check=True)
+        else:
+            os.chmod(path, stat.S_IRUSR | (stat.S_IWUSR | stat.S_IXUSR if is_directory else 0))
+    except Exception as exc:
+        raise RuntimeError(f"Cannot protect {path}: {exc}") from exc
 
 def load_company_details():
     default_details = {
@@ -325,27 +388,24 @@ def load_company_details():
         "department_name": "Environmental Monitoring Department",
         "report_title": "Temperature and Humidity Report"
     }
-    if not os.path.exists(COMPANY_CONFIG_FILE):
-        return default_details
     try:
-        with open(COMPANY_CONFIG_FILE, "r") as f:
-            content = f.read().strip()
-            decoded = deobfuscate_data(content)
-            if decoded:
-                data = json.loads(decoded)
-            else:
-                data = json.loads(content)
-            for k, v in default_details.items():
-                if k not in data:
-                    data[k] = v
-            return data
-    except:
-        return default_details
+        loaded = load_secure_json(COMPANY_CONFIG_FILE, {})
+    except RuntimeError:
+        # Older installations shipped this non-secret header with the source
+        # machine's XOR key. Preserve its exact bytes before migrating it.
+        try:
+            original = Path(COMPANY_CONFIG_FILE).read_bytes()
+            loaded = recover_legacy_company_details(original.decode("utf-8"))
+        except Exception:
+            raise RuntimeError("Cannot recover company_details.json. Original file preserved; restore valid company settings.")
+        original_path = COMPANY_CONFIG_FILE + ".legacy-original"
+        if not os.path.exists(original_path):
+            atomic_write(original_path, original)
+    default_details.update(loaded)
+    return default_details
 
 def save_company_details(company_details):
-    with open(COMPANY_CONFIG_FILE, "w") as f:
-        data_str = json.dumps(company_details, indent=4)
-        f.write(obfuscate_data(data_str))
+    save_secure_json(COMPANY_CONFIG_FILE, company_details)
 
 def is_timestamp_approved(approvals, ip, port, slave_id, row_dt):
     """Return whether one exact reading timestamp is inside an approved range."""
@@ -382,113 +442,42 @@ def is_timestamp_approved(approvals, ip, port, slave_id, row_dt):
     return False
 
 def load_users():
-    # Define default superadmin and admin in case of failure or first run
-    superadmin_h = hashlib.sha256("superadmin".encode()).hexdigest()
-    admin_h = hashlib.sha256("admin".encode()).hexdigest()
-    
-    all_perms = ["live_data", "add_device", "live_log", "view_data", "approve_data", "email_config", "email_smtp_config", "sms_config", "export_data", "data_trends", "user_manager", "audit_log", "company_details"]
-    admin_perms = ["live_data", "live_log", "view_data", "approve_data", "email_config", "email_smtp_config", "sms_config", "export_data", "data_trends", "user_manager", "audit_log", "company_details"]
-    
-    default_superadmin = {
-        "password": superadmin_h,
-        "permissions": all_perms.copy(),
-        "is_admin": True,
-        "is_superadmin": True
-    }
-    
-    default_admin = {
-        "password": admin_h,
-        "permissions": admin_perms.copy(),
-        "is_admin": True,
-        "is_superadmin": False
-    }
-
-    default_users = {
-        "superadmin": default_superadmin,
-        "admin": default_admin
-    }
-
     if not os.path.exists(USERS_FILE):
-        save_users(default_users)
-        return default_users
-            
-    try:
-        with open(USERS_FILE, "r") as f:
-            content = f.read().strip()
-            decoded = deobfuscate_data(content)
-            if decoded:
-                users = json.loads(decoded)
-            else:
-                users = json.loads(content)
-            
-            # Ensure "superadmin" exists and has full permissions
-            if "superadmin" not in users:
-                users["superadmin"] = default_superadmin
-            else:
-                users["superadmin"]["is_superadmin"] = True
-                users["superadmin"]["is_admin"] = True
-                if "permissions" not in users["superadmin"]:
-                    users["superadmin"]["permissions"] = all_perms.copy()
-                else:
-                    for p in all_perms:
-                        if p not in users["superadmin"]["permissions"]:
-                            users["superadmin"]["permissions"].append(p)
-            
-            # Ensure "admin" exists
-            if "admin" not in users:
-                users["admin"] = default_admin
-            else:
-                users["admin"]["is_admin"] = True
-                users["admin"]["is_superadmin"] = False
-                if "permissions" not in users["admin"]:
-                    users["admin"]["permissions"] = admin_perms.copy()
-                else:
-                    for p in admin_perms:
-                        if p not in users["admin"]["permissions"]:
-                            users["admin"]["permissions"].append(p)
-            
-            # Enforce that only superadmin has "add_device" permission
-            for uname, udata in users.items():
-                if uname != "superadmin" and not udata.get("is_superadmin"):
-                    if "permissions" in udata and "add_device" in udata["permissions"]:
-                        udata["permissions"].remove("add_device")
-            
-            save_users(users)
-            return users
-    except:
-        # If file is corrupted or HWID changed beyond recovery, return default users
-        return default_users
+        # An existing installation must never recreate privileged accounts.
+        if os.path.exists(os.path.join(DATA_PATH, ".accounts-initialized")) or any(
+                os.path.exists(p) for p in (CONFIG_FILE, EMAIL_CONFIG_FILE, SMS_CONFIG_FILE)):
+            raise RuntimeError("User database is missing. Restore a valid backup; automatic account reset is disabled.")
+        password = simpledialog.askstring("First-time setup", "Create the Super Admin password (at least 12 characters):", show="*")
+        if password is None or len(password) < 12:
+            raise RuntimeError("Initial administrator setup requires a password of at least 12 characters.")
+        confirmation = simpledialog.askstring("Confirm password", "Re-enter the new Super Admin password:", show="*")
+        if confirmation != password:
+            raise RuntimeError("Passwords did not match. No account was created.")
+        permissions = ["live_data", "add_device", "live_log", "view_data", "approve_data", "email_config", "email_smtp_config", "sms_config", "export_data", "data_trends", "user_manager", "audit_log", "backup_restore", "company_details"]
+        users = {"superadmin": {"password": hash_password(password), "permissions": permissions,
+                               "is_admin": True, "is_superadmin": True, "is_approver": True}}
+        save_users(users)
+    else:
+        users = load_secure_json(USERS_FILE, {})
+    if not users or not any(u.get("is_superadmin") for u in users.values() if isinstance(u, dict)):
+        raise RuntimeError("Invalid user database: no Super Admin. Restore a valid backup.")
+    for name, user in users.items():
+        if not isinstance(user, dict) or not isinstance(user.get("password"), str) or not isinstance(user.get("permissions"), list):
+            raise RuntimeError(f"Invalid account configuration for {name}.")
+    atomic_write(os.path.join(DATA_PATH, ".accounts-initialized"), "initialized")
+    return users
 
 def save_users(users):
-    with open(USERS_FILE, "w") as f:
-        data_str = json.dumps(users, indent=4)
-        f.write(obfuscate_data(data_str))
+    save_secure_json(USERS_FILE, users)
 
 def load_trend_settings():
-    if not os.path.exists(TREND_CONFIG_FILE):
-        return {"low_limit": "", "upper_limit": "", "visible_condition": "Both Limits", "decimal_places": "3"}
-    try:
-        with open(TREND_CONFIG_FILE, "r") as f:
-            content = f.read().strip()
-            decoded = deobfuscate_data(content)
-            if decoded:
-                data = json.loads(decoded)
-            else:
-                data = json.loads(content)
-            
-            if "decimal_places" not in data: data["decimal_places"] = "3"
-            return data
-    except:
-        return {"low_limit": "", "upper_limit": "", "visible_condition": "Both Limits", "decimal_places": "3"}
+    defaults = {"low_limit": "", "upper_limit": "", "visible_condition": "Both Limits", "decimal_places": "3"}
+    defaults.update(load_secure_json(TREND_CONFIG_FILE, {}))
+    return defaults
 
 def save_trend_settings(settings):
-    with open(TREND_CONFIG_FILE, "w") as f:
-        data_str = json.dumps(settings, indent=4)
-        f.write(obfuscate_data(data_str))
+    save_secure_json(TREND_CONFIG_FILE, settings)
 
-# -------------------------
-# CSV LOGGING
-# -------------------------
 def csv_filename(ip, port, slave_id=1):
     # Daily rotation: filename includes current date to prevent Excel row limits
     date_str = datetime.now().strftime("%Y-%m-%d")
@@ -507,6 +496,7 @@ def safe_format_val(val, prec=3):
     except (ValueError, TypeError):
         return s
 
+@storage_operation
 def write_csv(ip, port, slave_id, reg, value):
     # Safety filter: Skip NaN, inf, or empty strings
     val_str = str(value).strip().lower()
@@ -528,10 +518,13 @@ def write_csv(ip, port, slave_id, reg, value):
                 if not exists:
                     writer.writerow(["Timestamp", "IP", "Port", "SlaveID", "Register", "Value"])
                 writer.writerow([datetime.now().strftime("%Y-%m-%d %H:%M:%S"), ip, port, slave_id, reg, value])
-            break
+            return
         except Exception:
             time.sleep(0.1)
+    raise OSError(f"Could not save records to {filename} after three attempts.")
 
+
+@storage_operation
 def write_alarm_history_csv(dev_name, reg_name, reg_addr, value, condition, threshold):
     date_str = datetime.now().strftime("%Y-%m-%d")
     filename = os.path.join(DATA_PATH, "live", f"Alarm_History_{date_str}.csv")
@@ -551,10 +544,13 @@ def write_alarm_history_csv(dev_name, reg_name, reg_addr, value, condition, thre
                     condition, 
                     threshold
                 ])
-            break
+            return
         except Exception:
             time.sleep(0.1)
 
+    raise OSError(f"Could not save alarm history to {filename} after three attempts.")
+
+@storage_operation
 def write_email_log_csv(dev_name, field_name, recipient, status):
     date_str = datetime.now().strftime("%Y-%m-%d")
     filename = os.path.join(DATA_PATH, "live", f"Email_Logs_{date_str}.csv")
@@ -572,9 +568,11 @@ def write_email_log_csv(dev_name, field_name, recipient, status):
                     recipient, 
                     status
                 ])
-            break
+            return
         except Exception:
             time.sleep(0.1)
+    raise OSError(f"Could not save records to {filename} after three attempts.")
+
 
 def send_fast2sms(api_key, route, numbers, message_text, sender_id="", template_id="", entity_id=""):
     if not api_key:
@@ -672,6 +670,7 @@ def send_fast2sms(api_key, route, numbers, message_text, sender_id="", template_
 
     return False, msg
 
+@storage_operation
 def write_sms_log_csv(dev_name, field_name, recipient, status, message_text=""):
     date_str = datetime.now().strftime("%Y-%m-%d")
     filename = os.path.join(DATA_PATH, "live", f"SMS_Logs_{date_str}.csv")
@@ -690,30 +689,90 @@ def write_sms_log_csv(dev_name, field_name, recipient, status, message_text=""):
                     status,
                     message_text
                 ])
-            break
+            return
         except Exception:
             time.sleep(0.1)
+    raise OSError(f"Could not save records to {filename} after three attempts.")
 
-def write_audit_log_csv(username, action, category, details):
+
+def _audit_hash(previous_hash, values):
+    identity_path = os.path.join(DATA_PATH, "config", "audit_identity.json")
+    identity = load_secure_json(identity_path, {})
+    if not identity:
+        identity = {"workstation_key": get_hwid()}
+        save_secure_json(identity_path, identity)
+    payload = "|".join([str(previous_hash)] + [str(v) for v in values]) + "|" + identity["workstation_key"]
+    return hashlib.sha256(payload.encode("utf-8", errors="replace")).hexdigest()
+
+def _upgrade_audit_file(filename):
+    """Upgrade legacy five-column logs to the tamper-evident audit schema."""
+    if not os.path.exists(filename) or os.path.getsize(filename) == 0:
+        return ""
+    try:
+        os.chmod(filename, stat.S_IREAD | stat.S_IWRITE)
+        with open(filename, "r", newline="", encoding="utf-8", errors="replace") as f:
+            rows = list(csv.reader((line.replace('\0', '') for line in f)))
+        if not rows:
+            return ""
+        expected = ["Timestamp", "Username", "Workstation", "Action", "Category",
+                    "Previous Value", "Updated Value", "Status", "Details", "Entry Hash"]
+        if rows[0] == expected:
+            if len(rows) == 1:
+                return ""
+            if len(rows[-1]) < 10:
+                raise ValueError("Audit file ends with an incomplete record.")
+            return rows[-1][9]
+        converted = [expected]
+        previous_hash = ""
+        for row in rows[1:]:
+            if len(row) < 5:
+                continue
+            values = [row[0], row[1], "LEGACY", row[2], row[3], "", "", "UNKNOWN", row[4]]
+            entry_hash = _audit_hash(previous_hash, values)
+            converted.append(values + [entry_hash])
+            previous_hash = entry_hash
+        output = io.StringIO(newline="")
+        csv.writer(output).writerows(converted)
+        atomic_write(filename, output.getvalue())
+        return previous_hash
+    except Exception as exc:
+        raise OSError(f"Could not read or upgrade audit file {filename}: {exc}") from exc
+
+@storage_operation
+def write_audit_log_csv(username, action, category, details, device_info="",
+                        previous_value="", updated_value="", status="SUCCESS"):
     date_str = datetime.now().strftime("%Y-%m-%d")
     filename = os.path.join(DATA_PATH, "live", f"Audit_Logs_{date_str}.csv")
-    for attempt in range(3):
-        exists = os.path.exists(filename)
-        try:
-            with open(filename, "a", newline="", encoding="utf-8") as f:
-                writer = csv.writer(f)
-                if not exists:
-                    writer.writerow(["Timestamp", "Username", "Action", "Category", "Details"])
-                writer.writerow([
-                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"), 
-                    username, 
-                    action, 
-                    category, 
-                    details
-                ])
-            break
-        except Exception:
-            time.sleep(0.1)
+    workstation = device_info or f"{platform.node()} / {platform.system()} {platform.release()}"
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    values = [timestamp, username, workstation, action, category, previous_value,
+              updated_value, status, details]
+    with AUDIT_WRITE_LOCK:
+        for attempt in range(3):
+            exists = os.path.exists(filename)
+            try:
+                previous_hash = _upgrade_audit_file(filename) if exists else ""
+                if exists:
+                    os.chmod(filename, stat.S_IREAD | stat.S_IWRITE)
+                entry_hash = _audit_hash(previous_hash, values)
+                with open(filename, "a", newline="", encoding="utf-8") as f:
+                    writer = csv.writer(f)
+                    if not exists or os.path.getsize(filename) == 0:
+                        writer.writerow(["Timestamp", "Username", "Workstation", "Action", "Category",
+                                         "Previous Value", "Updated Value", "Status", "Details", "Entry Hash"])
+                    writer.writerow(values + [entry_hash])
+                try:
+                    os.chmod(filename, stat.S_IREAD)
+                except Exception:
+                    pass
+                break
+            except Exception:
+                time.sleep(0.1)
+        else:
+            raise OSError(f"Could not persist audit event to {filename} after three attempts.")
+        if not exists:
+            protect_local_path(filename)
+        return tuple(values + [entry_hash])
 
 # -------------------------
 # FLOAT DECODING (ABCD)
@@ -955,7 +1014,9 @@ def read_modbus_device(host, port, registers, app, stop_event, unit_id=1, refres
                                 try:
                                     thresh = float(alert.get('threshold'))
                                     triggered = False
-                                    if cond == ">" and value > thresh: triggered = True
+                                    if is_lora and value <= 0:
+                                        triggered = False
+                                    elif cond == ">" and value > thresh: triggered = True
                                     elif cond == "<" and value < thresh: triggered = True
                                     elif cond == "==" and value == thresh: triggered = True
                                     
@@ -974,7 +1035,9 @@ def read_modbus_device(host, port, registers, app, stop_event, unit_id=1, refres
                                 try:
                                     thresh = float(alert.get('threshold'))
                                     triggered = False
-                                    if cond == ">" and value > thresh: triggered = True
+                                    if is_lora and value <= 0:
+                                        triggered = False
+                                    elif cond == ">" and value > thresh: triggered = True
                                     elif cond == "<" and value < thresh: triggered = True
                                     elif cond == "==" and value == thresh: triggered = True
                                     app.check_sms_alert_logic(alert, value, triggered)
@@ -1070,7 +1133,9 @@ def read_dummy_device(host, port, registers, app, stop_event, unit_id=1, refresh
                         try:
                             thresh = float(alert.get('threshold'))
                             triggered = False
-                            if cond == ">" and value > thresh: triggered = True
+                            if is_lora and value <= 0:
+                                triggered = False
+                            elif cond == ">" and value > thresh: triggered = True
                             elif cond == "<" and value < thresh: triggered = True
                             elif cond == "==" and value == thresh: triggered = True
                             app.check_alert_logic(alert, value, triggered)
@@ -1087,7 +1152,9 @@ def read_dummy_device(host, port, registers, app, stop_event, unit_id=1, refresh
                         try:
                             thresh = float(alert.get('threshold'))
                             triggered = False
-                            if cond == ">" and value > thresh: triggered = True
+                            if is_lora and value <= 0:
+                                triggered = False
+                            elif cond == ">" and value > thresh: triggered = True
                             elif cond == "<" and value < thresh: triggered = True
                             elif cond == "==" and value == thresh: triggered = True
                             app.check_sms_alert_logic(alert, value, triggered)
@@ -1111,7 +1178,7 @@ def read_dummy_device(host, port, registers, app, stop_event, unit_id=1, refresh
 # -------------------------
 # GUI APPLICATION
 # -------------------------
-class ModbusApp:
+class ModbusApp(BackupMixin):
     # Professional Light Theme Colors
     COLORS = {
         "bg_dark": "#F0F2F5",      # Modern Light Grey
@@ -1221,6 +1288,15 @@ class ModbusApp:
         self.current_user = None
         self.global_audit_log = deque(maxlen=2000)
 
+        # Viewed-data audit and automatic backup/restore state
+        self.viewed_records = load_viewed_records()
+        self.backup_settings = load_backup_settings()
+        self.backup_history = load_backup_history()
+        self.backup_lock = threading.RLock()
+        self.restore_in_progress = False
+        self.restart_required = False
+        self.backup_in_progress = False
+
         # Live Real-time Analytics
         self.data_history = {}  # { lid: [val1, val2, ...] }
         self.graph_canvas = None
@@ -1231,11 +1307,18 @@ class ModbusApp:
         self.trend_settings = load_trend_settings()
 
         # Force encode all config files on startup (Migration)
+        # Validate remaining files before rewriting any existing configuration.
+        approvals = load_approvals()
         save_devices(self.devices)
         save_email_settings(self.email_settings)
         save_sms_settings(self.sms_settings)
         save_users(self.users)
         save_trend_settings(self.trend_settings)
+        save_viewed_records(self.viewed_records)
+        save_backup_settings(self.backup_settings)
+        save_backup_history(self.backup_history)
+        save_approvals(approvals)
+        save_company_details(self.company_details)
 
         # Start Flow
         self.edit_index = None
@@ -1243,11 +1326,14 @@ class ModbusApp:
         self.check_initial_license()
         self.periodic_refresher()
 
-    def log_audit(self, action, category, details, user=None):
+    def log_audit(self, action, category, details, user=None, device_info="",
+                  previous_value="", updated_value="", status="SUCCESS"):
         username = user if user else (getattr(self, 'current_user', None) or 'SYSTEM')
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        write_audit_log_csv(username, action, category, details)
-        entry = (ts, username, action, category, details)
+        entry = write_audit_log_csv(username, action, category, details,
+                                    device_info=device_info,
+                                    previous_value=previous_value,
+                                    updated_value=updated_value,
+                                    status=status)
         self.global_audit_log.append(entry)
         if hasattr(self, 'audit_tree') and self.audit_tree and self.audit_tree.winfo_exists():
             self.root.after(0, lambda: self._append_audit_live(entry))
@@ -1255,9 +1341,288 @@ class ModbusApp:
     def _append_audit_live(self, entry):
         try:
             if hasattr(self, 'audit_tree') and self.audit_tree and self.audit_tree.winfo_exists():
-                self.audit_tree.insert("", 0, values=entry)
+                self.audit_tree.insert("", 0, values=entry[:9])
         except Exception:
             pass
+
+    def _authenticate_current_user(self, title="Authorization Required"):
+        entered_password = simpledialog.askstring(
+            title,
+            f"Enter the password for '{self.current_user}' to continue:",
+            show="*", parent=self.root
+        )
+        if entered_password is None:
+            return False
+        expected = self.users.get(self.current_user, {}).get("password", "")
+        valid = verify_password(entered_password, expected)
+        if not valid:
+            self.log_audit("AUTHORIZATION_DENIED", "SECURITY", title,
+                           status="DENIED")
+            messagebox.showerror("Authentication Failed", "Incorrect password.")
+        return valid
+
+    def _backup_runtime(self):
+        return globals()
+
+    def _reload_restored_configuration(self):
+        self.devices = load_devices()
+        self.email_settings = load_email_settings()
+        self.sms_settings = load_sms_settings()
+        self.users = load_users()
+        self.company_details = load_company_details()
+        self.trend_settings = load_trend_settings()
+        self.viewed_records = load_viewed_records()
+        self.backup_settings = load_backup_settings()
+        self.backup_history = load_backup_history()
+
+    def _backup_interval_seconds(self):
+        return {
+            "5 Mins": 300,
+            "30 Mins": 1800,
+            "1 Hour": 3600,
+            "6 Hours": 21600,
+            "12 Hours": 43200,
+            "24 Hours": 86400
+        }.get(self.backup_settings.get("interval", "6 Hours"), 21600)
+
+    def _backup_storage_path(self):
+        require_windows_admin()
+        root = os.path.abspath(secure_backup_root())
+        location = os.path.abspath(os.path.expandvars(str(self.backup_settings.get("storage_location") or root)))
+        if os.path.commonpath([root, location]) != root:
+            raise ValueError(f"For administrator-only deletion, select a folder inside {root}.")
+        # Reject links/junctions before granting protection or following the path.
+        current = Path(root)
+        for part in [None] + list(Path(location).relative_to(root).parts):
+            if part is not None:
+                current = current / part
+            if current.is_symlink() or (hasattr(current, "is_junction") and current.is_junction()):
+                raise ValueError("Backup storage cannot contain links or junctions.")
+            current.mkdir(exist_ok=True)
+            protect_admin_path(str(current), is_directory=True)
+        return location
+
+    def _count_backup_content(self):
+        recorded = 0
+        audit_records = 0
+        config_items = 0
+        for source_name in ("config", "live", "reports"):
+            source_dir = os.path.join(DATA_PATH, source_name)
+            if not os.path.isdir(source_dir):
+                continue
+            for root_dir, _, files in os.walk(source_dir):
+                for filename in files:
+                    full_path = os.path.join(root_dir, filename)
+                    if source_name == "config":
+                        config_items += 1
+                    if source_name == "live" and filename.lower().endswith(".csv"):
+                        try:
+                            with open(full_path, "r", encoding="utf-8", errors="replace") as f:
+                                count = max(0, sum(1 for _ in f) - 1)
+                            if filename.startswith("Audit_Logs_"):
+                                audit_records += count
+                            elif not filename.startswith(("Email_Logs_", "SMS_Logs_", "Alarm_")):
+                                recorded += count
+                        except Exception:
+                            pass
+        return recorded, config_items, audit_records
+
+    def _record_backup_history(self, entry):
+        self.backup_history.append(entry)
+        max_history = max(1, int(self.backup_settings.get("max_history", 30)))
+        self.backup_history = self.backup_history[-max_history:]
+        save_backup_history(self.backup_history)
+
+    def _enforce_backup_retention(self, storage, protected=()):
+        protected = {os.path.abspath(p) for p in protected}
+        limit = max(1, int(self.backup_settings.get("max_history", 30)))
+        max_bytes = max(1, int(self.backup_settings.get("max_storage_mb", 2048))) * 1024 * 1024
+        files = sorted((os.path.getmtime(os.path.join(storage, n)), os.path.join(storage, n), os.path.getsize(os.path.join(storage, n)))
+                       for n in os.listdir(storage) if n.startswith("TempTrek_Backup_") and n.lower().endswith((".zip", ".ttbackup")) and os.path.isfile(os.path.join(storage, n)))
+        total = sum(item[2] for item in files)
+        count = len(files)
+        for _, path, size in files:
+            if count <= limit and total <= max_bytes:
+                break
+            if os.path.abspath(path) in protected or count <= 1:
+                continue
+            os.chmod(path, stat.S_IREAD | stat.S_IWRITE)
+            os.remove(path)
+            total -= size
+            count -= 1
+
+    def browse_backup_location(self):
+        selected = filedialog.askdirectory(
+            title="Select Local Backup Storage Folder",
+            initialdir=self.backup_location_var.get() or DATA_PATH
+        )
+        if selected:
+            self.backup_location_var.set(os.path.abspath(selected))
+
+    def save_backup_settings_ui(self):
+        if not self._authenticate_current_user("Backup Settings Authorization"):
+            return
+        if not self._ensure_backup_password():
+            return
+        try:
+            location = os.path.abspath(os.path.expandvars(self.backup_location_var.get().strip()))
+            max_history = int(self.backup_history_limit_var.get().strip())
+            max_storage_mb = int(self.backup_storage_limit_var.get().strip())
+            if not location or max_history < 1 or max_storage_mb < 1:
+                raise ValueError("Storage location and positive retention limits are required.")
+            old_settings = dict(self.backup_settings)
+            self.backup_settings.update({
+                "enabled": self.backup_enabled_var.get(),
+                "interval": self.backup_interval_var.get(),
+                "storage_location": location,
+                "max_history": max_history,
+                "max_storage_mb": max_storage_mb
+            })
+            self._backup_storage_path()
+            save_backup_settings(self.backup_settings)
+            self.log_audit("BACKUP_CONFIG_UPDATE", "BACKUP", "Updated automatic backup settings",
+                           previous_value=json.dumps({k: v for k, v in old_settings.items() if k != "backup_password"}, sort_keys=True),
+                           updated_value=json.dumps({k: v for k, v in self.backup_settings.items() if k != "backup_password"}, sort_keys=True))
+            self.refresh_backup_view()
+            messagebox.showinfo("Saved", "Automatic backup settings saved successfully.")
+        except Exception as exc:
+            if "old_settings" in locals():
+                self.backup_settings = old_settings
+            messagebox.showerror("Invalid Backup Settings", str(exc))
+
+    def refresh_backup_view(self):
+        if hasattr(self, "backup_status_label") and self.backup_status_label.winfo_exists():
+            status = self.backup_settings.get("last_status", "NOT RUN")
+            last_success = self.backup_settings.get("last_success", "Never") or "Never"
+            error = self.backup_settings.get("last_error", "")
+            status_text = f"STATUS: {status}   |   LAST SUCCESS: {last_success}"
+            if error:
+                status_text += f"   |   ERROR: {error}"
+            color = self.COLORS["success"] if status == "SUCCESS" else (self.COLORS["danger"] if status == "FAILED" else self.COLORS["warning"])
+            self.backup_status_label.config(text=status_text, fg=color)
+        if hasattr(self, "backup_progress") and self.backup_progress.winfo_exists() and not self.backup_in_progress:
+            self.backup_progress.stop()
+        if not hasattr(self, "backup_tree") or not self.backup_tree.winfo_exists():
+            return
+        for item in self.backup_tree.get_children():
+            self.backup_tree.delete(item)
+        rows = list(reversed(self.backup_history))
+        known_paths = {str(row.get("location", "")) for row in rows}
+        try:
+            storage = self.backup_settings.get("storage_location", secure_backup_root())
+            for filename in os.listdir(storage):
+                path = os.path.join(storage, filename)
+                if filename.lower().endswith((".zip", ".ttbackup")) and path not in known_paths:
+                    try:
+                        if filename.lower().endswith(".ttbackup"):
+                            rows.append({"type": "DISCOVERED", "file_name": filename, "date_time": "",
+                                         "size": os.path.getsize(path), "status": "VERIFY ON RESTORE", "location": path})
+                            continue
+                        manifest = self._load_backup_manifest(path)
+                        rows.append({
+                            "type": manifest.get("trigger", "DISCOVERED"),
+                            "file_name": filename,
+                            "date_time": manifest.get("created_at", ""),
+                            "size": os.path.getsize(path),
+                            "status": "SUCCESS",
+                            "includes": ", ".join(manifest.get("includes", [])),
+                            "location": path
+                        })
+                    except Exception:
+                        rows.append({"type": "UNKNOWN", "file_name": filename, "date_time": "",
+                                     "size": os.path.getsize(path), "status": "INVALID", "location": path})
+        except Exception:
+            pass
+        for row in rows:
+            if row.get("status") == "SUCCESS" and not os.path.isfile(row.get("location", "")):
+                row = dict(row, status="MISSING")
+            size_mb = float(row.get("size", 0)) / (1024 * 1024)
+            self.backup_tree.insert("", "end", values=(
+                row.get("type", ""), row.get("file_name", ""), row.get("date_time", ""),
+                f"{size_mb:.2f} MB", row.get("status", ""),
+                row.get("includes", "Recorded data, configuration, users, notifications, approvals, audit" if row.get("status") == "SUCCESS" else "Not available"),
+                row.get("location", "")
+            ))
+
+    def show_backup_restore(self):
+        user_perms = self.users.get(self.current_user, {}).get("permissions", [])
+        if "backup_restore" not in user_perms:
+            messagebox.showerror("Access Denied", "You do not have permission to manage backup and restore.")
+            self.navigate("live_data")
+            return
+
+        layout = tk.Frame(self.content_frame, bg=self.COLORS["bg_dark"])
+        layout.pack(fill="both", expand=True, padx=30, pady=20)
+
+        settings = tk.Frame(layout, bg=self.COLORS["bg_surface"], padx=18, pady=15,
+                            highlightbackground=self.COLORS["bg_highlight"], highlightthickness=1)
+        settings.pack(fill="x", pady=(0, 12))
+        tk.Label(settings, text="AUTOMATIC DATA BACKUP & RESTORE SETTINGS", font=self.FONTS["h3"],
+                 bg=self.COLORS["bg_surface"], fg=self.COLORS["accent"]).grid(row=0, column=0, columnspan=6, sticky="w", pady=(0, 12))
+
+        self.backup_enabled_var = tk.BooleanVar(value=self.backup_settings.get("enabled", True))
+        tk.Checkbutton(settings, text="ENABLE AUTOMATIC BACKUP", variable=self.backup_enabled_var,
+                       bg=self.COLORS["bg_surface"], fg=self.COLORS["text_main"],
+                       selectcolor=self.COLORS["bg_dark"]).grid(row=1, column=0, sticky="w", padx=(0, 12))
+
+        tk.Label(settings, text="INTERVAL", bg=self.COLORS["bg_surface"], fg=self.COLORS["text_dim"]).grid(row=1, column=1, sticky="w")
+        self.backup_interval_var = tk.StringVar(value=self.backup_settings.get("interval", "6 Hours"))
+        ttk.Combobox(settings, textvariable=self.backup_interval_var, state="readonly", width=12,
+                     values=["5 Mins", "30 Mins", "1 Hour", "6 Hours", "12 Hours", "24 Hours"]).grid(row=2, column=1, sticky="ew", padx=(0, 12))
+
+        tk.Label(settings, text="MAX BACKUPS", bg=self.COLORS["bg_surface"], fg=self.COLORS["text_dim"]).grid(row=1, column=2, sticky="w")
+        self.backup_history_limit_var = tk.StringVar(value=str(self.backup_settings.get("max_history", 30)))
+        tk.Entry(settings, textvariable=self.backup_history_limit_var, width=10).grid(row=2, column=2, sticky="ew", padx=(0, 12))
+
+        tk.Label(settings, text="MAX STORAGE (MB)", bg=self.COLORS["bg_surface"], fg=self.COLORS["text_dim"]).grid(row=1, column=3, sticky="w")
+        self.backup_storage_limit_var = tk.StringVar(value=str(self.backup_settings.get("max_storage_mb", 2048)))
+        tk.Entry(settings, textvariable=self.backup_storage_limit_var, width=12).grid(row=2, column=3, sticky="ew", padx=(0, 12))
+
+        tk.Label(settings, text="ADMINISTRATOR BACKUP LOCATION", bg=self.COLORS["bg_surface"], fg=self.COLORS["text_dim"]).grid(row=3, column=0, sticky="w", pady=(12, 0))
+        self.backup_location_var = tk.StringVar(value=self.backup_settings.get("storage_location", secure_backup_root()))
+        tk.Entry(settings, textvariable=self.backup_location_var).grid(row=4, column=0, columnspan=4, sticky="ew", padx=(0, 8))
+        tk.Button(settings, text="BROWSE", command=self.browse_backup_location,
+                  bg=self.COLORS["bg_highlight"], fg=self.COLORS["text_main"], relief="flat").grid(row=4, column=4, padx=4)
+        tk.Button(settings, text="SAVE SETTINGS", command=self.save_backup_settings_ui,
+                  bg=self.COLORS["accent"], fg="white", relief="flat").grid(row=4, column=5, padx=4)
+        for col in range(4):
+            settings.grid_columnconfigure(col, weight=1)
+
+        self.backup_status_label = tk.Label(layout, text="", bg=self.COLORS["bg_surface"],
+                                            fg=self.COLORS["text_dim"], font=("Segoe UI", 9, "bold"), padx=12, pady=8)
+        self.backup_status_label.pack(fill="x")
+        self.backup_progress = ttk.Progressbar(layout, mode="indeterminate")
+        self.backup_progress.pack(fill="x", pady=(0, 10))
+
+        actions = tk.Frame(layout, bg=self.COLORS["bg_dark"])
+        actions.pack(fill="x", pady=(0, 10))
+        tk.Button(actions, text="CREATE BACKUP NOW", command=self.start_manual_backup,
+                  bg=self.COLORS["success"], fg="white", font=self.FONTS["button"], relief="flat", padx=16, pady=7).pack(side="left")
+        tk.Button(actions, text="EXPORT SELECTED BACKUP", command=self.export_selected_backup,
+                  bg=self.COLORS["accent"], fg="white", font=self.FONTS["button"], relief="flat", padx=12, pady=7).pack(side="left", padx=8)
+        tk.Button(actions, text="RESTORE SELECTED BACKUP", command=self.restore_selected_backup,
+                  bg=self.COLORS["warning"], fg="black", font=self.FONTS["button"], relief="flat", padx=16, pady=7).pack(side="right")
+        tk.Button(actions, text="SELECT BACKUP FILE", command=self.browse_restore_file,
+                  bg=self.COLORS["bg_highlight"], fg="white", relief="flat", padx=12, pady=7).pack(side="right", padx=8)
+
+        table_frame = tk.Frame(layout, bg=self.COLORS["bg_surface"])
+        table_frame.pack(fill="both", expand=True)
+        columns = ("type", "file", "date", "size", "status", "contents", "location")
+        self.backup_tree = ttk.Treeview(table_frame, columns=columns, show="headings", style="Treeview")
+        labels = {"type": "TYPE", "file": "BACKUP FILE", "date": "DATE / TIME", "size": "SIZE",
+                  "status": "STATUS", "contents": "INCLUDED DATA", "location": "LOCATION"}
+        widths = {"type": 100, "file": 250, "date": 160, "size": 90, "status": 90,
+                  "contents": 300, "location": 350}
+        for column in columns:
+            self.backup_tree.heading(column, text=labels[column])
+            self.backup_tree.column(column, width=widths[column], anchor="w")
+        y_scroll = ttk.Scrollbar(table_frame, orient="vertical", command=self.backup_tree.yview)
+        x_scroll = ttk.Scrollbar(table_frame, orient="horizontal", command=self.backup_tree.xview)
+        self.backup_tree.configure(yscrollcommand=y_scroll.set, xscrollcommand=x_scroll.set)
+        y_scroll.pack(side="right", fill="y")
+        x_scroll.pack(side="bottom", fill="x")
+        self.backup_tree.pack(fill="both", expand=True)
+        self.refresh_backup_view()
 
     def compute_device_diff(self, old_dev, new_dev):
         changes = []
@@ -1502,7 +1867,6 @@ class ModbusApp:
                  bg=self.COLORS["bg_surface"], fg=self.COLORS["text_dim"]).pack(anchor="w")
         self.u_entry = tk.Entry(card, font=self.FONTS["body"], bg=self.COLORS["bg_dark"], 
                           fg=self.COLORS["text_main"], relief="flat", insertbackground="black")
-        self.u_entry.insert(0, "SUPERADMIN")
         self.u_entry.pack(fill="x", pady=(5, 20), ipady=8)
 
         tk.Label(card, text="PASSCODE", font=self.FONTS["body"], 
@@ -1510,7 +1874,7 @@ class ModbusApp:
         self.pass_entry = tk.Entry(card, show="*", font=self.FONTS["body"], bg=self.COLORS["bg_dark"], 
                                   fg=self.COLORS["text_main"], relief="flat", insertbackground="black", bd=0)
         self.pass_entry.pack(fill="x", pady=(5, 30), ipady=8)
-        self.pass_entry.focus()
+        self.u_entry.focus()
         
         # Underline accent
         uline = tk.Frame(card, bg=self.COLORS["accent"], height=2)
@@ -1530,10 +1894,12 @@ class ModbusApp:
     def check_password(self):
         username = self.u_entry.get().lower()
         password = self.pass_entry.get()
-        h = hashlib.sha256(password.encode()).hexdigest()
         
         if username in self.users:
-            if self.users[username]["password"] == h:
+            if verify_password(password, self.users[username]["password"]):
+                if not self.users[username]["password"].startswith("pbkdf2_sha256$"):
+                    self.users[username]["password"] = hash_password(password)
+                    save_users(self.users)
                 self.current_user = username
                 self.log_audit("LOGIN", "AUTHENTICATION", f"User '{username.upper()}' logged in successfully", user=username)
                 self.build_main_ui()
@@ -1566,8 +1932,20 @@ class ModbusApp:
         tk.Label(logo_frame, text="Trek", font=("Segoe UI", 16), 
                  fg=self.COLORS["text_main"], bg=self.COLORS["bg_surface"]).pack(side="left")
 
-        self.nav_container = tk.Frame(self.sidebar, bg=self.COLORS["bg_surface"], pady=10)
-        self.nav_container.pack(fill="both", expand=True)
+        nav_area = tk.Frame(self.sidebar, bg=self.COLORS["bg_surface"])
+        nav_area.pack(fill="both", expand=True)
+        self.nav_canvas = tk.Canvas(nav_area, bg=self.COLORS["bg_surface"],
+                                    highlightthickness=0, width=220, height=1)
+        nav_scrollbar = ttk.Scrollbar(nav_area, orient="vertical", command=self.nav_canvas.yview)
+        nav_scrollbar.pack(side="right", fill="y")
+        self.nav_canvas.pack(side="left", fill="both", expand=True)
+        self.nav_canvas.configure(yscrollcommand=nav_scrollbar.set)
+        self.nav_container = tk.Frame(self.nav_canvas, bg=self.COLORS["bg_surface"], pady=10)
+        nav_window = self.nav_canvas.create_window((0, 0), window=self.nav_container, anchor="nw")
+        self.nav_container.bind("<Configure>",
+                                lambda event: self.nav_canvas.configure(scrollregion=self.nav_canvas.bbox("all")))
+        self.nav_canvas.bind("<Configure>",
+                             lambda event: self.nav_canvas.itemconfigure(nav_window, width=event.width))
 
         self.nav_btns = {}
         user_perms = self.users.get(self.current_user, {}).get("permissions", [])
@@ -1575,35 +1953,48 @@ class ModbusApp:
         
         if "live_data" in user_perms:
             self.create_nav_item("live_data", "DASHBOARD")
-        if "add_device" in user_perms and is_superadmin:
-            self.create_nav_item("add_device", "Device Manager")
         if "live_log" in user_perms:
             self.create_nav_item("live_log", "Live Log")
-        if "export_data" in user_perms:
-            self.create_nav_item("export_data", "Data Export")
-        if "data_trends" in user_perms:
-            self.create_nav_item("data_trends", "Historic Trends")
-        if "user_manager" in user_perms:
-            self.create_nav_item("user_manager", "System Users")
-        if "company_details" in user_perms:
-            self.create_nav_item("company_details", "Company Details")
 
-        fda_perms = ["view_data", "approve_data", "sms_config", "email_config", "audit_log"]
-        if any(p in user_perms for p in fda_perms):
-            self.create_nav_header("FDA 21 CFR Part 11")
+        if "view_data" in user_perms or "approve_data" in user_perms:
+            self.create_nav_header("DATA")
             if "view_data" in user_perms:
                 self.create_nav_item("view_data", "View Data", indent=True)
             if "approve_data" in user_perms:
-                self.create_nav_item("approve_data", "Approve Data", indent=True)
+                self.create_nav_item("approve_data", "Approved Data", indent=True)
+
+        if "export_data" in user_perms or "data_trends" in user_perms:
+            self.create_nav_header("REPORTS / PDF")
+            if "export_data" in user_perms:
+                self.create_nav_item("export_data", "Export / Download", indent=True)
+            if "data_trends" in user_perms:
+                self.create_nav_item("data_trends", "Historic Trends", indent=True)
+
+        if "sms_config" in user_perms or "email_config" in user_perms:
+            self.create_nav_header("NOTIFICATIONS")
+            if "email_config" in user_perms:
+                self.create_nav_item("email_config", "Email Configuration", indent=True)
             if "sms_config" in user_perms:
                 self.create_nav_item("sms_config", "SMS Alert", indent=True)
-            if "email_config" in user_perms:
-                self.create_nav_item("email_config", "Alarm Configuration", indent=True)
+
+        admin_perms = ["add_device", "user_manager", "company_details", "audit_log", "backup_restore"]
+        if any(p in user_perms for p in admin_perms):
+            self.create_nav_header("ADMINISTRATION")
+            if "add_device" in user_perms and is_superadmin:
+                self.create_nav_item("add_device", "Device Manager", indent=True)
+            if "user_manager" in user_perms:
+                self.create_nav_item("user_manager", "System Users", indent=True)
+            if "company_details" in user_perms:
+                self.create_nav_item("company_details", "Company Details", indent=True)
             if "audit_log" in user_perms:
                 self.create_nav_item("audit_log", "Audit Log", indent=True)
+            if "backup_restore" in user_perms:
+                self.create_nav_item("backup_restore", "Backup & Restore", indent=True)
+
+        self.create_nav_item("change_password", "Change Password")
 
         footer = tk.Frame(self.sidebar, bg=self.COLORS["bg_surface"], pady=20)
-        footer.pack(side="bottom", fill="x")
+        footer.pack(side="bottom", fill="x", before=nav_area)
         
         status_frame = tk.Frame(footer, bg=self.COLORS["bg_surface"])
         status_frame.pack(side="left", padx=20)
@@ -1613,9 +2004,31 @@ class ModbusApp:
         tk.Label(status_frame, text=self.current_user.upper(), font=("Segoe UI", 8, "bold"), 
                  fg=self.COLORS["text_dim"], bg=self.COLORS["bg_surface"]).pack(side="left", padx=(5, 0))
 
-        tk.Button(footer, text="LOGOUT", font=("Segoe UI", 8, "bold"), fg=self.COLORS["danger"],
+        tk.Button(footer, text="↪ LOGOUT", font=("Segoe UI", 8, "bold"), fg=self.COLORS["danger"],
                   bg=self.COLORS["bg_surface"], relief="flat", cursor="hand2",
                   command=self.show_login).pack(side="right", padx=20)
+
+        # Bind only sidebar widgets so scrolling does not affect the active page.
+        def scroll_navigation(event):
+            if self.nav_container.winfo_reqheight() > self.nav_canvas.winfo_height():
+                if getattr(event, "num", None) == 4:
+                    units = -1
+                elif getattr(event, "num", None) == 5:
+                    units = 1
+                else:
+                    delta = getattr(event, "delta", 0)
+                    units = (-1 if delta > 0 else 1) * max(1, abs(int(delta / 120))) if delta else 0
+                self.nav_canvas.yview_scroll(units, "units")
+            return "break"
+
+        def bind_navigation_scroll(widget):
+            widget.bind("<MouseWheel>", scroll_navigation)
+            widget.bind("<Button-4>", scroll_navigation)
+            widget.bind("<Button-5>", scroll_navigation)
+            for child in widget.winfo_children():
+                bind_navigation_scroll(child)
+
+        bind_navigation_scroll(nav_area)
 
         # Main Content Area
         self.main_area = tk.Frame(self.root, bg=self.COLORS["bg_dark"])
@@ -1643,8 +2056,25 @@ class ModbusApp:
         sep.pack(side="left", fill="x", expand=True, padx=(8, 0))
 
     def create_nav_item(self, view_id, text, indent=False):
-        left_pad = 35 if indent else 30
-        btn = tk.Button(self.nav_container, text=text, font=("Segoe UI", 10), 
+        icons = {
+            "live_data": "▦",
+            "live_log": "≡",
+            "view_data": "▤",
+            "approve_data": "✓",
+            "export_data": "↓",
+            "data_trends": "↗",
+            "email_config": "✉",
+            "sms_config": "☎",
+            "add_device": "⚙",
+            "user_manager": "👤",
+            "company_details": "▥",
+            "audit_log": "☷",
+            "backup_restore": "⟳",
+            "change_password": "🔒",
+        }
+        left_pad = 22 if indent else 16
+        label = f"{icons.get(view_id, '•')}  {text}"
+        btn = tk.Button(self.nav_container, text=label, font=("Segoe UI", 10),
                         fg=self.COLORS["text_dim"], bg=self.COLORS["bg_surface"], 
                         relief="flat", anchor="w", padx=left_pad, pady=10, cursor="hand2",
                         activebackground=self.COLORS["bg_highlight"], activeforeground="white",
@@ -1741,6 +2171,9 @@ class ModbusApp:
         self.root.option_add("*TCombobox*Listbox.width", "25")
 
     def navigate(self, view_name):
+        if self.restore_in_progress or self.restart_required:
+            messagebox.showwarning("Restore", "Wait for restoration to finish, then restart TempTrek.")
+            return
         self.active_view = view_name
         for name, btn in self.nav_btns.items():
             if name == view_name:
@@ -1753,7 +2186,7 @@ class ModbusApp:
             "add_device": "DEVICE CONFIGURATION", 
             "live_log": "SYSTEM ANALYTICS",
             "view_data": "VIEW DATA",
-            "approve_data": "APPROVE DATA",
+            "approve_data": "APPROVED DATA",
             "email_config": "ALARM CONFIGURATION",
             "sms_config": "SMS ALERT CONFIGURATION",
             "export_data": "DATA EXPORT",
@@ -1762,7 +2195,9 @@ class ModbusApp:
             "company_details": "COMPANY DETAILS",
             "email_alerts": "ALARM HISTORY",
             "email_logs_view": "EMAIL SEND LOGS",
-            "audit_log": "USER AUDIT LOG"
+            "audit_log": "USER AUDIT LOG",
+            "backup_restore": "DATA BACKUP & RESTORE",
+            "change_password": "CHANGE PASSWORD"
         }
         self.view_title.config(text=titles.get(view_name, ""))
 
@@ -1806,6 +2241,64 @@ class ModbusApp:
             self.show_company_details()
         elif view_name == "audit_log":
             self.show_audit_log()
+        elif view_name == "backup_restore":
+            self.show_backup_restore()
+        elif view_name == "change_password":
+            self.show_change_password()
+
+    def show_change_password(self):
+        if not self.current_user:
+            return
+        card = tk.Frame(self.content_frame, bg=self.COLORS["bg_surface"], padx=30, pady=25)
+        card.pack(fill="x", padx=30, pady=20)
+        tk.Label(card, text="Change your password", font=self.FONTS["h2"],
+                 bg=self.COLORS["bg_surface"], fg=self.COLORS["text_main"]).pack(anchor="w")
+        tk.Label(card, text="Use at least 12 characters for your new password.",
+                 bg=self.COLORS["bg_surface"], fg=self.COLORS["text_dim"]).pack(anchor="w", pady=(5, 15))
+        entries = []
+        for label in ("Current password", "New password", "Confirm new password"):
+            tk.Label(card, text=label, font=self.FONTS["body"],
+                     bg=self.COLORS["bg_surface"], fg=self.COLORS["text_dim"]).pack(anchor="w")
+            entry = tk.Entry(card, show="*", font=self.FONTS["body"], width=35)
+            entry.pack(anchor="w", pady=(5, 15), ipady=6)
+            entries.append(entry)
+
+        def save_password():
+            if not self.current_user or self.restore_in_progress or self.restart_required:
+                return
+            current, new, confirmation = [entry.get() for entry in entries]
+            user = self.users[self.current_user]
+            if not verify_password(current, user["password"]):
+                messagebox.showerror("Change Password", "Current password is incorrect.")
+                entries[0].delete(0, tk.END)
+                entries[0].focus()
+                return
+            if len(new) < 12:
+                messagebox.showerror("Change Password", "Use a new password of at least 12 characters.")
+                return
+            if new != confirmation:
+                messagebox.showerror("Change Password", "New passwords do not match.")
+                return
+            if new == current:
+                messagebox.showerror("Change Password", "Choose a password different from your current password.")
+                return
+            try:
+                updated_users = {**self.users, self.current_user: {**user, "password": hash_password(new)}}
+                save_users(updated_users)
+            except Exception as exc:
+                messagebox.showerror("Change Password", f"Could not save your password: {exc}")
+                return
+            self.users = updated_users
+            for entry in entries:
+                entry.delete(0, tk.END)
+            self.log_audit("PASSWORD_CHANGE", "AUTHENTICATION", "User changed their own password")
+            messagebox.showinfo("Change Password", "Your password has been changed successfully.")
+
+        tk.Button(card, text="CHANGE PASSWORD", command=save_password,
+                  bg=self.COLORS["accent"], fg="white", font=self.FONTS["button"],
+                  relief="flat", padx=16, pady=10).pack(anchor="w")
+        entries[-1].bind("<Return>", lambda event: save_password())
+        entries[0].focus()
 
     # -------------------------
     # VIEW: LIVE DATA
@@ -2199,6 +2692,7 @@ class ModbusApp:
             self.trend_dev_cb.current(0)
             _on_dev_change(None)
 
+    @storage_operation
     def export_trend_pdf(self, dev_override=None):
         if not HAS_REPORTLAB:
             messagebox.showerror("Error", "Feature unavailable: reportlab library not found.")
@@ -3040,7 +3534,8 @@ class ModbusApp:
             ("sms_config", "SMS Alerts & Fast2SMS API"),
             ("data_trends", "Historic Trends"),
             ("user_manager", "User Manager"),
-            ("audit_log", "Audit Log")
+            ("audit_log", "Audit Log"),
+            ("backup_restore", "Backup & Restore")
         ]
         if can_assign_view:
             perms.insert(2, ("view_data", "View Data"))
@@ -3049,7 +3544,7 @@ class ModbusApp:
             perms.insert(insert_idx, ("approve_data", "Approve Data"))
         
         for pid, pname in perms:
-            var = tk.BooleanVar(value=True if pid != "user_manager" else False)
+            var = tk.BooleanVar(value=pid not in ["user_manager", "backup_restore"])
             self.perm_vars[pid] = var
             cb = tk.Checkbutton(left, text=pname, variable=var, bg=self.COLORS["bg_surface"], 
                                fg=self.COLORS["text_main"], selectcolor=self.COLORS["bg_dark"],
@@ -3110,7 +3605,8 @@ class ModbusApp:
             "export_data": "Data Export",
             "data_trends": "Historic Trends",
             "user_manager": "User Mgr",
-            "audit_log": "Audit Log"
+            "audit_log": "Audit Log",
+            "backup_restore": "Backup/Restore"
         }
 
         for uname, udata in self.users.items():
@@ -3172,7 +3668,11 @@ class ModbusApp:
             messagebox.showerror("Error", "Password required for new user")
             return
 
-        h = hashlib.sha256(upass.encode()).hexdigest() if upass else (self.users[uname]["password"] if is_update else "")
+        if upass and len(upass) < 12:
+            messagebox.showerror("Password", "Use at least 12 characters.")
+            return
+
+        h = hash_password(upass) if upass else (self.users[uname]["password"] if is_update else "")
         selected_perms = [pid for pid, var in self.perm_vars.items() if var.get()]
         
         # Maintain superadmin / admin status if updating
@@ -3791,7 +4291,10 @@ class ModbusApp:
 
             self.sender_email, _ = fld("EMAIL / USERNAME", initial=s.get('sender_email', ''))
             self.sender_pass, _ = fld("PASSWORD / APP KEY", initial=s.get('sender_password', ''), show="*")
-            self.recipient_email, self.f_recip = fld("RECIPIENT EMAIL", initial=s.get('recipient_email', ''))
+            self.recipient_email, self.f_recip = fld(
+                f"RECIPIENT EMAILS (Comma/semicolon separated, max {MAX_EMAIL_RECIPIENTS})",
+                initial=s.get('recipient_email', '')
+            )
             self.email_subject, self.f_sub = fld("EMAIL SUBJECT", initial=s.get('subject', ''))
 
             # Scheduled PDF Report Interval Selection
@@ -3989,6 +4492,14 @@ class ModbusApp:
     def save_email_settings_ui(self):
         old_settings = dict(self.email_settings)
         stype = self.server_type_cb.get()
+        if stype in ["Gmail", "SMTP"]:
+            try:
+                recipients = parse_email_recipients(self.recipient_email.get())
+                if self.email_enabled_var.get() and not recipients:
+                    raise ValueError("At least one recipient email address is required.")
+            except ValueError as exc:
+                messagebox.showerror("Invalid Recipients", str(exc))
+                return
         self.email_settings['server_type'] = stype
         self.email_settings['sender_email'] = self.sender_email.get().strip()
         self.email_settings['sender_password'] = self.sender_pass.get().strip()
@@ -4027,7 +4538,9 @@ class ModbusApp:
             changes.append(f"Scheduled PDF Report: '{old_settings.get('scheduled_pdf_interval', 'Disabled')}' -> '{self.email_settings.get('scheduled_pdf_interval')}'")
 
         diff_str = "; ".join(changes) if changes else "Saved email settings"
-        self.log_audit("EMAIL_CONFIG_SAVE", "ALARM", f"Updated Email Settings ({stype}): {diff_str}")
+        self.log_audit("EMAIL_CONFIG_SAVE", "EMAIL", f"Updated Email Settings ({stype}): {diff_str}",
+                       previous_value=json.dumps({k: v for k, v in old_settings.items() if k != "sender_password"}, sort_keys=True),
+                       updated_value=json.dumps({k: v for k, v in self.email_settings.items() if k != "sender_password"}, sort_keys=True))
         messagebox.showinfo("Success", f"{stype} settings saved successfully.")
 
     def test_email_config(self):
@@ -4049,30 +4562,10 @@ class ModbusApp:
 
         def run_test():
             def try_smtp_connect(target_host, target_port):
-                for unverified in [False, True]:
-                    if unverified:
-                        ssl_ctx = ssl._create_unverified_context()
-                    else:
-                        try:
-                            ssl_ctx = ssl.create_default_context()
-                        except Exception:
-                            ssl_ctx = ssl._create_unverified_context()
-                    try:
-                        if target_port == 465:
-                            srv = smtplib.SMTP_SSL(target_host, target_port, timeout=15, context=ssl_ctx)
-                        else:
-                            srv = smtplib.SMTP(target_host, target_port, timeout=15)
-                            if srv.has_extn('STARTTLS') or target_port == 587:
-                                srv.starttls(context=ssl_ctx)
-                        srv.login(user, pwd)
-                        return srv, target_port, None
-                    except (ssl.SSLError, ssl.SSLCertVerificationError) as ssl_err:
-                        if not unverified:
-                            continue
-                        return None, target_port, ssl_err
-                    except Exception as err:
-                        return None, target_port, err
-                return None, target_port, Exception("Connection failed")
+                try:
+                    return connect_smtp(target_host, target_port, user, pwd), target_port, None
+                except Exception as exc:
+                    return None, target_port, exc
 
             try:
                 if stype in ["Gmail", "SMTP"]:
@@ -4082,7 +4575,7 @@ class ModbusApp:
                         self.root.after(0, lambda: messagebox.showwarning("Incomplete", "Please specify at least one recipient email address."))
                         return
                     # Replace semicolon with comma then split
-                    recipients = [r.strip() for r in raw_to.replace(";", ",").split(",") if r.strip()]
+                    recipients = parse_email_recipients(raw_to)
                     if not recipients:
                         self.root.after(0, lambda: messagebox.showwarning("Incomplete", "Please specify a valid recipient email address."))
                         return
@@ -4097,24 +4590,6 @@ class ModbusApp:
                     domain = user.split('@')[-1] if '@' in user else ''
                     
                     candidate_targets = [(host, port)]
-                    alt_p = 587 if port == 465 else (465 if port == 587 else 587)
-                    if (host, alt_p) not in candidate_targets:
-                        candidate_targets.append((host, alt_p))
-                    
-                    # Add domain-specific candidate hosts for custom domains
-                    if domain and '.' in domain:
-                        cpanel_host = f"mail.{domain}"
-                        if (cpanel_host, 465) not in candidate_targets:
-                            candidate_targets.append((cpanel_host, 465))
-                        if (cpanel_host, 587) not in candidate_targets:
-                            candidate_targets.append((cpanel_host, 587))
-                        if ("smtp.office365.com", 587) not in candidate_targets:
-                            candidate_targets.append(("smtp.office365.com", 587))
-                        if ("smtpout.secureserver.net", 465) not in candidate_targets:
-                            candidate_targets.append(("smtpout.secureserver.net", 465))
-                        if ("smtpout.secureserver.net", 587) not in candidate_targets:
-                            candidate_targets.append(("smtpout.secureserver.net", 587))
-
                     server = None
                     used_host = host
                     used_port = port
@@ -4132,7 +4607,17 @@ class ModbusApp:
                             last_err = err
 
                     if server is None:
-                        if isinstance(last_err, smtplib.SMTPServerDisconnected):
+                        if isinstance(last_err, ssl.SSLCertVerificationError):
+                            err_msg = (
+                                f"Cannot verify the mail server certificate ({host}:{port}).\n\n"
+                                "Check the server hostname and the computer's date and time. "
+                                "If this persists, ask your IT administrator to check the server's "
+                                "certificate chain and any antivirus or network TLS inspection. "
+                                "A private CA must be trusted in the Windows certificate store.\n\n"
+                                f"Details: {last_err}"
+                            )
+                            self.root.after(0, lambda msg=err_msg: messagebox.showerror("Failure", msg))
+                        elif isinstance(last_err, smtplib.SMTPServerDisconnected):
                             err_msg = (f"Connection unexpectedly closed by mail server ({host}:{port}).\n\n"
                                        "Most Likely Causes & Solutions:\n\n"
                                        "1. INCORRECT USERNAME OR PASSWORD:\n"
@@ -4196,7 +4681,7 @@ class ModbusApp:
                     server.quit()
                     self.root.after(0, lambda: messagebox.showinfo("Success", "POP3 connection successful!"))
             except Exception as e:
-                self.root.after(0, lambda: messagebox.showerror("Failure", f"Test failed: {str(e)}"))
+                self.root.after(0, lambda msg=str(e): messagebox.showerror("Failure", f"Test failed: {msg}"))
 
         threading.Thread(target=run_test, daemon=True).start()
 
@@ -4528,7 +5013,18 @@ class ModbusApp:
         except Exception as e:
             messagebox.showerror("Error", f"Failed to import alarm rules: {e}")
 
+    def is_lora_alert(self, alert):
+        dev_ip = str(alert.get('device_ip', ''))
+        slave_id = str(alert.get('slave_id', 1))
+        for d in list(self.devices):
+            if str(d.get('ip')) == dev_ip and str(d.get('slave_id', 1)) == slave_id:
+                if ("LORA" in str(d.get('node_type', '')).upper()) or ("LORA" in str(d.get('device_name', '')).upper()):
+                    return True
+        return False
+
     def check_sms_alert_logic(self, alert, current_value, is_triggered):
+        if is_triggered and self.is_lora_alert(alert) and float(current_value) <= 0:
+            is_triggered = False
         alert_id = f"sms_{alert.get('device_ip')}_{alert.get('reg')}_{alert.get('condition')}_{alert.get('threshold')}"
         
         try:
@@ -4593,16 +5089,49 @@ class ModbusApp:
                 return
 
             ts_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            tpl = alert.get('template', "Alert: {name} reached {value} at {time}")
-            msg_text = tpl.replace("{name}", full_name).replace("{value}", formatted_val).replace("{time}", ts_str).replace("{ip}", alert.get('device_ip', '0.0.0.0'))
+            
+            v1_setting = alert.get('var1', '').strip()
+            v2_setting = alert.get('var2', '').strip()
+            tpl = alert.get('template', '').strip()
+
+            if not tpl or (v1_setting or v2_setting):
+                v1_raw = v1_setting if v1_setting else "{name}"
+                v2_raw = v2_setting if v2_setting else "{value}"
+                tpl = f"{v1_raw}|{v2_raw}"
+
+            msg_text = (tpl
+                .replace("{name}", full_name)
+                .replace("{dev}", dev_alias)
+                .replace("{device}", dev_alias)
+                .replace("{reg}", only_reg_name)
+                .replace("{var1}", full_name)
+                .replace("{var2}", formatted_val)
+                .replace("{var3}", formatted_thresh)
+                .replace("{value1}", formatted_val)
+                .replace("{value2}", formatted_thresh)
+                .replace("{value}", formatted_val)
+                .replace("{val}", formatted_val)
+                .replace("{threshold}", formatted_thresh)
+                .replace("{thresh}", formatted_thresh)
+                .replace("{condition}", str(alert.get('condition', '')))
+                .replace("{cond}", str(alert.get('condition', '')))
+                .replace("{time}", ts_str)
+                .replace("{ip}", str(alert.get('device_ip', '0.0.0.0'))))
 
             success, response_msg = send_fast2sms(api_key, route, numbers, msg_text, sender_id=sender_id, template_id=template_id, entity_id=entity_id)
             status_str = "SUCCESS" if success else f"FAILED ({response_msg})"
             
             write_sms_log_csv(dev_alias, only_reg_name, numbers, status_str, msg_text)
             self.log(f"Fast2SMS Result [{full_name}]: {status_str}")
+            self.log_audit("SMS_ALERT_SENT" if success else "SMS_ALERT_FAILED", "SMS",
+                           f"SMS alert for {full_name} to {numbers}: {status_str}",
+                           device_info=f"{platform.node()}; monitored_device={alert.get('device_ip', '')}",
+                           updated_value=msg_text, status="SUCCESS" if success else "FAILED")
         except Exception as e:
             write_sms_log_csv(dev_alias, only_reg_name, s.get('recipient_numbers', ''), f"FAILED ({e})", "")
+            self.log_audit("SMS_ALERT_FAILED", "SMS", str(e),
+                           device_info=f"{platform.node()}; monitored_device={alert.get('device_ip', '')}",
+                           status="FAILED")
 
     # -------------------------
     # VIEW: SMS CONFIG & ALERTS (FAST2SMS)
@@ -4748,14 +5277,31 @@ class ModbusApp:
         self.rule_sms_interval.insert(0, "0")
         self.rule_sms_interval.pack(fill="x", pady=(2, 0), ipady=6)
 
+        row_vars = tk.Frame(add_rule_frame, bg=self.COLORS["bg_surface"], pady=5)
+        row_vars.pack(fill="x")
+
+        f_var1 = tk.Frame(row_vars, bg=self.COLORS["bg_surface"])
+        f_var1.pack(side="left", fill="x", expand=True, padx=5)
+        tk.Label(f_var1, text="DLT VARIABLE 1 (VAR 1)", font=("Segoe UI", 8, "bold"), fg=self.COLORS["text_dim"], bg=self.COLORS["bg_surface"]).pack(anchor="w")
+        self.rule_sms_var1 = tk.Entry(f_var1, bg=self.COLORS["bg_dark"], fg=self.COLORS["text_main"], relief="flat", font=self.FONTS["body"], insertbackground="black")
+        self.rule_sms_var1.insert(0, "{name}")
+        self.rule_sms_var1.pack(fill="x", pady=(2, 0), ipady=6)
+
+        f_var2 = tk.Frame(row_vars, bg=self.COLORS["bg_surface"])
+        f_var2.pack(side="left", fill="x", expand=True, padx=5)
+        tk.Label(f_var2, text="DLT VARIABLE 2 (VAR 2)", font=("Segoe UI", 8, "bold"), fg=self.COLORS["text_dim"], bg=self.COLORS["bg_surface"]).pack(anchor="w")
+        self.rule_sms_var2 = tk.Entry(f_var2, bg=self.COLORS["bg_dark"], fg=self.COLORS["text_main"], relief="flat", font=self.FONTS["body"], insertbackground="black")
+        self.rule_sms_var2.insert(0, "{value}")
+        self.rule_sms_var2.pack(fill="x", pady=(2, 0), ipady=6)
+
         row3 = tk.Frame(add_rule_frame, bg=self.COLORS["bg_surface"])
-        row3.pack(fill="x", pady=10)
+        row3.pack(fill="x", pady=5)
         
-        tk.Label(row3, text="CUSTOM SMS TEMPLATE (Use {value}, {time}, {name}, {ip})", font=("Segoe UI", 8, "bold"), 
+        tk.Label(row3, text="FULL SMS TEMPLATE / DLT COMBINED MESSAGE", font=("Segoe UI", 8, "bold"), 
                  fg=self.COLORS["text_dim"], bg=self.COLORS["bg_surface"]).pack(anchor="w")
         self.rule_sms_msg = tk.Entry(row3, bg=self.COLORS["bg_dark"], fg=self.COLORS["text_main"], relief="flat", font=self.FONTS["body"], insertbackground="black")
-        self.rule_sms_msg.insert(0, "Alert: {name} reached {value} at {time}")
-        self.rule_sms_msg.pack(fill="x", pady=(5, 0), ipady=8)
+        self.rule_sms_msg.insert(0, "{name}|{value}")
+        self.rule_sms_msg.pack(fill="x", pady=(2, 0), ipady=6)
 
         btn_row = tk.Frame(add_rule_frame, bg=self.COLORS["bg_surface"])
         btn_row.pack(fill="x", pady=10)
@@ -4771,20 +5317,22 @@ class ModbusApp:
         tree_cnt = tk.Frame(right, bg=self.COLORS["bg_surface"], highlightbackground=self.COLORS["bg_highlight"], highlightthickness=1)
         tree_cnt.pack(fill="both", expand=True, padx=30, pady=(0, 20))
 
-        self.sms_rules_tree = ttk.Treeview(tree_cnt, columns=("ip", "reg", "cond", "thresh", "interval", "msg"), show="headings", style="Treeview")
+        self.sms_rules_tree = ttk.Treeview(tree_cnt, columns=("ip", "reg", "cond", "thresh", "var1", "var2", "msg"), show="headings", style="Treeview")
         self.sms_rules_tree.heading("ip", text="DEVICE NAME")
         self.sms_rules_tree.heading("reg", text="REGISTER NAME")
         self.sms_rules_tree.heading("cond", text="CONDITION")
         self.sms_rules_tree.heading("thresh", text="PROCESS VALUE")
-        self.sms_rules_tree.heading("interval", text="INTERVAL (SEC)")
-        self.sms_rules_tree.heading("msg", text="SMS TEMPLATE MESSAGE")
+        self.sms_rules_tree.heading("var1", text="VARIABLE 1")
+        self.sms_rules_tree.heading("var2", text="VARIABLE 2")
+        self.sms_rules_tree.heading("msg", text="SMS TEMPLATE / DLT")
         
-        self.sms_rules_tree.column("ip", width=160, minwidth=130, stretch=True)
-        self.sms_rules_tree.column("reg", width=180, minwidth=150, stretch=True)
-        self.sms_rules_tree.column("cond", width=110, minwidth=100, stretch=False)
-        self.sms_rules_tree.column("thresh", width=150, minwidth=130, stretch=False)
-        self.sms_rules_tree.column("interval", width=150, minwidth=130, stretch=False)
-        self.sms_rules_tree.column("msg", width=300, minwidth=200, stretch=True)
+        self.sms_rules_tree.column("ip", width=140, minwidth=110, stretch=True)
+        self.sms_rules_tree.column("reg", width=150, minwidth=120, stretch=True)
+        self.sms_rules_tree.column("cond", width=100, minwidth=90, stretch=False)
+        self.sms_rules_tree.column("thresh", width=120, minwidth=100, stretch=False)
+        self.sms_rules_tree.column("var1", width=130, minwidth=100, stretch=True)
+        self.sms_rules_tree.column("var2", width=130, minwidth=100, stretch=True)
+        self.sms_rules_tree.column("msg", width=220, minwidth=160, stretch=True)
         
         v_sb = ttk.Scrollbar(tree_cnt, orient="vertical", command=self.sms_rules_tree.yview, style="Vertical.TScrollbar")
         h_sb = ttk.Scrollbar(tree_cnt, orient="horizontal", command=self.sms_rules_tree.xview, style="Horizontal.TScrollbar")
@@ -4811,7 +5359,9 @@ class ModbusApp:
 
         save_sms_settings(self.sms_settings)
 
-        self.log_audit("SMS_CONFIG_UPDATE", "CONFIG", f"Updated Fast2SMS configuration (Route: {route_val}, Recipients: {self.sms_settings['recipient_numbers']})")
+        self.log_audit("SMS_CONFIG_UPDATE", "SMS", f"Updated Fast2SMS configuration (Route: {route_val}, Recipients: {self.sms_settings['recipient_numbers']})",
+                       previous_value=json.dumps({k: v for k, v in old_settings.items() if k != "api_key"}, sort_keys=True),
+                       updated_value=json.dumps({k: v for k, v in self.sms_settings.items() if k != "api_key"}, sort_keys=True))
         messagebox.showinfo("Success", "Fast2SMS configuration saved successfully.")
 
     def test_sms_config(self):
@@ -4876,7 +5426,14 @@ class ModbusApp:
         except:
             interval = 0
             
+        var1_val = self.rule_sms_var1.get().strip()
+        var2_val = self.rule_sms_var2.get().strip()
         msg_tpl = self.rule_sms_msg.get().strip()
+        
+        if (var1_val or var2_val) and (not msg_tpl or msg_tpl == "Alert: {name} reached {value} at {time}"):
+            v1 = var1_val if var1_val else "{name}"
+            v2 = var2_val if var2_val else "{value}"
+            msg_tpl = f"{v1}|{v2}"
 
         new_rule = {
             "device_ip": ip,
@@ -4888,7 +5445,9 @@ class ModbusApp:
             "threshold": thresh,
             "interval": interval,
             "reg_name": reg_raw,
-            "template": msg_tpl if msg_tpl else "Alert: {name} reached {value} at {time}"
+            "var1": var1_val,
+            "var2": var2_val,
+            "template": msg_tpl if msg_tpl else f"{var1_val if var1_val else '{name}'}|{var2_val if var2_val else '{value}'}"
         }
 
         if 'alerts' not in self.sms_settings:
@@ -4952,8 +5511,21 @@ class ModbusApp:
         self.rule_sms_thresh.insert(0, alert.get('threshold', ''))
         self.rule_sms_interval.delete(0, tk.END)
         self.rule_sms_interval.insert(0, alert.get('interval', '0'))
+        
+        v1 = alert.get('var1', '')
+        v2 = alert.get('var2', '')
+        tpl = alert.get('template', '')
+        if not v1 and not v2 and '|' in tpl:
+            parts = tpl.split('|', 1)
+            v1, v2 = parts[0], parts[1]
+            
+        self.rule_sms_var1.delete(0, tk.END)
+        self.rule_sms_var1.insert(0, v1 if v1 else "{name}")
+        self.rule_sms_var2.delete(0, tk.END)
+        self.rule_sms_var2.insert(0, v2 if v2 else "{value}")
+
         self.rule_sms_msg.delete(0, tk.END)
-        self.rule_sms_msg.insert(0, alert.get('template', ''))
+        self.rule_sms_msg.insert(0, tpl if tpl else f"{v1 if v1 else '{name}'}|{v2 if v2 else '{value}'}")
         
         self.btn_add_sms_alert.config(text="UPDATE SMS RULE", bg=self.COLORS["warning"])
 
@@ -4977,13 +5549,23 @@ class ModbusApp:
         for a in self.sms_settings.get('alerts', []):
             alias = a.get('device_alias', a.get('device_ip'))
             reg_disp = a.get('reg_name', f"Reg {a.get('reg')}")
+            tpl = a.get('template', '')
+            v1 = a.get('var1', '')
+            v2 = a.get('var2', '')
+            if not v1 and not v2 and '|' in tpl:
+                parts = tpl.split('|', 1)
+                v1, v2 = parts[0], parts[1]
+            if not v1: v1 = "{name}"
+            if not v2: v2 = "{value}"
+
             self.sms_rules_tree.insert("", "end", values=(
                 alias,
                 reg_disp,
                 get_display_cond(a.get('condition')),
                 a.get('threshold'),
-                f"{a.get('interval', 0)} mins",
-                a.get('template', '')
+                v1,
+                v2,
+                tpl if tpl else f"{v1}|{v2}"
             ))
 
     def export_sms_alert_config(self):
@@ -5106,6 +5688,8 @@ class ModbusApp:
                 self.log(f"Error reading SMS logs: {e}")
 
     def check_alert_logic(self, alert, current_value, is_triggered):
+        if is_triggered and self.is_lora_alert(alert) and float(current_value) <= 0:
+            is_triggered = False
         # Create a unique ID for this alert rule
         alert_id = f"{alert.get('device_ip')}_{alert.get('reg')}_{alert.get('condition')}_{alert.get('threshold')}"
         
@@ -5183,7 +5767,7 @@ class ModbusApp:
         try:
             raw_to = s.get('recipient_email', '')
             # Support multiple recipients (comma or semicolon)
-            recipients = [r.strip() for r in raw_to.replace(";", ",").split(",") if r.strip()]
+            recipients = parse_email_recipients(raw_to)
             
             if not recipients:
                 return
@@ -5220,43 +5804,13 @@ class ModbusApp:
             sender_pwd = s.get('sender_password', '').strip()
 
             def try_smtp_connect(target_host, target_port):
-                for unverified in [False, True]:
-                    if unverified:
-                        ssl_ctx = ssl._create_unverified_context()
-                    else:
-                        try:
-                            ssl_ctx = ssl.create_default_context()
-                        except Exception:
-                            ssl_ctx = ssl._create_unverified_context()
-                    try:
-                        if target_port == 465:
-                            srv = smtplib.SMTP_SSL(target_host, target_port, timeout=15, context=ssl_ctx)
-                        else:
-                            srv = smtplib.SMTP(target_host, target_port, timeout=15)
-                            if srv.has_extn('STARTTLS') or target_port == 587:
-                                srv.starttls(context=ssl_ctx)
-                        srv.login(sender_usr, sender_pwd)
-                        return srv, target_port, None
-                    except (ssl.SSLError, ssl.SSLCertVerificationError) as ssl_err:
-                        if not unverified:
-                            continue
-                        return None, target_port, ssl_err
-                    except Exception as err:
-                        return None, target_port, err
-                return None, target_port, Exception("Connection failed")
+                try:
+                    return connect_smtp(target_host, target_port, sender_usr, sender_pwd), target_port, None
+                except Exception as exc:
+                    return None, target_port, exc
 
             domain = sender_usr.split('@')[-1] if '@' in sender_usr else ''
             candidate_targets = [(smtp_server, smtp_port)]
-            alt_p = 587 if smtp_port == 465 else (465 if smtp_port == 587 else 587)
-            if (smtp_server, alt_p) not in candidate_targets:
-                candidate_targets.append((smtp_server, alt_p))
-            
-            if domain and '.' in domain:
-                cpanel_host = f"mail.{domain}"
-                if (cpanel_host, 465) not in candidate_targets: candidate_targets.append((cpanel_host, 465))
-                if (cpanel_host, 587) not in candidate_targets: candidate_targets.append((cpanel_host, 587))
-                if ("smtp.office365.com", 587) not in candidate_targets: candidate_targets.append(("smtp.office365.com", 587))
-
             server = None
             last_err = None
             for h_cand, p_cand in candidate_targets:
@@ -5280,6 +5834,9 @@ class ModbusApp:
             
             # Log to EMAIL LOGS
             write_email_log_csv(dev_alias, only_reg_name, raw_to, "SENT")
+            self.log_audit("EMAIL_ALERT_SENT", "EMAIL",
+                           f"Alert email for {full_name} sent to {', '.join(recipients)}",
+                           device_info=f"{platform.node()}; monitored_device={alert.get('device_ip', '')}")
             # Live Update UI
             ts_now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             self.root.after(0, lambda: self._append_email_log_live([
@@ -5289,46 +5846,19 @@ class ModbusApp:
             self.root.after(0, lambda: self.log(f"SUCCESS: Alert email sent at {datetime.now().strftime('%H:%M:%S')} for {full_name}"))
         except Exception as e:
             self.root.after(0, lambda: self.log(f"FAILURE: Email send failed: {e}"))
+            self.log_audit("EMAIL_ALERT_FAILED", "EMAIL", str(e),
+                           device_info=f"{platform.node()}; monitored_device={alert.get('device_ip', '')}",
+                           status="FAILED")
 
     def _connect_smtp(self, sender_usr, sender_pwd, smtp_server, smtp_port):
         def try_smtp_connect(target_host, target_port):
-            for unverified in [False, True]:
-                if unverified:
-                    ssl_ctx = ssl._create_unverified_context()
-                else:
-                    try:
-                        ssl_ctx = ssl.create_default_context()
-                    except Exception:
-                        ssl_ctx = ssl._create_unverified_context()
-                try:
-                    if target_port == 465:
-                        srv = smtplib.SMTP_SSL(target_host, target_port, timeout=15, context=ssl_ctx)
-                    else:
-                        srv = smtplib.SMTP(target_host, target_port, timeout=15)
-                        if srv.has_extn('STARTTLS') or target_port == 587:
-                            srv.starttls(context=ssl_ctx)
-                    srv.login(sender_usr, sender_pwd)
-                    return srv, target_port, None
-                except (ssl.SSLError, ssl.SSLCertVerificationError) as ssl_err:
-                    if not unverified:
-                        continue
-                    return None, target_port, ssl_err
-                except Exception as err:
-                    return None, target_port, err
-            return None, target_port, Exception("Connection failed")
+            try:
+                return connect_smtp(target_host, target_port, sender_usr, sender_pwd), target_port, None
+            except Exception as exc:
+                return None, target_port, exc
 
         domain = sender_usr.split('@')[-1] if '@' in sender_usr else ''
         candidate_targets = [(smtp_server, smtp_port)]
-        alt_p = 587 if smtp_port == 465 else (465 if smtp_port == 587 else 587)
-        if (smtp_server, alt_p) not in candidate_targets:
-            candidate_targets.append((smtp_server, alt_p))
-        
-        if domain and '.' in domain:
-            cpanel_host = f"mail.{domain}"
-            if (cpanel_host, 465) not in candidate_targets: candidate_targets.append((cpanel_host, 465))
-            if (cpanel_host, 587) not in candidate_targets: candidate_targets.append((cpanel_host, 587))
-            if ("smtp.office365.com", 587) not in candidate_targets: candidate_targets.append(("smtp.office365.com", 587))
-
         server = None
         last_err = None
         for h_cand, p_cand in candidate_targets:
@@ -5381,10 +5911,16 @@ class ModbusApp:
         threading.Thread(target=self.send_scheduled_pdf_email, args=(interval_str, interval_sec), daemon=True).start()
         messagebox.showinfo("Report Email Dispatched", f"Generating PDF data report for the past {interval_str} and sending via email in the background...")
 
+    @storage_operation
     def send_scheduled_pdf_email(self, interval_str, interval_sec):
         s = self.email_settings
         raw_to = s.get('recipient_email', '')
-        recipients = [r.strip() for r in raw_to.replace(";", ",").split(",") if r.strip()]
+        try:
+            recipients = parse_email_recipients(raw_to)
+        except ValueError as exc:
+            self.log_audit("SCHEDULED_REPORT_EMAIL", "EMAIL", str(exc), status="FAILED")
+            self.root.after(0, lambda e=str(exc): self.log(f"Scheduled PDF email skipped: {e}"))
+            return
         if not recipients:
             return
 
@@ -5406,10 +5942,30 @@ class ModbusApp:
                 date_str_prev = from_dt.strftime("%Y-%m-%d")
                 target_dates = set([date_str_now, date_str_prev])
                 live_dir = os.path.join(DATA_PATH, "live")
+                approvals_for_report = load_approvals()
+                scheduled_all_approved = True
+
+                def draw_scheduled_approval_status(is_final):
+                    if is_final:
+                        c.setFillColorRGB(0.1, 0.55, 0.25)
+                        c.setFont("Helvetica-Bold", 11)
+                        c.drawRightString(w - 40, h - 50, "FINAL / APPROVED")
+                        return
+                    c.saveState()
+                    c.setFillColorRGB(0.82, 0.82, 0.82)
+                    c.setFont("Helvetica-Bold", 48)
+                    c.translate(w / 2, h / 2)
+                    c.rotate(35)
+                    c.drawCentredString(0, 0, "DRAFT")
+                    c.restoreState()
+                    c.setFillColorRGB(0.8, 0.15, 0.15)
+                    c.setFont("Helvetica-Bold", 11)
+                    c.drawRightString(w - 40, h - 50, "DRAFT / UNAPPROVED")
 
                 device_list = list(self.devices)
                 comp_info = load_company_details()
                 if not device_list:
+                    scheduled_all_approved = False
                     c.setFillColorRGB(0.0, 0.36, 0.72); c.setFont("Helvetica-Bold", 18)
                     c.drawString(40, h-50, comp_info.get("company_name", "TempTrek Environmental Monitoring System"))
                     c.setFont("Helvetica", 9); c.setFillColorRGB(0.5, 0.5, 0.5)
@@ -5417,6 +5973,7 @@ class ModbusApp:
                     c.drawString(40, h-85, f"RANGE: {from_dt.strftime('%Y-%m-%d %H:%M')} TO {to_dt.strftime('%Y-%m-%d %H:%M')}")
                     c.line(40, h-95, w-40, h-95)
                     c.drawString(40, h-130, "No configured devices found.")
+                    draw_scheduled_approval_status(False)
                 else:
                     for dev_idx, dev in enumerate(device_list):
                         if dev_idx > 0:
@@ -5424,7 +5981,12 @@ class ModbusApp:
 
                         ip, port, slave = dev['ip'], str(dev['port']), str(dev.get('slave_id', 1))
                         d_alias = dev.get('device_name', ip)
-                        registers = [str(r) for r in dev.get('registers', [])]
+                        all_registers = [str(r) for r in dev.get('registers', [])]
+                        registers = all_registers[:MAX_PDF_REGISTERS]
+                        if len(all_registers) > MAX_PDF_REGISTERS:
+                            self.log_audit("SCHEDULED_REPORT_LIMIT", "EXPORT",
+                                           f"Device '{d_alias}' has {len(all_registers)} registers; PDF limit is {MAX_PDF_REGISTERS}",
+                                           status="PARTIAL")
                         reg_names = [dev.get('names', {}).get(r, f"Reg {r}") for r in registers]
                         num_params = len(reg_names)
 
@@ -5494,6 +6056,25 @@ class ModbusApp:
                         # Build series data for Graph Preview
                         all_series = []
                         sorted_ts = sorted(pivoted.keys())
+                        if len(sorted_ts) > MAX_PDF_RECORDS:
+                            allowed_timestamps = set(sorted_ts[-MAX_PDF_RECORDS:])
+                            pivoted = {key: value for key, value in pivoted.items() if key in allowed_timestamps}
+                            sorted_ts = sorted(pivoted.keys())
+                            self.log_audit("SCHEDULED_REPORT_LIMIT", "EXPORT",
+                                           f"Scheduled PDF limited to {MAX_PDF_RECORDS} records for '{d_alias}'",
+                                           status="PARTIAL")
+                        approval_flags = []
+                        for timestamp in sorted_ts:
+                            try:
+                                approval_flags.append(is_timestamp_approved(
+                                    approvals_for_report, ip, port, slave,
+                                    datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S")
+                                ))
+                            except Exception:
+                                approval_flags.append(False)
+                        device_report_approved = bool(approval_flags) and all(approval_flags)
+                        scheduled_all_approved = scheduled_all_approved and device_report_approved
+                        draw_scheduled_approval_status(device_report_approved)
                         for r_addr in registers:
                             ser_vals = []
                             for ts in sorted_ts:
@@ -5590,6 +6171,7 @@ class ModbusApp:
                         for ts in sorted(pivoted.keys(), reverse=True):
                             if curr_y < 50:
                                 c.showPage(); curr_y = h - 60
+                                draw_scheduled_approval_status(device_report_approved)
                                 c.setFillColorRGB(0.1, 0.1, 0.1); c.setFont("Helvetica-Bold", f_size)
                                 c.drawString(40, curr_y, "TIMESTAMP")
                                 for i, rname in enumerate(reg_names):
@@ -5662,7 +6244,8 @@ class ModbusApp:
             msg['From'] = s.get('sender_email', '')
             msg['To'] = raw_to
             base_sub = s.get('subject', 'TempTrek System Report')
-            msg['Subject'] = f"PERIODIC DATA REPORT ({interval_str}): {base_sub}"
+            approval_label = "FINAL / APPROVED" if locals().get("scheduled_all_approved", False) else "DRAFT / UNAPPROVED"
+            msg['Subject'] = f"{approval_label} - PERIODIC DATA REPORT ({interval_str}): {base_sub}"
 
             body = (f"TempTrek Environmental Monitoring System\n"
                     f"=========================================\n"
@@ -5670,6 +6253,7 @@ class ModbusApp:
                     f"=========================================\n"
                     f"Report Time Window: {from_dt.strftime('%Y-%m-%d %H:%M:%S')} to {to_dt.strftime('%Y-%m-%d %H:%M:%S')}\n"
                     f"Generated At: {to_dt.strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+                    f"Approval Status: {approval_label}\n\n"
                     f"Attached is the automated PDF data report for all monitored devices covering the past {interval_str}.\n"
                     f"=========================================")
             msg.attach(MIMEText(body, 'plain'))
@@ -5688,6 +6272,8 @@ class ModbusApp:
 
             server, err = self._connect_smtp(sender_usr, sender_pwd, smtp_server, smtp_port)
             if server:
+                sent_recipients = []
+                failed_recipients = []
                 for r in recipients:
                     try:
                         msg.replace_header('To', r)
@@ -5695,26 +6281,68 @@ class ModbusApp:
                         msg['To'] = r
                     try:
                         server.sendmail(sender_usr, [r], msg.as_string())
+                        sent_recipients.append(r)
                         write_email_log_csv("System Periodic Report", f"{interval_str} PDF Report", r, "SUCCESS")
                         ts_now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                         self.root.after(0, lambda r_tgt=r: self._append_email_log_live([ts_now, "System Periodic Report", f"{interval_str} PDF Report", r_tgt, "SUCCESS"]))
                     except Exception as send_err:
+                        failed_recipients.append(r)
                         write_email_log_csv("System Periodic Report", f"{interval_str} PDF Report", r, f"FAIL: {send_err}")
+                        self.log_audit("SCHEDULED_REPORT_EMAIL", "EMAIL",
+                                       f"Failed sending scheduled report to {r}: {send_err}", status="FAILED")
                 try: server.quit()
                 except: pass
 
-                self.log_audit("SCHEDULED_REPORT_EMAIL", "EXPORT", f"Sent scheduled {interval_str} PDF report email to [{', '.join(recipients)}]")
-                self.root.after(0, lambda: self.log(f"SCHEDULED PDF EMAIL SENT ({interval_str}) to {', '.join(recipients)}"))
+                delivery_status = "SUCCESS" if not failed_recipients else ("PARTIAL" if sent_recipients else "FAILED")
+                self.log_audit("SCHEDULED_REPORT_EMAIL", "EMAIL",
+                               f"Scheduled {interval_str} report: sent [{', '.join(sent_recipients)}], failed [{', '.join(failed_recipients)}]",
+                               updated_value=approval_label, status=delivery_status)
+                self.root.after(0, lambda: self.log(f"SCHEDULED PDF EMAIL {delivery_status} ({interval_str}); sent to {', '.join(sent_recipients)}"))
             else:
                 for r in recipients:
                     write_email_log_csv("System Periodic Report", f"{interval_str} PDF Report", r, f"FAIL: {err}")
+                self.log_audit("SCHEDULED_REPORT_EMAIL", "EMAIL", f"SMTP connection failed: {err}", status="FAILED")
                 self.root.after(0, lambda: self.log(f"SCHEDULED PDF EMAIL FAILED: {err}"))
         except Exception as ex:
+            self.log_audit("SCHEDULED_REPORT_EMAIL", "EMAIL", str(ex), status="FAILED")
             self.root.after(0, lambda: self.log(f"Scheduled PDF email dispatch failed: {ex}"))
 
     # -------------------------
     # VIEW: VIEW DATA
     # -------------------------
+    def record_viewed_records(self, dev, timestamps):
+        if not timestamps:
+            return
+        now_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        username = self.current_user or "SYSTEM"
+        workstation = platform.node()
+        ip, port, slave = dev['ip'], dev['port'], dev.get('slave_id', 1)
+        for timestamp in timestamps:
+            key = f"{ip}:{port}:{slave}_{timestamp}"
+            entry = self.viewed_records.setdefault(key, {
+                "device_name": dev.get("device_name", ip),
+                "device_ip": ip,
+                "port": port,
+                "slave_id": slave,
+                "timestamp": timestamp,
+                "first_viewed_by": username,
+                "first_viewed_at": now_text,
+                "views": []
+            })
+            entry["last_viewed_by"] = username
+            entry["last_viewed_at"] = now_text
+            entry.setdefault("views", []).append({
+                "username": username,
+                "viewed_at": now_text,
+                "workstation": workstation
+            })
+        save_viewed_records(self.viewed_records)
+        self.log_audit(
+            "DATA_VIEWED", "DATA", f"Viewed {len(timestamps)} records for '{dev.get('device_name', ip)}'",
+            device_info=f"{workstation}; device={ip}:{port}; slave={slave}",
+            updated_value=f"{timestamps[0]} to {timestamps[-1]}"
+        )
+
     def show_view_data(self):
         user_perms = self.users.get(self.current_user, {}).get("permissions", [])
         if "view_data" not in user_perms:
@@ -5885,8 +6513,7 @@ class ModbusApp:
         )
         if entered_password is None:
             return
-        entered_hash = hashlib.sha256(entered_password.encode()).hexdigest()
-        if entered_hash != current_user_data.get("password", ""):
+        if not verify_password(entered_password, current_user_data.get("password", "")):
             self.log_audit("DATA_APPROVAL_DENIED", "SECURITY", f"Incorrect approval password entered for '{self.current_user}'")
             messagebox.showerror("Authentication Failed", "Incorrect password. Data was not approved.")
             return
@@ -5911,6 +6538,15 @@ class ModbusApp:
             messagebox.showerror("Error", f"Invalid date selection: {e}")
             return
 
+        loaded_context = getattr(self, "view_loaded_context", None)
+        expected_device = f"{ip}:{port}:{slave_id_part}"
+        if (not loaded_context or loaded_context.get("device") != expected_device or
+                loaded_context.get("from") != from_dt.strftime("%Y-%m-%d %H:%M:%S") or
+                loaded_context.get("to") != to_dt.strftime("%Y-%m-%d %H:%M:%S") or
+                not loaded_context.get("timestamps")):
+            messagebox.showwarning("View Required", "Load and review this exact device and date range before approving it.")
+            return
+
         cur_d = from_dt.date()
         end_d = to_dt.date()
         approvals = load_approvals()
@@ -5928,6 +6564,8 @@ class ModbusApp:
                 "to": to_dt.strftime("%Y-%m-%d %H:%M:%S"),
                 "approved_by": self.current_user,
                 "approved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "approved_workstation": platform.node(),
+                "record_count": len(loaded_context.get("timestamps", [])),
                 "notes": f"Approved via View Data ({from_dt.strftime('%H:%M:%S')} to {to_dt.strftime('%H:%M:%S')})"
             }
             if not any(r.get("from") == range_record["from"] and r.get("to") == range_record["to"] for r in ranges):
@@ -5936,7 +6574,9 @@ class ModbusApp:
             count += 1
 
         save_approvals(approvals)
-        self.log_audit("DATA_APPROVAL", "APPROVE", f"Approved data for device '{dev_alias}' from {from_dt} to {to_dt}")
+        self.log_audit("DATA_APPROVAL", "APPROVE", f"Approved data for device '{dev_alias}' from {from_dt} to {to_dt}",
+                       device_info=f"{platform.node()}; device={ip}:{port}; slave={slave_id_part}",
+                       previous_value="VIEWED / DRAFT", updated_value="APPROVED")
         messagebox.showinfo("Success", f"Data for '{dev_alias}' ({from_dt.strftime('%Y-%m-%d')} to {to_dt.strftime('%Y-%m-%d')}) has been APPROVED and moved to 'Approve Data'!")
         self.load_view_data_records()
 
@@ -6061,12 +6701,21 @@ class ModbusApp:
 
         inserted_count = 0
         if pivoted_data:
+            visible_timestamps = []
             for ts in sorted(pivoted_data.keys()):
                 reading_values = [pivoted_data[ts].get(name, "-") for name in register_names]
                 if all(v == "-" or v == "" for v in reading_values):
                     continue
-                self.view_tree.insert("", "end", values=(ts, dev_alias, *reading_values, "DRAFT"))
+                visible_timestamps.append(ts)
+                self.view_tree.insert("", "end", values=(ts, dev_alias, *reading_values, "VIEWED / DRAFT"))
                 inserted_count += 1
+            self.view_loaded_context = {
+                "device": f"{ip}:{port}:{slave_id_part}",
+                "from": from_dt.strftime("%Y-%m-%d %H:%M:%S"),
+                "to": to_dt.strftime("%Y-%m-%d %H:%M:%S"),
+                "timestamps": list(visible_timestamps)
+            }
+            self.record_viewed_records(dev, visible_timestamps)
 
         if inserted_count > 0:
             self.view_status_lbl.config(
@@ -6472,9 +7121,10 @@ class ModbusApp:
                         font=self.FONTS["button"], relief="flat", cursor="hand2", 
                         command=lambda: self.perform_export("pdf")).pack(side="left", fill="x", expand=True, padx=5, ipady=12)
 
-        tk.Label(card, text="Excel files are generated as CSV. PDF reports use high-resolution formatting.", 
+        tk.Label(card, text=f"Excel files are generated as CSV. PDF limit: {MAX_PDF_REGISTERS} registers and {MAX_PDF_RECORDS:,} records per report.",
                  font=("Segoe UI", 7), bg=self.COLORS["bg_surface"], fg=self.COLORS["text_dim"]).pack(pady=15)
 
+    @storage_operation
     def perform_export(self, fmt="excel"):
         # The same exporter is available from both DATA EXPORT and VIEW DATA.
         # Use the controls belonging to the currently displayed screen; widgets
@@ -6566,12 +7216,13 @@ class ModbusApp:
             
             # Pivot the reading data by timestamp
             pivoted_data = {} # {ts_string: {reg_name: val}}
+            pivoted_approval = {}
             
             # Interval Logic
             interval_str = interval_selector.get() if interval_selector is not None else "Raw"
             interval_map = {"1 Min": 60, "5 Min": 300, "15 Min": 900, "30 Min": 1800, "1 Hour": 3600}
             interval_sec = interval_map.get(interval_str, 0)
-            view_approvals = load_approvals() if (exporting_from_view_data or exporting_from_approved) else {}
+            view_approvals = load_approvals()
 
             try:
                 for source_file in all_files:
@@ -6594,6 +7245,8 @@ class ModbusApp:
                                     if interval_sec > 0:
                                         rounded_ts = int(row_dt.timestamp() // interval_sec * interval_sec)
                                         ts = datetime.fromtimestamp(rounded_ts).strftime("%Y-%m-%d %H:%M:%S")
+                                    raw_approved = is_timestamp_approved(view_approvals, ip, port, slave_id_part, row_dt)
+                                    pivoted_approval[ts] = pivoted_approval.get(ts, True) and raw_approved
                                     
                                     reg_addr = str(row[4])
                                     is_lora = ("LORA" in str(dev.get('node_type', '')).upper()) or ("LORA" in str(dev.get('device_name', '')).upper())
@@ -6632,7 +7285,7 @@ class ModbusApp:
                 if pivoted_data:
                     with open(target_file, 'w', newline='') as f_out:
                         writer = csv.writer(f_out)
-                        header = ["Timestamp", "Device Name"] + reg_headers
+                        header = ["Timestamp", "Device Name"] + reg_headers + ["Approval Status"]
                         writer.writerow(header)
                         
                         # Sort by timestamp
@@ -6642,10 +7295,15 @@ class ModbusApp:
                                 row_vals.append(pivoted_data[ts].get(rname, ""))
                             if all(v == "" or v == "-" for v in row_vals[2:]):
                                 continue
+                            row_vals.append("APPROVED" if pivoted_approval.get(ts, False) else "VIEWED / DRAFT")
                             writer.writerow(row_vals)
                     
                     messagebox.showinfo("Success", f"Data pivoted and exported to {target_file}")
-                    self.log_audit("DATA_EXPORT", "EXPORT", f"Exported CSV data for device '{dev_alias}' ({len(pivoted_data)} records)")
+                    approval_values = [pivoted_approval.get(ts, False) for ts in pivoted_data]
+                    export_status = "APPROVED" if approval_values and all(approval_values) else "DRAFT / CONTAINS UNAPPROVED DATA"
+                    self.log_audit("DATA_EXPORT", "EXPORT", f"Exported CSV data for device '{dev_alias}' ({len(pivoted_data)} records)",
+                                   device_info=f"{platform.node()}; device={ip}:{port}; slave={slave_id_part}",
+                                   updated_value=export_status)
                     webbrowser.open(target_file)
                 else:
                     messagebox.showwarning("No Data", "No records found for the range.")
@@ -6655,19 +7313,27 @@ class ModbusApp:
             if not HAS_REPORTLAB:
                 messagebox.showerror("Error", "Feature unavailable: reportlab library not found.")
                 return
+            if len(sorted_regs) > MAX_PDF_REGISTERS:
+                messagebox.showerror(
+                    "PDF Register Limit",
+                    f"A PDF report supports a maximum of {MAX_PDF_REGISTERS} registers. "
+                    f"This device currently has {len(sorted_regs)} configured report registers."
+                )
+                return
             
             target_name = f"Report_{clean_alias}_{datetime.now().strftime('%H%M%S')}.pdf"
             target_file = os.path.join(export_dir, target_name)
             
             # Pivot the reading data for PDF
             pivoted_data = {} # {ts_string: {reg_name: val}}
+            pivoted_approval = {}
             reg_names_only = [dev_names.get(str(r), f"Reg {r}") for r in sorted_regs]
             
             # Interval Logic
             interval_str = interval_selector.get() if interval_selector is not None else "Raw"
             interval_map = {"1 Min": 60, "5 Min": 300, "15 Min": 900, "30 Min": 1800, "1 Hour": 3600}
             interval_sec = interval_map.get(interval_str, 0)
-            view_approvals = load_approvals() if (exporting_from_view_data or exporting_from_approved) else {}
+            view_approvals = load_approvals()
 
             try:
                 for source_file in all_files:
@@ -6690,6 +7356,8 @@ class ModbusApp:
                                     if interval_sec > 0:
                                         rounded_ts = int(row_dt.timestamp() // interval_sec * interval_sec)
                                         ts = datetime.fromtimestamp(rounded_ts).strftime("%Y-%m-%d %H:%M:%S")
+                                    raw_approved = is_timestamp_approved(view_approvals, ip, port, slave_id_part, row_dt)
+                                    pivoted_approval[ts] = pivoted_approval.get(ts, True) and raw_approved
                                     
                                     reg_addr = str(row[4])
                                     is_lora = ("LORA" in str(dev.get('node_type', '')).upper()) or ("LORA" in str(dev.get('device_name', '')).upper())
@@ -6728,6 +7396,13 @@ class ModbusApp:
                 if not pivoted_data:
                     messagebox.showwarning("No Data", "No records found for the range.")
                     return
+                if len(pivoted_data) > MAX_PDF_RECORDS:
+                    messagebox.showerror(
+                        "PDF Record Limit",
+                        f"A single PDF supports a maximum of {MAX_PDF_RECORDS:,} records. "
+                        "Select a smaller date range or a larger time interval."
+                    )
+                    return
 
                 # VIEW DATA uses the controlled data-log layout represented by
                 # the supplied reference PDF.  Keep the graph report for the
@@ -6740,14 +7415,16 @@ class ModbusApp:
                     )
                     report_kind = "Approved Data" if exporting_from_approved else "View Data"
                     messagebox.showinfo("Success", f"{report_kind} PDF log generated: {target_file}")
-                    self.log_audit("DATA_EXPORT", "EXPORT", f"Exported {report_kind} PDF log for device '{dev_alias}' ({len(pivoted_data)} records)")
+                    self.log_audit("DATA_EXPORT", "EXPORT", f"Exported {report_kind} PDF log for device '{dev_alias}' ({len(pivoted_data)} records)",
+                                   device_info=f"{platform.node()}; device={ip}:{port}; slave={slave_id_part}",
+                                   updated_value="FINAL / APPROVED" if exporting_from_approved else "DRAFT")
                     webbrowser.open(target_file)
                     return
 
-                # Check approval status of target device and date range
-                date_str = from_dt.strftime("%Y-%m-%d")
-                app_key = f"{ip}:{port}:{slave_id_part}_{date_str}"
-                is_approved = (load_approvals().get(app_key, {}).get("status") == "APPROVED")
+                # A report is final only when every included system record is
+                # inside an approved range. Mixed reports remain clearly DRAFT.
+                approval_flags = [pivoted_approval.get(timestamp, False) for timestamp in pivoted_data.keys()]
+                is_approved = bool(approval_flags) and all(approval_flags)
 
                 # Generate Optimized PDF
                 c = canvas.Canvas(target_file, pagesize=letter)
@@ -6959,10 +7636,13 @@ class ModbusApp:
 
                 c.save()
                 messagebox.showinfo("Success", f"PDF report generated: {target_file}")
-                self.log_audit("DATA_EXPORT", "EXPORT", f"Exported PDF report for device '{dev_alias}' ({len(sorted_ts)} records)")
+                self.log_audit("DATA_EXPORT", "EXPORT", f"Exported PDF report for device '{dev_alias}' ({len(sorted_ts)} records)",
+                               device_info=f"{platform.node()}; device={ip}:{port}; slave={slave_id_part}",
+                               updated_value="FINAL / APPROVED" if is_approved else "DRAFT")
                 webbrowser.open(target_file)
             except Exception as e: messagebox.showerror("Error", f"PDF Export failed: {e}")
 
+    @storage_operation
     def _generate_view_data_log_pdf(self, target_file, dev, dev_alias, from_dt, to_dt,
                                     pivoted_data, sorted_regs, reg_names_only, dev_units,
                                     force_approved=False):
@@ -8091,6 +8771,7 @@ class ModbusApp:
             self.email_logs_live_tree.insert("", "end", values=row)
             self.email_logs_live_tree.yview_moveto(1)
 
+    @storage_operation
     def export_pdf(self):
         if not HAS_REPORTLAB: messagebox.showerror("Error", "reportlab not found"); return
         
@@ -8271,6 +8952,8 @@ class ModbusApp:
     # CORE LOGIC
     # -------------------------
     def start_device(self, dev):
+        if self.restore_in_progress or self.restart_required:
+            raise RuntimeError("Restart TempTrek before starting monitoring.")
         ip, port, slave = dev['ip'], dev['port'], dev.get('slave_id', 1)
         key = f"{ip}:{port}:{slave}"
         if key in self.device_threads and self.device_threads[key].is_alive(): return
@@ -8284,6 +8967,8 @@ class ModbusApp:
         self.root.after(500, self.refresh_view_if_active)
 
     def start_simulation_device(self, dev):
+        if self.restore_in_progress or self.restart_required:
+            raise RuntimeError("Restart TempTrek before starting monitoring.")
         ip, port, slave = dev['ip'], dev['port'], dev.get('slave_id', 1)
         key = f"{ip}:{port}:{slave}"
         if key in self.device_threads and self.device_threads[key].is_alive(): return
@@ -8318,11 +9003,21 @@ class ModbusApp:
 
     def periodic_refresher(self):
         try:
-            self.check_scheduled_pdf_email()
-        except Exception:
-            pass
-        
-        self.root.after(1000, self.periodic_refresher)
+            errors = []
+            while len(errors) < 20:
+                try:
+                    errors.append(STORAGE_ERRORS.get_nowait())
+                except queue.Empty:
+                    break
+            if errors:
+                messagebox.showerror("Storage error — action required", "\n".join(dict.fromkeys(errors)))
+            if not self.restore_in_progress and not self.restart_required:
+                self.check_scheduled_pdf_email()
+                self.check_automatic_backup()
+        except Exception as exc:
+            messagebox.showerror("Background operation failed", str(exc))
+        finally:
+            self.root.after(1000, self.periodic_refresher)
 
     def log(self, msg):
         ts = datetime.now().strftime("%H:%M:%S")
@@ -8566,7 +9261,7 @@ class ModbusApp:
         bar.pack(side="top", fill="x", pady=10, padx=30)
 
         tk.Label(bar, text="CATEGORY:", font=("Segoe UI", 9, "bold"), fg=self.COLORS["text_dim"], bg=self.COLORS["bg_dark"]).pack(side="left", padx=(0, 5))
-        self.audit_cat_cb = ttk.Combobox(bar, values=["ALL", "AUTHENTICATION", "DEVICE", "ALARM", "USER_MGMT", "EXPORT"], width=15, style="TCombobox", state="readonly")
+        self.audit_cat_cb = ttk.Combobox(bar, values=["ALL", "AUTHENTICATION", "SECURITY", "DATA", "APPROVE", "DEVICE", "ALARM", "EMAIL", "SMS", "USER_MGMT", "CONFIG", "EXPORT", "BACKUP", "RESTORE"], width=15, style="TCombobox", state="readonly")
         self.audit_cat_cb.set("ALL")
         self.audit_cat_cb.pack(side="left", padx=5)
 
@@ -8582,20 +9277,16 @@ class ModbusApp:
         cnt = tk.Frame(self.content_frame, bg=self.COLORS["bg_surface"], highlightbackground=self.COLORS["bg_highlight"], highlightthickness=1)
         cnt.pack(fill="both", expand=True, padx=30, pady=(0, 20))
 
-        cols = ("timestamp", "user", "action", "category", "details")
+        cols = ("timestamp", "user", "workstation", "action", "category", "previous", "updated", "status", "details")
         self.audit_tree = ttk.Treeview(cnt, columns=cols, show="headings", style="Treeview")
-
-        self.audit_tree.heading("timestamp", text="TIMESTAMP")
-        self.audit_tree.heading("user", text="USER")
-        self.audit_tree.heading("action", text="ACTION")
-        self.audit_tree.heading("category", text="CATEGORY")
-        self.audit_tree.heading("details", text="DETAILS")
-
-        self.audit_tree.column("timestamp", width=160, minwidth=140, anchor="center", stretch=False)
-        self.audit_tree.column("user", width=130, minwidth=100, anchor="w", stretch=False)
-        self.audit_tree.column("action", width=150, minwidth=120, anchor="w", stretch=False)
-        self.audit_tree.column("category", width=150, minwidth=120, anchor="w", stretch=False)
-        self.audit_tree.column("details", width=450, minwidth=250, anchor="w", stretch=True)
+        audit_labels = {"timestamp": "TIMESTAMP", "user": "USER", "workstation": "DEVICE / WORKSTATION",
+                        "action": "ACTION", "category": "CATEGORY", "previous": "PREVIOUS VALUE",
+                        "updated": "UPDATED VALUE", "status": "STATUS", "details": "DETAILS"}
+        audit_widths = {"timestamp": 155, "user": 110, "workstation": 200, "action": 150,
+                        "category": 100, "previous": 180, "updated": 180, "status": 90, "details": 320}
+        for column in cols:
+            self.audit_tree.heading(column, text=audit_labels[column])
+            self.audit_tree.column(column, width=audit_widths[column], minwidth=80, anchor="w", stretch=(column == "details"))
 
         v_sb = ttk.Scrollbar(cnt, orient="vertical", command=self.audit_tree.yview, style="Vertical.TScrollbar")
         h_sb = ttk.Scrollbar(cnt, orient="horizontal", command=self.audit_tree.xview, style="Horizontal.TScrollbar")
@@ -8607,6 +9298,7 @@ class ModbusApp:
 
         self.refresh_audit_log_view()
 
+    @storage_operation
     def upload_report_logo(self):
         filepath = filedialog.askopenfilename(
             title="Select Right Header Logo Image for PDF Reports",
@@ -8766,6 +9458,7 @@ class ModbusApp:
             else:
                 self.lbl_logo_status.config(text="Default logo active", fg=self.COLORS["text_dim"])
 
+    @storage_operation
     def upload_company_logo_action(self):
         filepath = filedialog.askopenfilename(
             title="Select Right Header Logo Image for PDF Reports",
@@ -8864,29 +9557,38 @@ class ModbusApp:
                     with open(fn, "r", encoding='utf-8', errors='replace') as f:
                         reader = csv.reader((line.replace('\0', '') for line in f))
                         header = next(reader, None)
+                        previous_hash = ""
                         for row in reader:
-                            if len(row) >= 5:
-                                logs_to_display.append(tuple(row[:5]))
+                            if len(row) >= 10:
+                                values = row[:9]
+                                expected_hash = _audit_hash(previous_hash, values)
+                                if row[9] != expected_hash:
+                                    values[7] = "TAMPER WARNING"
+                                previous_hash = row[9]
+                                logs_to_display.append(tuple(values))
+                            elif len(row) >= 5:
+                                logs_to_display.append((row[0], row[1], "LEGACY", row[2], row[3], "", "", "UNKNOWN", row[4]))
                 except Exception:
                     pass
 
         # Also merge in-memory log entries for entries not yet on disk or fallback
         for entry in list(self.global_audit_log):
-            if entry not in logs_to_display:
-                logs_to_display.append(entry)
+            normalized = tuple(entry[:9]) if len(entry) >= 9 else (entry[0], entry[1], "LEGACY", entry[2], entry[3], "", "", "UNKNOWN", entry[4])
+            if normalized not in logs_to_display:
+                logs_to_display.append(normalized)
 
         # Sort descending by timestamp
         logs_to_display.sort(key=lambda x: x[0], reverse=True)
 
         for entry in logs_to_display:
-            ts, user, action, category, details = entry[0], entry[1], entry[2], entry[3], entry[4]
+            ts, user, workstation, action, category, previous, updated, status, details = entry[:9]
             if cat_filter != "ALL" and category.upper() != cat_filter:
                 continue
             if search_query:
-                combined = f"{ts} {user} {action} {category} {details}".lower()
+                combined = " ".join(str(value) for value in entry[:9]).lower()
                 if search_query not in combined:
                     continue
-            self.audit_tree.insert("", "end", values=(ts, user, action, category, details))
+            self.audit_tree.insert("", "end", values=(ts, user, workstation, action, category, previous, updated, status, details))
 
     def export_audit_log_to_pdf(self):
         if not HAS_REPORTLAB:
@@ -8913,8 +9615,10 @@ class ModbusApp:
             log_records = []
             for item in tree_items:
                 row = self.audit_tree.item(item)['values']
-                if len(row) >= 5:
-                    log_records.append((str(row[0]), str(row[1]), str(row[2]), str(row[3]), str(row[4])))
+                if len(row) >= 9:
+                    detail_text = (f"Status={row[7]}; Device={row[2]}; Previous={row[5]}; "
+                                   f"Updated={row[6]}; Details={row[8]}")
+                    log_records.append((str(row[0]), str(row[1]), str(row[3]), str(row[4]), detail_text))
 
             rows_per_page = 20
             total_pages = max(1, (len(log_records) + rows_per_page - 1) // rows_per_page)
@@ -9075,7 +9779,8 @@ class ModbusApp:
         try:
             with open(target_file, 'w', newline='', encoding='utf-8') as f:
                 writer = csv.writer(f)
-                writer.writerow(["Timestamp", "Username", "Action", "Category", "Details"])
+                writer.writerow(["Timestamp", "Username", "Workstation", "Action", "Category",
+                                 "Previous Value", "Updated Value", "Status", "Details"])
                 for item in self.audit_tree.get_children():
                     row = self.audit_tree.item(item)['values']
                     writer.writerow(row)
@@ -9090,7 +9795,17 @@ class ModbusApp:
 # -------------------------
 def main():
     root = tk.Tk()
-    app = ModbusApp(root)
+    def report_error(kind, value, traceback):
+        messagebox.showerror("Operation failed", str(value), parent=root)
+    root.report_callback_exception = report_error
+    try:
+        if STARTUP_STORAGE_ERROR is not None:
+            raise RuntimeError(f"Restore recovery failed. Original folders have been retained: {STARTUP_STORAGE_ERROR}")
+        app = ModbusApp(root)
+    except Exception as exc:
+        messagebox.showerror("TempTrek could not start", str(exc), parent=root)
+        root.destroy()
+        return
     root.mainloop()
 
 if __name__ == "__main__":

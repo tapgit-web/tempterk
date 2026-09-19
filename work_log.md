@@ -1,5 +1,48 @@
 # TempTrek Environmental Monitoring System v2 - Project Work Log
 
+## Windows packaging (September 8, 2026)
+
+- Built the standalone x64 EXE and native `TempTrek-2.5.1-x64.msi` in `dist`.
+- Added `build_msi.py` and updated `build.bat` to produce both packages with Windows Python 3.12. MSI includes installation/completion UI, an embedded cabinet, shortcuts, uninstall registration, and upgrade metadata.
+- Verified required modules in the EXE and confirmed it reaches first-time setup using isolated application data.
+- MSI administrative extraction returned 0; extracted EXE SHA-256 matches the standalone build. Full system install/uninstall/upgrade remains untested. No signing certificate was applied.
+- Added `BUILDING.md`, distribution instructions, and checksums. No customer data or credentials are included.
+
+## Security and recovery fixes (September 8, 2026)
+
+- Approval startup follow-up: added exact legacy configuration decoding using the key established by the validated company header. Preserves each recovered file as `.legacy-original` and never resets approval history. All 25 tests pass. A separate hidden-window startup check using temporary copies of all 10 actual configuration files passed, retaining all three approval-history entries.
+
+- Startup follow-up: recovered the legacy company header encoded with a different machine key. Added a narrowly scoped company-settings migration that preserves the original as `company_details.json.legacy-original`; genuinely damaged files and account settings still fail closed. All 24 regression tests pass, including three new migration checks.
+
+- Replaced default-account recovery with fail-closed loading and first-run Super Admin password setup. Added salted PBKDF2 hashes, legacy hash upgrades, and mandatory default-password replacement.
+- Moved settings to Windows DPAPI encryption and atomic writes. Corrupt configuration is preserved and reported instead of overwritten with defaults.
+- Added `storage_security.py` and `backup_engine.py`: encrypted portable backups, administrator-owned storage, explicit ACL errors, shared storage/operation locks, pinned restore input, retention-safe safety backups, transactional folder replacement, rollback, and startup recovery.
+- Added a transferred-backup file selector, missing-file history status, backup-password setup, and restart enforcement after restoration stops monitoring.
+- Required verified SMTP TLS on the configured host, with no unverified/plaintext credential fallback.
+- Made CSV/audit write failures visible and preserved audit identity across new portable backups.
+- Retired plaintext export and removed exported application data from installer inputs. Added the encryption dependency to the build and installed it in the current Python environment.
+- Validation: all 21 regression tests passed on Python 3.12, including Windows DPAPI, read-only ACL descriptor generation, isolated hidden-window startup, backup/restore integration, and failure recovery. Actual project data was not restored or migrated during testing.
+- See [security_changes.md](security_changes.md) for setup, compatibility limits, and remaining live-device/SMTP/packaged-EXE checks. Existing legacy backup archives and plaintext exports have not been altered.
+
+## Implementation Update (September 7, 2026)
+
+- Added exact Viewed-record tracking with username, workstation, date/time, first/last view, and complete view history.
+- Required approvers to load and review the exact device/time selection before password-authenticated approval.
+- Added explicit PDF limits of eight registers and 50,000 records.
+- Added approval status to CSV exports and made general/scheduled PDFs DRAFT whenever any included record is unapproved.
+- Added validated, de-duplicated multiple email recipients with a maximum of 50 addresses.
+- Added approval-aware scheduled email reports and detailed success, partial, and failure auditing.
+- Added SMS delivery success/failure events to the main audit trail.
+- Expanded audit records with workstation/device, previous value, updated value, result, details, and chained integrity hashes.
+- Added legacy audit-log migration, tamper detection, read-only protection, and operating-system user access restrictions where supported.
+- Added automatic and manual ZIP backups containing configuration, readings, approvals, viewed history, users, notification settings, audit logs, reports, and backup history.
+- Added configurable backup interval, local destination, maximum backup count, and maximum storage allocation.
+- Added backup status/error reporting, manifest metadata, integrity checking, retention, and history display.
+- Added password-authorized restore with archive validation, safe extraction checks, mandatory pre-restore backup, polling shutdown, detailed summary, and audit records.
+- Reorganized navigation into Data, Reports / PDF, Notifications, and Administration sections.
+- Updated `feature_verification_report.md` with the implemented functionality and required release tests.
+- Python AST syntax validation and a headless module-import smoke test passed for the updated `2.py` source.
+
 ## Project Summary
 * **Last Code Modification Date:** June 12, 2026
 * **Latest Runtime Activity Date:** June 12, 2026 (Active app execution)
