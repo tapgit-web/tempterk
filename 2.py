@@ -1,3 +1,5 @@
+from graph_format import channel_precision, graph_precision
+from date_display import display_dates
 import time
 import math
 import base64
@@ -51,6 +53,7 @@ import zipfile
 import getpass
 import io
 from backup_engine import BackupMixin
+from password_policy import password_changed_at, password_expired, password_expiry_label, PASSWORD_EXPIRY_OPTIONS
 import queue
 from pathlib import Path
 from storage_security import (
@@ -207,7 +210,7 @@ BACKUP_HISTORY_FILE = os.path.join(DATA_PATH, "config", "backup_history.json")
 
 # Explicit, validated application limits. These values keep generated reports
 # readable and prevent a single operation from exhausting the workstation.
-MAX_PDF_REGISTERS = 8
+MAX_PDF_REGISTERS = 10
 MAX_PDF_RECORDS = 50000
 MAX_EMAIL_RECIPIENTS = 50
 AUDIT_WRITE_LOCK = threading.Lock()
@@ -447,9 +450,9 @@ def load_users():
         if os.path.exists(os.path.join(DATA_PATH, ".accounts-initialized")) or any(
                 os.path.exists(p) for p in (CONFIG_FILE, EMAIL_CONFIG_FILE, SMS_CONFIG_FILE)):
             raise RuntimeError("User database is missing. Restore a valid backup; automatic account reset is disabled.")
-        password = simpledialog.askstring("First-time setup", "Create the Super Admin password (at least 12 characters):", show="*")
-        if password is None or len(password) < 12:
-            raise RuntimeError("Initial administrator setup requires a password of at least 12 characters.")
+        password = simpledialog.askstring("First-time setup", "Create the Super Admin password (at least 6 characters):", show="*")
+        if password is None or len(password) < 6:
+            raise RuntimeError("Initial administrator setup requires a password of at least 6 characters.")
         confirmation = simpledialog.askstring("Confirm password", "Re-enter the new Super Admin password:", show="*")
         if confirmation != password:
             raise RuntimeError("Passwords did not match. No account was created.")
@@ -461,9 +464,16 @@ def load_users():
         users = load_secure_json(USERS_FILE, {})
     if not users or not any(u.get("is_superadmin") for u in users.values() if isinstance(u, dict)):
         raise RuntimeError("Invalid user database: no Super Admin. Restore a valid backup.")
+    migrated = False
     for name, user in users.items():
         if not isinstance(user, dict) or not isinstance(user.get("password"), str) or not isinstance(user.get("permissions"), list):
             raise RuntimeError(f"Invalid account configuration for {name}.")
+        if "password_changed_at" not in user:
+            # Existing installations get one full lifetime on first upgrade.
+            user["password_changed_at"] = password_changed_at()
+            migrated = True
+    if migrated:
+        save_users(users)
     atomic_write(os.path.join(DATA_PATH, ".accounts-initialized"), "initialized")
     return users
 
@@ -842,6 +852,8 @@ def read_modbus_device(host, port, registers, app, stop_event, unit_id=1, refres
 
     while not stop_event.is_set():
         with lock:
+            if stop_event.is_set():
+                break
             try:
                 # Ensure connection is active
                 is_connected = False
@@ -855,7 +867,7 @@ def read_modbus_device(host, port, registers, app, stop_event, unit_id=1, refres
                     if not client.connect():
                         log_ui(f"Connection Failed ❌")
                         # Skip this poll cycle if connection fails
-                        time.sleep(2)
+                        stop_event.wait(2)
                         continue
                 
                 # One-time log upon successful connection for this thread's visibility
@@ -863,6 +875,8 @@ def read_modbus_device(host, port, registers, app, stop_event, unit_id=1, refres
                     log_ui(f"Connected ✔")
                     stop_event.first_run = False
                 for reg in registers:
+                    if stop_event.is_set():
+                        break
                     try:
                         # Find correct data type for this specific device and register
                         dt = "INT32"
@@ -897,6 +911,8 @@ def read_modbus_device(host, port, registers, app, stop_event, unit_id=1, refres
                         else:
                             result = client.read_input_registers(address=reg_num, count=count_to_read, **kwargs)
 
+                        if stop_event.is_set():
+                            break
                         if result is None:
                             log_ui(f"TIMEOUT @ {reg}")
                             log_ui(f"Reg {reg} \u2192 0")
@@ -1075,6 +1091,8 @@ def read_dummy_device(host, port, registers, app, stop_event, unit_id=1, refresh
     while not stop_event.is_set():
         try:
             for reg in registers:
+                if stop_event.is_set():
+                    break
                 prec = 3
                 dt = "FLOAT32"
                 target_dev = None
@@ -1254,6 +1272,7 @@ class ModbusApp(BackupMixin):
 
         self.devices = load_devices()
         self.device_threads = {}
+        self.device_modes = {}
         self.stop_events = {}
         self.global_log = []
         self.live_labels = {}
@@ -1341,7 +1360,7 @@ class ModbusApp(BackupMixin):
     def _append_audit_live(self, entry):
         try:
             if hasattr(self, 'audit_tree') and self.audit_tree and self.audit_tree.winfo_exists():
-                self.audit_tree.insert("", 0, values=entry[:9])
+                self.audit_tree.insert("", 0, values=display_dates(entry[:9]))
         except Exception:
             pass
 
@@ -1488,7 +1507,7 @@ class ModbusApp(BackupMixin):
         except Exception as exc:
             if "old_settings" in locals():
                 self.backup_settings = old_settings
-            messagebox.showerror("Invalid Backup Settings", str(exc))
+            messagebox.showerror("Invalid Backup Settings", display_dates(str(exc)))
 
     def refresh_backup_view(self):
         if hasattr(self, "backup_status_label") and self.backup_status_label.winfo_exists():
@@ -1499,7 +1518,7 @@ class ModbusApp(BackupMixin):
             if error:
                 status_text += f"   |   ERROR: {error}"
             color = self.COLORS["success"] if status == "SUCCESS" else (self.COLORS["danger"] if status == "FAILED" else self.COLORS["warning"])
-            self.backup_status_label.config(text=status_text, fg=color)
+            self.backup_status_label.config(text=display_dates(status_text), fg=color)
         if hasattr(self, "backup_progress") and self.backup_progress.winfo_exists() and not self.backup_in_progress:
             self.backup_progress.stop()
         if not hasattr(self, "backup_tree") or not self.backup_tree.winfo_exists():
@@ -1537,12 +1556,12 @@ class ModbusApp(BackupMixin):
             if row.get("status") == "SUCCESS" and not os.path.isfile(row.get("location", "")):
                 row = dict(row, status="MISSING")
             size_mb = float(row.get("size", 0)) / (1024 * 1024)
-            self.backup_tree.insert("", "end", values=(
+            self.backup_tree.insert("", "end", values=display_dates((
                 row.get("type", ""), row.get("file_name", ""), row.get("date_time", ""),
                 f"{size_mb:.2f} MB", row.get("status", ""),
                 row.get("includes", "Recorded data, configuration, users, notifications, approvals, audit" if row.get("status") == "SUCCESS" else "Not available"),
                 row.get("location", "")
-            ))
+            )))
 
     def show_backup_restore(self):
         user_perms = self.users.get(self.current_user, {}).get("permissions", [])
@@ -1726,7 +1745,7 @@ class ModbusApp(BackupMixin):
         hwid = get_hwid()
         hwid_box = tk.Frame(card, bg=self.COLORS["bg_dark"], padx=15, pady=10)
         hwid_box.pack(fill="x", pady=(0, 20))
-        tk.Label(hwid_box, text=f"DEVICE HWID: {hwid}", font=self.FONTS["code"], 
+        tk.Label(hwid_box, text=display_dates(f"DEVICE HWID: {hwid}"), font=self.FONTS["code"], 
                  bg=self.COLORS["bg_dark"], fg=self.COLORS["accent"]).pack()
 
         tk.Label(card, text="ENTER LICENSE KEY", font=self.FONTS["body"], 
@@ -1761,7 +1780,7 @@ class ModbusApp(BackupMixin):
                     messagebox.showerror("Error", "Failed to save local license cache.")
                     btn.config(text="ACTIVATE SYSTEM", state="normal")
             else:
-                messagebox.showerror("Activation Failed", f"{server_msg}")
+                messagebox.showerror("Activation Failed", display_dates(f"{server_msg}"))
                 btn.config(text="ACTIVATE SYSTEM", state="normal")
 
         btn = tk.Button(card, text="ACTIVATE SYSTEM", bg=self.COLORS["accent"], fg="black", 
@@ -1897,7 +1916,14 @@ class ModbusApp(BackupMixin):
         
         if username in self.users:
             if verify_password(password, self.users[username]["password"]):
-                if not self.users[username]["password"].startswith("pbkdf2_sha256$"):
+                if password_expired(self.users[username]):
+                    self.log_audit("PASSWORD_EXPIRED", "AUTHENTICATION", "Password change required before sign-in", user=username)
+                    if not self.renew_expired_password(username, password):
+                        self.pass_entry.delete(0, tk.END)
+                        self.lbl_error.config(text="PASSWORD EXPIRED: CHANGE REQUIRED TO SIGN IN")
+                        return
+                    password = None  # The replacement hash is already persisted.
+                if password is not None and not self.users[username]["password"].startswith("pbkdf2_sha256$"):
                     self.users[username]["password"] = hash_password(password)
                     save_users(self.users)
                 self.current_user = username
@@ -1911,6 +1937,30 @@ class ModbusApp(BackupMixin):
             self.log_audit("LOGIN_FAILED", "AUTHENTICATION", f"Failed login attempt for unknown user '{username.upper()}'", user=username)
             self.lbl_error.config(text="ACCESS DENIED: UNKNOWN USER")
             self.pass_entry.delete(0, tk.END)
+
+    def renew_expired_password(self, username, old_password):
+        while True:
+            new = simpledialog.askstring("Password expired", "Your password has expired. Enter a different password (at least 6 characters):", show="*", parent=self.root)
+            if new is None:
+                return False
+            if len(new) < 6 or new == old_password:
+                messagebox.showerror("Password expired", "Use a different password with at least 6 characters.", parent=self.root)
+                continue
+            confirmation = simpledialog.askstring("Confirm new password", "Re-enter your new password:", show="*", parent=self.root)
+            if confirmation is None:
+                return False
+            if confirmation != new:
+                messagebox.showerror("Password expired", "Passwords do not match.", parent=self.root)
+                continue
+            updated = {**self.users, username: {**self.users[username], "password": hash_password(new), "password_changed_at": password_changed_at()}}
+            try:
+                save_users(updated)
+            except Exception as exc:
+                messagebox.showerror("Password expired", display_dates(f"Could not save password: {exc}"), parent=self.root)
+                return False
+            self.users = updated
+            self.log_audit("PASSWORD_CHANGE", "AUTHENTICATION", "Expired password replaced", user=username)
+            return True
 
     # -------------------------
     # 3. MAIN UI
@@ -1956,12 +2006,14 @@ class ModbusApp(BackupMixin):
         if "live_log" in user_perms:
             self.create_nav_item("live_log", "Live Log")
 
-        if "view_data" in user_perms or "approve_data" in user_perms:
-            self.create_nav_header("DATA")
+        if any(p in user_perms for p in ("view_data", "approve_data", "audit_log")):
+            self.create_nav_header("FDA 21 CFR")
             if "view_data" in user_perms:
                 self.create_nav_item("view_data", "View Data", indent=True)
             if "approve_data" in user_perms:
                 self.create_nav_item("approve_data", "Approved Data", indent=True)
+            if "audit_log" in user_perms:
+                self.create_nav_item("audit_log", "Audit Log", indent=True)
 
         if "export_data" in user_perms or "data_trends" in user_perms:
             self.create_nav_header("REPORTS / PDF")
@@ -1977,7 +2029,7 @@ class ModbusApp(BackupMixin):
             if "sms_config" in user_perms:
                 self.create_nav_item("sms_config", "SMS Alert", indent=True)
 
-        admin_perms = ["add_device", "user_manager", "company_details", "audit_log", "backup_restore"]
+        admin_perms = ["add_device", "user_manager", "company_details", "backup_restore"]
         if any(p in user_perms for p in admin_perms):
             self.create_nav_header("ADMINISTRATION")
             if "add_device" in user_perms and is_superadmin:
@@ -1986,8 +2038,6 @@ class ModbusApp(BackupMixin):
                 self.create_nav_item("user_manager", "System Users", indent=True)
             if "company_details" in user_perms:
                 self.create_nav_item("company_details", "Company Details", indent=True)
-            if "audit_log" in user_perms:
-                self.create_nav_item("audit_log", "Audit Log", indent=True)
             if "backup_restore" in user_perms:
                 self.create_nav_item("backup_restore", "Backup & Restore", indent=True)
 
@@ -2001,7 +2051,7 @@ class ModbusApp(BackupMixin):
         
         status_dot = tk.Label(status_frame, text="●", fg=self.COLORS["success"], bg=self.COLORS["bg_surface"])
         status_dot.pack(side="left")
-        tk.Label(status_frame, text=self.current_user.upper(), font=("Segoe UI", 8, "bold"), 
+        tk.Label(status_frame, text=display_dates(self.current_user.upper()), font=("Segoe UI", 8, "bold"), 
                  fg=self.COLORS["text_dim"], bg=self.COLORS["bg_surface"]).pack(side="left", padx=(5, 0))
 
         tk.Button(footer, text="↪ LOGOUT", font=("Segoe UI", 8, "bold"), fg=self.COLORS["danger"],
@@ -2049,7 +2099,7 @@ class ModbusApp(BackupMixin):
     def create_nav_header(self, text):
         header_frame = tk.Frame(self.nav_container, bg=self.COLORS["bg_surface"])
         header_frame.pack(fill="x", padx=20, pady=(15, 6))
-        lbl = tk.Label(header_frame, text=text, font=("Segoe UI", 8, "bold"), 
+        lbl = tk.Label(header_frame, text=display_dates(text), font=("Segoe UI", 8, "bold"), 
                        fg=self.COLORS["accent"], bg=self.COLORS["bg_surface"], anchor="w")
         lbl.pack(side="left")
         sep = tk.Frame(header_frame, bg=self.COLORS["bg_highlight"], height=1)
@@ -2199,7 +2249,7 @@ class ModbusApp(BackupMixin):
             "backup_restore": "DATA BACKUP & RESTORE",
             "change_password": "CHANGE PASSWORD"
         }
-        self.view_title.config(text=titles.get(view_name, ""))
+        self.view_title.config(text=display_dates(titles.get(view_name, "")))
 
         for widget in self.content_frame.winfo_children():
             widget.destroy()
@@ -2253,11 +2303,11 @@ class ModbusApp(BackupMixin):
         card.pack(fill="x", padx=30, pady=20)
         tk.Label(card, text="Change your password", font=self.FONTS["h2"],
                  bg=self.COLORS["bg_surface"], fg=self.COLORS["text_main"]).pack(anchor="w")
-        tk.Label(card, text="Use at least 12 characters for your new password.",
+        tk.Label(card, text=display_dates("Use at least 6 characters. Password expires: " + password_expiry_label(self.users[self.current_user])),
                  bg=self.COLORS["bg_surface"], fg=self.COLORS["text_dim"]).pack(anchor="w", pady=(5, 15))
         entries = []
         for label in ("Current password", "New password", "Confirm new password"):
-            tk.Label(card, text=label, font=self.FONTS["body"],
+            tk.Label(card, text=display_dates(label), font=self.FONTS["body"],
                      bg=self.COLORS["bg_surface"], fg=self.COLORS["text_dim"]).pack(anchor="w")
             entry = tk.Entry(card, show="*", font=self.FONTS["body"], width=35)
             entry.pack(anchor="w", pady=(5, 15), ipady=6)
@@ -2273,8 +2323,8 @@ class ModbusApp(BackupMixin):
                 entries[0].delete(0, tk.END)
                 entries[0].focus()
                 return
-            if len(new) < 12:
-                messagebox.showerror("Change Password", "Use a new password of at least 12 characters.")
+            if len(new) < 6:
+                messagebox.showerror("Change Password", "Use a new password of at least 6 characters.")
                 return
             if new != confirmation:
                 messagebox.showerror("Change Password", "New passwords do not match.")
@@ -2283,16 +2333,17 @@ class ModbusApp(BackupMixin):
                 messagebox.showerror("Change Password", "Choose a password different from your current password.")
                 return
             try:
-                updated_users = {**self.users, self.current_user: {**user, "password": hash_password(new)}}
+                updated_users = {**self.users, self.current_user: {**user, "password": hash_password(new), "password_changed_at": password_changed_at()}}
                 save_users(updated_users)
             except Exception as exc:
-                messagebox.showerror("Change Password", f"Could not save your password: {exc}")
+                messagebox.showerror("Change Password", display_dates(f"Could not save your password: {exc}"))
                 return
             self.users = updated_users
             for entry in entries:
                 entry.delete(0, tk.END)
             self.log_audit("PASSWORD_CHANGE", "AUTHENTICATION", "User changed their own password")
             messagebox.showinfo("Change Password", "Your password has been changed successfully.")
+            self.navigate("change_password")
 
         tk.Button(card, text="CHANGE PASSWORD", command=save_password,
                   bg=self.COLORS["accent"], fg="white", font=self.FONTS["button"],
@@ -2320,7 +2371,7 @@ class ModbusApp(BackupMixin):
                  fg=self.COLORS["text_dim"], bg=self.COLORS["bg_surface"]).pack(side="left")
         
         status_text = f"{active_nodes} / {total_nodes} NODES ONLINE"
-        tk.Label(status_frame, text=status_text, font=("Segoe UI", 10, "bold"), 
+        tk.Label(status_frame, text=display_dates(status_text), font=("Segoe UI", 10, "bold"), 
                  fg=self.COLORS["accent"] if active_nodes > 0 else self.COLORS["text_dim"], 
                  bg=self.COLORS["bg_surface"], padx=10).pack(side="left")
 
@@ -2518,18 +2569,20 @@ class ModbusApp(BackupMixin):
         def trend_dt_selector(label, initial_dt, parent):
             f = tk.Frame(parent, bg=self.COLORS["bg_surface"])
             f.pack(side="left", padx=(0, 20))
-            tk.Label(f, text=label, font=("Segoe UI", 7, "bold"), bg=self.COLORS["bg_surface"], fg=self.COLORS["text_dim"]).pack(side="left", padx=5)
+            tk.Label(f, text=display_dates(label), font=("Segoe UI", 7, "bold"), bg=self.COLORS["bg_surface"], fg=self.COLORS["text_dim"]).pack(side="left", padx=5)
             
-            years = [str(y) for y in range(2024, 2031)]
+            years = [f"{y % 100:02d}" for y in range(2024, 2031)]
             months = [f"{i:02d}" for i in range(1, 13)]
             days = [f"{i:02d}" for i in range(1, 32)]
             hours = [f"{i:02d}" for i in range(0, 24)]
             minutes = [f"{i:02d}" for i in range(0, 60)]
             
             sel = {}
-            sel['y'] = ttk.Combobox(f, values=years, width=5, font=("Consolas", 9)); sel['y'].set(initial_dt.strftime("%Y")); sel['y'].pack(side="left")
-            sel['m'] = ttk.Combobox(f, values=months, width=3, font=("Consolas", 9)); sel['m'].set(initial_dt.strftime("%m")); sel['m'].pack(side="left", padx=2)
             sel['d'] = ttk.Combobox(f, values=days, width=3, font=("Consolas", 9)); sel['d'].set(initial_dt.strftime("%d")); sel['d'].pack(side="left")
+            tk.Label(f, text="-", bg=self.COLORS["bg_surface"]).pack(side="left")
+            sel['m'] = ttk.Combobox(f, values=months, width=3, font=("Consolas", 9)); sel['m'].set(initial_dt.strftime("%m")); sel['m'].pack(side="left", padx=2)
+            tk.Label(f, text="-", bg=self.COLORS["bg_surface"]).pack(side="left")
+            sel['y'] = ttk.Combobox(f, values=years, width=5, font=("Consolas", 9)); sel['y'].set(initial_dt.strftime("%y")); sel['y'].pack(side="left")
             tk.Label(f, text="@", bg=self.COLORS["bg_surface"], fg=self.COLORS["text_dim"]).pack(side="left", padx=2)
             sel['h'] = ttk.Combobox(f, values=hours, width=3, font=("Consolas", 9)); sel['h'].set(initial_dt.strftime("%H")); sel['h'].pack(side="left")
             tk.Label(f, text=":", bg=self.COLORS["bg_surface"], fg=self.COLORS["text_dim"]).pack(side="left")
@@ -2745,17 +2798,17 @@ class ModbusApp(BackupMixin):
             
             # Parse From/To range for Filtering
             try:
-                f_dt = datetime.strptime(f"{self.trend_from_dt['y'].get()}-{self.trend_from_dt['m'].get()}-{self.trend_from_dt['d'].get()} {self.trend_from_dt['h'].get()}:{self.trend_from_dt['min'].get()}:00", "%Y-%m-%d %H:%M:%S")
-                t_dt = datetime.strptime(f"{self.trend_to_dt['y'].get()}-{self.trend_to_dt['m'].get()}-{self.trend_to_dt['d'].get()} {self.trend_to_dt['h'].get()}:{self.trend_to_dt['min'].get()}:59", "%Y-%m-%d %H:%M:%S")
+                f_dt = datetime.strptime(f"20{self.trend_from_dt['y'].get()}-{self.trend_from_dt['m'].get()}-{self.trend_from_dt['d'].get()} {self.trend_from_dt['h'].get()}:{self.trend_from_dt['min'].get()}:00", "%Y-%m-%d %H:%M:%S")
+                t_dt = datetime.strptime(f"20{self.trend_to_dt['y'].get()}-{self.trend_to_dt['m'].get()}-{self.trend_to_dt['d'].get()} {self.trend_to_dt['h'].get()}:{self.trend_to_dt['min'].get()}:59", "%Y-%m-%d %H:%M:%S")
             except: 
                 f_dt, t_dt = datetime.min, datetime.max
 
             # Header
             c.setFillColorRGB(0.0, 0.36, 0.72); c.setFont("Helvetica-Bold", 18)
-            c.drawString(40, h-50, self.company_details.get("company_name", "TempTrek Environmental Monitoring System"))
+            c.drawString(40, h-50, display_dates(self.company_details.get("company_name", "TempTrek Environmental Monitoring System")))
             c.setFont("Helvetica", 9); c.setFillColorRGB(0.5, 0.5, 0.5)
-            c.drawString(40, h-70, f"DEVICE: {d_alias} | EXPORTED: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-            c.drawString(40, h-85, f"RANGE: {f_dt.strftime('%Y-%m-%d %H:%M')} TO {t_dt.strftime('%Y-%m-%d %H:%M')}")
+            c.drawString(40, h-70, display_dates(f"DEVICE: {d_alias} | EXPORTED: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"))
+            c.drawString(40, h-85, display_dates(f"RANGE: {f_dt.strftime('%Y-%m-%d %H:%M')} TO {t_dt.strftime('%Y-%m-%d %H:%M')}"))
             c.line(40, h-95, w-40, h-95)
 
             # --- DRAW GRAPH PREVIEW ---
@@ -2795,8 +2848,8 @@ class ModbusApp(BackupMixin):
                     py = gy + 40 + (i * plot_h / 5)
                     c.setStrokeColorRGB(0.85, 0.85, 0.85)
                     c.line(gx+60, py, gx+60+plot_w, py)
-                    prec = 2 # Fixed precision for Y-axis labels
-                    c.drawString(gx+15, py-2, f"{tick_val:.{prec}f}")
+                    prec = graph_precision(self.devices, [s[0] for s in all_series], self.trend_settings.get("decimal_places", 3))
+                    c.drawString(gx+15, py-2, display_dates(f"{tick_val:.{prec}f}"))
 
                 # Draw Visual Limits (Dashed Lines)
                 try:
@@ -2810,7 +2863,7 @@ class ModbusApp(BackupMixin):
                         if gy+40 <= ly <= gy+gh-30:
                             c.setStrokeColorRGB(0.83, 0.18, 0.18); c.setDash(3, 3)
                             c.line(gx+60, ly, gx+60+plot_w, ly)
-                            c.drawString(gx+60+plot_w+5, ly-2, f"LOW: {lv}")
+                            c.drawString(gx+60+plot_w+5, ly-2, display_dates(f"LOW: {lv}"))
                             c.setDash([])
                     if h_limit and v_cond in ["Both Limits", "Upper Limit Only"]:
                         hv = float(h_limit)
@@ -2818,7 +2871,7 @@ class ModbusApp(BackupMixin):
                         if gy+40 <= hy <= gy+gh-30:
                             c.setStrokeColorRGB(0.8, 0.2, 0.0); c.setDash(3, 3)
                             c.line(gx+60, hy, gx+60+plot_w, hy)
-                            c.drawString(gx+60+plot_w+5, hy-2, f"UPPER: {hv}")
+                            c.drawString(gx+60+plot_w+5, hy-2, display_dates(f"UPPER: {hv}"))
                             c.setDash([])
                 except: pass
 
@@ -2879,7 +2932,7 @@ class ModbusApp(BackupMixin):
                     ly_leg = gy + gh - 50 - (idx * 15)
                     c.setFillColorRGB(r_col, g_col, b_col); c.rect(gx + gw - 140, ly_leg, 8, 8, fill=1, stroke=0)
                     c.setFillColorRGB(0.2, 0.2, 0.2); c.setFont("Helvetica-Bold", 8)
-                    c.drawString(gx + gw - 125, ly_leg + 1, leg_name.upper())
+                    c.drawString(gx + gw - 125, ly_leg + 1, display_dates(leg_name.upper()))
             
             # --- DATA LOG TABLE ---
             curr_y = gy - 40
@@ -2891,7 +2944,7 @@ class ModbusApp(BackupMixin):
             c.setFont("Helvetica-Bold", f_size)
             c.drawString(40, curr_y, "TIMESTAMP")
             for i, rname in enumerate(reg_names): # Removed limit for width
-                c.drawString(180 + (i*col_spacing), curr_y, rname.upper())
+                c.drawString(180 + (i*col_spacing), curr_y, display_dates(rname.upper()))
             
             curr_y -= 35
             c.line(40, curr_y+20, w-40, curr_y+20)
@@ -2973,7 +3026,7 @@ class ModbusApp(BackupMixin):
                         c.setFillColorRGB(0.1, 0.1, 0.1); c.setFont("Helvetica-Bold", f_size)
                         c.drawString(40, curr_y, "TIMESTAMP")
                         for i, rname in enumerate(reg_names):
-                            c.drawString(180 + (i*col_spacing), curr_y, rname.upper())
+                            c.drawString(180 + (i*col_spacing), curr_y, display_dates(rname.upper()))
                         curr_y -= 35
                         c.line(40, curr_y+20, w-40, curr_y+20)
                         c.setFont("Helvetica", f_size)
@@ -3004,7 +3057,7 @@ class ModbusApp(BackupMixin):
                         c.setFillColorRGB(0.3, 0.3, 0.3)
                         c.setFont("Helvetica", f_size)
 
-                    c.drawString(40, curr_y, ts)
+                    c.drawString(40, curr_y, display_dates(ts))
 
                     if not row_has_alert:
                         c.setFillColorRGB(0.1, 0.1, 0.1)
@@ -3025,7 +3078,7 @@ class ModbusApp(BackupMixin):
                                         fv = float(v)
                                         v = "---" if (math.isnan(fv) or math.isinf(fv)) else f"{fv:.{prec}f}"
                                 except: pass
-                        c.drawString(180 + (i*col_spacing), curr_y, v)
+                        c.drawString(180 + (i*col_spacing), curr_y, display_dates(v))
                     curr_y -= 15
                     rows_found += 1
 
@@ -3034,11 +3087,11 @@ class ModbusApp(BackupMixin):
 
             c.save()
             self.log_audit("TREND_EXPORT", "EXPORT", f"Exported trend report PDF for device '{clean_alias}' ({rows_found} records)")
-            messagebox.showinfo("Success", f"Trend report saved to {target_file}")
+            messagebox.showinfo("Success", display_dates(f"Trend report saved to {target_file}"))
             webbrowser.open(target_file)
             
         except Exception as e:
-            messagebox.showerror("Error", f"PDF Export failed: {e}")
+            messagebox.showerror("Error", display_dates(f"PDF Export failed: {e}"))
 
     def sync_trend_history(self):
         # Auto-save limits
@@ -3053,8 +3106,8 @@ class ModbusApp(BackupMixin):
         
         # Parse From/To range
         try:
-            f_dt = datetime.strptime(f"{self.trend_from_dt['y'].get()}-{self.trend_from_dt['m'].get()}-{self.trend_from_dt['d'].get()} {self.trend_from_dt['h'].get()}:{self.trend_from_dt['min'].get()}:00", "%Y-%m-%d %H:%M:%S")
-            t_dt = datetime.strptime(f"{self.trend_to_dt['y'].get()}-{self.trend_to_dt['m'].get()}-{self.trend_to_dt['d'].get()} {self.trend_to_dt['h'].get()}:{self.trend_to_dt['min'].get()}:59", "%Y-%m-%d %H:%M:%S")
+            f_dt = datetime.strptime(f"20{self.trend_from_dt['y'].get()}-{self.trend_from_dt['m'].get()}-{self.trend_from_dt['d'].get()} {self.trend_from_dt['h'].get()}:{self.trend_from_dt['min'].get()}:00", "%Y-%m-%d %H:%M:%S")
+            t_dt = datetime.strptime(f"20{self.trend_to_dt['y'].get()}-{self.trend_to_dt['m'].get()}-{self.trend_to_dt['d'].get()} {self.trend_to_dt['h'].get()}:{self.trend_to_dt['min'].get()}:59", "%Y-%m-%d %H:%M:%S")
         except: 
             f_dt, t_dt = datetime.min, datetime.max
 
@@ -3246,7 +3299,7 @@ class ModbusApp(BackupMixin):
                 continue
                 
             tag = ("alert_row",) if has_alert else ()
-            self.trend_tree.insert("", "end", values=row_vals, tags=tag)
+            self.trend_tree.insert("", "end", values=display_dates(row_vals), tags=tag)
 
     def draw_large_graph(self, lids):
         if self.active_view != "data_trends" or not hasattr(self, 'large_graph_canvas'): return
@@ -3292,8 +3345,8 @@ class ModbusApp(BackupMixin):
             val = glob_min + (i * val_range / 10)
             y = h - padding_tb - (i * usable_h / 10)
             self.large_graph_canvas.create_line(padding_l, y, w-padding_r, y, fill=self.COLORS["bg_highlight"], width=1)
-            prec = int(self.trend_settings.get("decimal_places", 3))
-            self.large_graph_canvas.create_text(padding_l-15, y, text=f"{val:.{prec}f}", fill=self.COLORS["text_dim"], anchor="e", font=("Consolas", 8))
+            prec = graph_precision(self.devices, [s[0] for s in all_series], self.trend_settings.get("decimal_places", 3))
+            self.large_graph_canvas.create_text(padding_l-15, y, text=display_dates(f"{val:.{prec}f}"), fill=self.COLORS["text_dim"], anchor="e", font=("Consolas", 8))
 
         # Colors for multiple lines
         palette = ["#D32F2F", "#28A745", "#4285F4", "#F29900", "#6F42C1", "#E83E8C", "#20C997", "#FD7E14"]
@@ -3305,7 +3358,7 @@ class ModbusApp(BackupMixin):
             for i in range(0, max_len, step):
                 x = padding_l + (i * usable_w / (max_len - 1))
                 ts_str = trend_ts[i].split(" ")[1][:5] # Show HH:MM
-                self.large_graph_canvas.create_text(x, h - padding_tb + 20, text=ts_str, fill=self.COLORS["text_dim"], font=("Segoe UI", 8))
+                self.large_graph_canvas.create_text(x, h - padding_tb + 20, text=display_dates(ts_str), fill=self.COLORS["text_dim"], font=("Segoe UI", 8))
                 self.large_graph_canvas.create_line(x, h - padding_tb, x, h - padding_tb + 5, fill=self.COLORS["text_dim"])
 
         # Draw Lines
@@ -3331,7 +3384,7 @@ class ModbusApp(BackupMixin):
             reg_addr = parts[3] if len(parts) >= 4 else str(lid).split(":")[-1]
             display_name = getattr(self, 'trend_addr_to_name', {}).get(reg_addr, f"REG {reg_addr}")
             self.large_graph_canvas.create_rectangle(w-padding_r+30, legend_y, w-padding_r+45, legend_y+15, fill=color, outline="")
-            self.large_graph_canvas.create_text(w-padding_r+55, legend_y+7, text=display_name.upper(), anchor="w", fill=self.COLORS["text_main"], font=("Segoe UI", 9, "bold"))
+            self.large_graph_canvas.create_text(w-padding_r+55, legend_y+7, text=display_dates(display_name.upper()), anchor="w", fill=self.COLORS["text_main"], font=("Segoe UI", 9, "bold"))
             legend_y += 25
 
         # Updated Crosshair for multiple series
@@ -3381,13 +3434,13 @@ class ModbusApp(BackupMixin):
                 ly = h - padding_tb - ((l_val - glob_min) * usable_h / val_range)
                 if padding_tb <= ly <= h - padding_tb:
                     self.large_graph_canvas.create_line(padding_l, ly, w-padding_r, ly, fill="#D32F2F", width=2, dash=(4, 4))
-                    self.large_graph_canvas.create_text(w-padding_r+10, ly, text=f"LOW: {l_val}", fill="#D32F2F", anchor="w", font=("Segoe UI", 8, "bold"))
+                    self.large_graph_canvas.create_text(w-padding_r+10, ly, text=display_dates(f"LOW: {l_val}"), fill="#D32F2F", anchor="w", font=("Segoe UI", 8, "bold"))
             
             if h_val is not None:
                 hy = h - padding_tb - ((h_val - glob_min) * usable_h / val_range)
                 if padding_tb <= hy <= h - padding_tb:
                     self.large_graph_canvas.create_line(padding_l, hy, w-padding_r, hy, fill="#D35400", width=2, dash=(4, 4))
-                    self.large_graph_canvas.create_text(w-padding_r+10, hy, text=f"UPPER: {h_val}", fill="#D35400", anchor="w", font=("Segoe UI", 8, "bold"))
+                    self.large_graph_canvas.create_text(w-padding_r+10, hy, text=display_dates(f"UPPER: {h_val}"), fill="#D35400", anchor="w", font=("Segoe UI", 8, "bold"))
                     
         except: pass
 
@@ -3441,8 +3494,8 @@ class ModbusApp(BackupMixin):
             val = glob_min + (i * val_range / 10)
             y = h - padding_tb - (i * usable_h / 10)
             self.bar_chart_canvas.create_line(padding_l, y, w-padding_r, y, fill=self.COLORS["bg_highlight"], width=1)
-            prec = int(self.trend_settings.get("decimal_places", 3))
-            self.bar_chart_canvas.create_text(padding_l-15, y, text=f"{val:.{prec}f}", fill=self.COLORS["text_dim"], anchor="e", font=("Consolas", 8))
+            prec = graph_precision(self.devices, [s[0] for s in all_series], self.trend_settings.get("decimal_places", 3))
+            self.bar_chart_canvas.create_text(padding_l-15, y, text=display_dates(f"{val:.{prec}f}"), fill=self.COLORS["text_dim"], anchor="e", font=("Consolas", 8))
 
         palette = ["#D32F2F", "#28A745", "#4285F4", "#F29900", "#6F42C1", "#E83E8C", "#20C997", "#FD7E14"]
         
@@ -3457,7 +3510,7 @@ class ModbusApp(BackupMixin):
             for i in range(0, max_len, step):
                 x = padding_l + (i * group_width) + (group_width / 2)
                 ts_str = trend_ts[i].split(" ")[1][:5] # Show HH:MM
-                self.bar_chart_canvas.create_text(x, h - padding_tb + 20, text=ts_str, fill=self.COLORS["text_dim"], font=("Segoe UI", 8))
+                self.bar_chart_canvas.create_text(x, h - padding_tb + 20, text=display_dates(ts_str), fill=self.COLORS["text_dim"], font=("Segoe UI", 8))
                 self.bar_chart_canvas.create_line(x, h - padding_tb, x, h - padding_tb + 5, fill=self.COLORS["text_dim"])
 
         legend_y = padding_tb
@@ -3480,7 +3533,7 @@ class ModbusApp(BackupMixin):
             reg_addr = parts[3] if len(parts) >= 4 else str(lid).split(":")[-1]
             display_name = getattr(self, 'trend_addr_to_name', {}).get(reg_addr, f"REG {reg_addr}")
             self.bar_chart_canvas.create_rectangle(w-padding_r+30, legend_y, w-padding_r+45, legend_y+15, fill=color, outline="")
-            self.bar_chart_canvas.create_text(w-padding_r+55, legend_y+7, text=display_name.upper(), anchor="w", fill=self.COLORS["text_main"], font=("Segoe UI", 9, "bold"))
+            self.bar_chart_canvas.create_text(w-padding_r+55, legend_y+7, text=display_dates(display_name.upper()), anchor="w", fill=self.COLORS["text_main"], font=("Segoe UI", 9, "bold"))
             legend_y += 25
 
     def show_user_manager(self):
@@ -3495,7 +3548,7 @@ class ModbusApp(BackupMixin):
         def fld(lbl, parent=left, show=None):
             f = tk.Frame(parent, bg=self.COLORS["bg_surface"])
             f.pack(fill="x", pady=8)
-            tk.Label(f, text=lbl, font=("Segoe UI", 8, "bold"), fg=self.COLORS["text_dim"], bg=self.COLORS["bg_surface"]).pack(anchor="w")
+            tk.Label(f, text=display_dates(lbl), font=("Segoe UI", 8, "bold"), fg=self.COLORS["text_dim"], bg=self.COLORS["bg_surface"]).pack(anchor="w")
             e = tk.Entry(f, bg=self.COLORS["bg_dark"], fg=self.COLORS["text_main"], 
                          relief="flat", font=self.FONTS["body"], insertbackground="#1C1E21", show=show)
             e.pack(fill="x", pady=(2, 0), ipady=6)
@@ -3508,6 +3561,15 @@ class ModbusApp(BackupMixin):
         # Approval authority can be granted if current user is Super Admin or possesses approve_data permission.
         self.u_manager_approver = tk.BooleanVar(value=False)
         current_is_superadmin = (self.current_user == "superadmin") or self.users.get(self.current_user, {}).get("is_superadmin", False)
+        tk.Label(left, text="PASSWORD EXPIRY (DAYS) - SUPER ADMIN ONLY",
+                 bg=self.COLORS["bg_surface"], fg=self.COLORS["text_dim"],
+                 font=("Segoe UI", 8, "bold")).pack(anchor="w", pady=(10, 2))
+        self.u_manager_expiry = tk.StringVar(value="90")
+        ttk.Combobox(left, textvariable=self.u_manager_expiry, values=PASSWORD_EXPIRY_OPTIONS,
+                     state="readonly" if current_is_superadmin else "disabled").pack(fill="x")
+        tk.Label(left, text="Counted from the last password change.",
+                 bg=self.COLORS["bg_surface"], fg=self.COLORS["text_dim"],
+                 font=("Segoe UI", 8)).pack(anchor="w")
         manager_perms = self.users.get(self.current_user, {}).get("permissions", [])
         can_assign_view = current_is_superadmin or ("view_data" in manager_perms)
         can_assign_approve = current_is_superadmin or ("approve_data" in manager_perms)
@@ -3565,7 +3627,9 @@ class ModbusApp(BackupMixin):
         table_frame = tk.Frame(right, bg=self.COLORS["bg_surface"])
         table_frame.pack(fill="both", expand=True)
 
-        self.user_tree = ttk.Treeview(table_frame, columns=("user", "type", "perms"), show="headings", style="Treeview")
+        self.user_tree = ttk.Treeview(table_frame, columns=("user", "type", "perms", "expiry"), show="headings", style="Treeview")
+        self.user_tree.heading("expiry", text="PASSWORD EXPIRES")
+        self.user_tree.column("expiry", width=200, minwidth=180, stretch=False)
         self.user_tree.heading("user", text="USERNAME")
         self.user_tree.heading("type", text="ACCOUNT TYPE")
         self.user_tree.heading("perms", text="PERMISSIONS")
@@ -3629,7 +3693,7 @@ class ModbusApp(BackupMixin):
                     perms = ", ".join([PERM_LABELS.get(p, p) for p in clean_perms])
                 else:
                     perms = "NO ACCESS"
-            self.user_tree.insert("", "end", values=(uname.upper(), utype, perms))
+            self.user_tree.insert("", "end", values=display_dates((uname.upper(), utype, perms, password_expiry_label(udata))))
 
     def _on_user_select(self, event):
         selected = self.user_tree.selection()
@@ -3649,6 +3713,7 @@ class ModbusApp(BackupMixin):
             for pid, var in self.perm_vars.items():
                 var.set(True if pid in up else False)
             self.u_manager_approver.set(bool(udata.get("is_approver", False)))
+            self.u_manager_expiry.set(str(udata.get("password_expiry_days", 90)))
 
     def add_user_submit(self):
         uname = self.u_manager_name.get().lower().strip()
@@ -3660,7 +3725,7 @@ class ModbusApp(BackupMixin):
         
         is_update = False
         if uname in self.users:
-            if not messagebox.askyesno("Update User", f"User '{uname}' already exists. Update password and permissions?"):
+            if not messagebox.askyesno("Update User", display_dates(f"User '{uname}' already exists. Update password and permissions?")):
                 return
             is_update = True
 
@@ -3668,10 +3733,13 @@ class ModbusApp(BackupMixin):
             messagebox.showerror("Error", "Password required for new user")
             return
 
-        if upass and len(upass) < 12:
-            messagebox.showerror("Password", "Use at least 12 characters.")
+        if upass and len(upass) < 6:
+            messagebox.showerror("Password", "Use at least 6 characters.")
             return
 
+        if is_update and upass and verify_password(upass, self.users[uname]["password"]):
+            messagebox.showerror("Password", "Choose a password different from the current password.")
+            return
         h = hash_password(upass) if upass else (self.users[uname]["password"] if is_update else "")
         selected_perms = [pid for pid, var in self.perm_vars.items() if var.get()]
         
@@ -3679,6 +3747,15 @@ class ModbusApp(BackupMixin):
         is_superadmin = self.users[uname].get("is_superadmin", False) if is_update else (uname == "superadmin")
         is_admin = self.users[uname].get("is_admin", False) if is_update else (uname in ["admin", "superadmin"])
         manager_is_superadmin = (self.current_user == "superadmin") or self.users.get(self.current_user, {}).get("is_superadmin", False)
+        expiry_days = self.users.get(uname, {}).get("password_expiry_days", 90)
+        if manager_is_superadmin:
+            try:
+                expiry_days = int(self.u_manager_expiry.get())
+                if expiry_days not in PASSWORD_EXPIRY_OPTIONS:
+                    raise ValueError
+            except ValueError:
+                messagebox.showerror("Password expiry", "Select 1, 30, 60 or 90 days.")
+                return
         manager_perms = self.users.get(self.current_user, {}).get("permissions", [])
         can_manage_approver = manager_is_superadmin or ("approve_data" in manager_perms)
         old_is_approver = self.users.get(uname, {}).get("is_approver", False)
@@ -3724,23 +3801,34 @@ class ModbusApp(BackupMixin):
             audit_msg = f"Created user '{uname.upper()}' (Permissions: [{', '.join(selected_perms)}])"
             act = "USER_CREATE"
 
-        self.users[uname] = {
+        updated_user = {
+            **self.users.get(uname, {}),
             "password": h,
+            "password_changed_at": password_changed_at() if upass else self.users[uname]["password_changed_at"],
+            "password_expiry_days": expiry_days,
             "permissions": selected_perms,
             "is_admin": is_admin,
             "is_superadmin": is_superadmin,
             "is_approver": is_approver
         }
         
-        save_users(self.users)
+        updated_users = {**self.users, uname: updated_user}
+        try:
+            save_users(updated_users)
+        except Exception as exc:
+            messagebox.showerror("Save User", display_dates(f"Could not save user: {exc}"))
+            return
+        self.users = updated_users
+        audit_msg += f"; Password expiry: {expiry_days} days"
         self.log_audit(act, "USER_MGMT", audit_msg)
         self.refresh_user_list()
         self.u_manager_name.delete(0, tk.END)
         self.u_manager_pass.delete(0, tk.END)
         self.u_manager_approver.set(False)
+        self.u_manager_expiry.set("90")
         
         msg = f"User {uname} updated successfully" if is_update else f"User {uname} created successfully"
-        messagebox.showinfo("Success", msg)
+        messagebox.showinfo("Success", display_dates(msg))
 
     def remove_user_submit(self):
         selected = self.user_tree.selection()
@@ -3750,15 +3838,38 @@ class ModbusApp(BackupMixin):
         
         uname = self.user_tree.item(selected[0])['values'][0].lower()
         if uname in ["admin", "superadmin"]:
-            messagebox.showerror("Error", f"Cannot remove primary {uname}")
+            messagebox.showerror("Error", display_dates(f"Cannot remove primary {uname}"))
             return
         
-        if messagebox.askyesno("Confirm", f"Remove user {uname.upper()}?"):
+        if messagebox.askyesno("Confirm", display_dates(f"Remove user {uname.upper()}?")):
             removed_user = self.users.pop(uname, {})
             old_perms = removed_user.get("permissions", [])
             save_users(self.users)
             self.log_audit("USER_DELETE", "USER_MGMT", f"Deleted user '{uname.upper()}' (Had permissions: [{', '.join(old_perms)}])")
             self.refresh_user_list()
+
+    def monitoring_status(self, key):
+        worker = self.device_threads.get(key)
+        stop = self.stop_events.get(key)
+        if stop is not None and stop.is_set():
+            if worker is not None and worker.is_alive():
+                return "STOPPING...", self.COLORS["danger"]
+            return "\u25a0 STOPPED", self.COLORS["danger"]
+        if worker is not None and worker.is_alive():
+            return "\u25b6 RUNNING", self.COLORS["success"]
+        return "\u25a0 STOPPED", self.COLORS["text_dim"]
+
+    def refresh_monitoring_indicators(self):
+        for label_id, label in list(self.live_labels.items()):
+            if not label_id.endswith((":monitoring", ":status")):
+                continue
+            if not label.winfo_exists():
+                self.live_labels.pop(label_id, None)
+                continue
+            is_header = label_id.endswith(":status")
+            key = label.monitoring_device_key
+            text, color = self.monitoring_status(key)
+            label.config(text="\u25cf" if is_header else display_dates(text), fg=color)
 
     def render_device_block(self, parent, dev):
         ip, port, slave_id = dev['ip'], dev['port'], dev.get('slave_id', 1)
@@ -3773,8 +3884,11 @@ class ModbusApp(BackupMixin):
                         highlightbackground=self.COLORS["bg_highlight"], highlightthickness=1)
         head.pack(fill="x", pady=(0, 10))
         
-        status_color = self.COLORS["success"] if is_running else self.COLORS["text_dim"]
-        tk.Label(head, text="●", fg=status_color, bg=self.COLORS["bg_surface"]).pack(side="left", padx=(0, 10))
+        _, status_color = self.monitoring_status(key)
+        status_dot = tk.Label(head, text="\u25cf", fg=status_color, bg=self.COLORS["bg_surface"])
+        status_dot.monitoring_device_key = key
+        status_dot.pack(side="left", padx=(0, 10))
+        self.live_labels[f"{key}:status"] = status_dot
         slave_id = dev.get('slave_id', 1)
         d_name = dev.get('device_name', '')
         header_text = d_name.upper() if d_name else f"NODE: {ip}"
@@ -3782,10 +3896,10 @@ class ModbusApp(BackupMixin):
         info_frame = tk.Frame(head, bg=self.COLORS["bg_surface"])
         info_frame.pack(side="left")
 
-        tk.Label(info_frame, text=header_text, font=self.FONTS["h3"], 
+        tk.Label(info_frame, text=display_dates(header_text), font=self.FONTS["h3"], 
                  fg=self.COLORS["text_main"], bg=self.COLORS["bg_surface"]).pack(anchor="w")
         
-        ts_lbl = tk.Label(info_frame, text=f"Last Sync: {self.last_update_times.get(key, 'NEVER')}", 
+        ts_lbl = tk.Label(info_frame, text=display_dates(f"Last Sync: {self.last_update_times.get(key, 'NEVER')}"), 
                          font=("Segoe UI", 7), fg=self.COLORS["text_dim"], bg=self.COLORS["bg_surface"])
         ts_lbl.pack(anchor="w")
         
@@ -3812,7 +3926,7 @@ class ModbusApp(BackupMixin):
 
         card_frames = []
         for i, reg in enumerate(dev['registers']):
-            r_frame = tk.Frame(cards, bg=self.COLORS["bg_surface"], height=130,
+            r_frame = tk.Frame(cards, bg=self.COLORS["bg_surface"], height=155,
                                highlightbackground=self.COLORS["bg_highlight"], highlightthickness=1)
             r_frame.pack_propagate(False)
             card_frames.append(r_frame)
@@ -3836,7 +3950,7 @@ class ModbusApp(BackupMixin):
                     # Only default unit if it's one of the standard first 10
                     unit = self.DEFAULT_REGISTER_UNITS[i]
 
-            tk.Label(r_frame, text=str(name).upper(), font=("Segoe UI", 11, "bold"), 
+            tk.Label(r_frame, text=display_dates(str(name).upper()), font=("Segoe UI", 11, "bold"), 
                      fg=self.COLORS["text_dim"], bg=self.COLORS["bg_surface"]).pack(pady=(10, 0))
             
             val_id = f"{ip}:{port}:{slave_id}:{reg}"
@@ -3846,16 +3960,23 @@ class ModbusApp(BackupMixin):
             val_container = tk.Frame(r_frame, bg=self.COLORS["bg_surface"])
             val_container.pack(expand=True)
             
-            lbl = tk.Label(val_container, text=cached_val, font=("Segoe UI", 22, "bold"), 
+            lbl = tk.Label(val_container, text=display_dates(cached_val), font=("Segoe UI", 22, "bold"), 
                            fg=self.COLORS["accent"], bg=self.COLORS["bg_surface"])
             lbl.pack(side="left")
             
             if unit and unit != "na" and dtype != "BOOLEAN":
-                tk.Label(val_container, text=unit, font=("Segoe UI", 12, "bold"), 
+                tk.Label(val_container, text=display_dates(unit), font=("Segoe UI", 12, "bold"), 
                          fg=self.COLORS["text_dim"], bg=self.COLORS["bg_surface"]).pack(side="left", padx=(5, 0), pady=(8, 0))
             
+            status_text, status_color = self.monitoring_status(key)
+            status_lbl = tk.Label(r_frame, text=display_dates(status_text), fg=status_color,
+                                  bg=self.COLORS["bg_surface"], font=("Segoe UI", 9, "bold"))
+            status_lbl.monitoring_device_key = key
+            status_lbl.pack(pady=(0, 2))
+            self.live_labels[f"{val_id}:monitoring"] = status_lbl
+
             ts_text = f"Last Update: {cached_ts}" if cached_ts else "Last Update: --"
-            time_lbl = tk.Label(r_frame, text=ts_text, font=("Segoe UI", 8), 
+            time_lbl = tk.Label(r_frame, text=display_dates(ts_text), font=("Segoe UI", 8), 
                                 fg=self.COLORS["text_dim"], bg=self.COLORS["bg_surface"])
             time_lbl.pack(pady=(0, 6))
 
@@ -3923,7 +4044,7 @@ class ModbusApp(BackupMixin):
         def fld(lbl, parent=left):
             f = tk.Frame(parent, bg=self.COLORS["bg_surface"])
             f.pack(fill="x", pady=8)
-            tk.Label(f, text=lbl, font=("Segoe UI", 8, "bold"), fg=self.COLORS["text_dim"], bg=self.COLORS["bg_surface"]).pack(anchor="w")
+            tk.Label(f, text=display_dates(lbl), font=("Segoe UI", 8, "bold"), fg=self.COLORS["text_dim"], bg=self.COLORS["bg_surface"]).pack(anchor="w")
             e = tk.Entry(f, bg=self.COLORS["bg_dark"], fg=self.COLORS["text_main"], relief="flat", font=self.FONTS["body"], insertbackground="black")
             e.pack(fill="x", pady=(2, 0), ipady=6)
             tk.Frame(f, bg=self.COLORS["bg_highlight"], height=1).pack(fill="x")
@@ -4268,7 +4389,7 @@ class ModbusApp(BackupMixin):
             def fld(lbl, parent=left, initial="", show=None):
                 f = tk.Frame(parent, bg=self.COLORS["bg_surface"])
                 f.pack(fill="x", pady=6)
-                tk.Label(f, text=lbl, font=("Segoe UI", 8, "bold"), fg=self.COLORS["text_dim"], bg=self.COLORS["bg_surface"]).pack(anchor="w")
+                tk.Label(f, text=display_dates(lbl), font=("Segoe UI", 8, "bold"), fg=self.COLORS["text_dim"], bg=self.COLORS["bg_surface"]).pack(anchor="w")
                 e = tk.Entry(f, bg=self.COLORS["bg_dark"], fg=self.COLORS["text_main"], relief="flat", font=self.FONTS["body"], insertbackground="black", show=show)
                 e.insert(0, str(initial))
                 e.pack(fill="x", pady=(2, 0), ipady=6)
@@ -4358,7 +4479,7 @@ class ModbusApp(BackupMixin):
                            activebackground=self.COLORS["bg_surface"], selectcolor=self.COLORS["bg_dark"]).pack(anchor="w", pady=10)
             
             info_text = "Note: Gmail requires an 'App Password'.\nSMTP uses TLS/587 or SSL/465.\nIMAP/POP3 test checks connection."
-            info_lbl = tk.Label(left, text=info_text, 
+            info_lbl = tk.Label(left, text=display_dates(info_text), 
                                font=("Segoe UI", 8, "italic"), fg=self.COLORS["warning"], bg=self.COLORS["bg_surface"], justify="left")
             info_lbl.pack(fill="x", pady=10)
         else:
@@ -4498,7 +4619,7 @@ class ModbusApp(BackupMixin):
                 if self.email_enabled_var.get() and not recipients:
                     raise ValueError("At least one recipient email address is required.")
             except ValueError as exc:
-                messagebox.showerror("Invalid Recipients", str(exc))
+                messagebox.showerror("Invalid Recipients", display_dates(str(exc)))
                 return
         self.email_settings['server_type'] = stype
         self.email_settings['sender_email'] = self.sender_email.get().strip()
@@ -4541,7 +4662,7 @@ class ModbusApp(BackupMixin):
         self.log_audit("EMAIL_CONFIG_SAVE", "EMAIL", f"Updated Email Settings ({stype}): {diff_str}",
                        previous_value=json.dumps({k: v for k, v in old_settings.items() if k != "sender_password"}, sort_keys=True),
                        updated_value=json.dumps({k: v for k, v in self.email_settings.items() if k != "sender_password"}, sort_keys=True))
-        messagebox.showinfo("Success", f"{stype} settings saved successfully.")
+        messagebox.showinfo("Success", display_dates(f"{stype} settings saved successfully."))
 
     def test_email_config(self):
         stype = self.server_type_cb.get()
@@ -4616,7 +4737,7 @@ class ModbusApp(BackupMixin):
                                 "A private CA must be trusted in the Windows certificate store.\n\n"
                                 f"Details: {last_err}"
                             )
-                            self.root.after(0, lambda msg=err_msg: messagebox.showerror("Failure", msg))
+                            self.root.after(0, lambda msg=err_msg: messagebox.showerror("Failure", display_dates(msg)))
                         elif isinstance(last_err, smtplib.SMTPServerDisconnected):
                             err_msg = (f"Connection unexpectedly closed by mail server ({host}:{port}).\n\n"
                                        "Most Likely Causes & Solutions:\n\n"
@@ -4630,12 +4751,12 @@ class ModbusApp(BackupMixin):
                                        "   Must use a 16-character 'App Password' instead of your standard password.\n\n"
                                        "4. PORT & FIREWALL:\n"
                                        "   Check if antivirus or network firewall is blocking outgoing SMTP traffic.")
-                            self.root.after(0, lambda: messagebox.showerror("Failure", err_msg))
+                            self.root.after(0, lambda: messagebox.showerror("Failure", display_dates(err_msg)))
                         elif isinstance(last_err, smtplib.SMTPAuthenticationError):
                             err_msg = f"Authentication failed for {user}.\nPlease check your username and password (or Gmail App Password)."
-                            self.root.after(0, lambda: messagebox.showerror("Failure", err_msg))
+                            self.root.after(0, lambda: messagebox.showerror("Failure", display_dates(err_msg)))
                         else:
-                            self.root.after(0, lambda: messagebox.showerror("Failure", f"Test failed: {str(last_err)}"))
+                            self.root.after(0, lambda: messagebox.showerror("Failure", display_dates(f"Test failed: {str(last_err)}")))
                         return
 
                     # Send individual emails to ensure delivery with strict servers
@@ -4652,7 +4773,7 @@ class ModbusApp(BackupMixin):
                             self.email_host.insert(0, used_host)
                             self.email_port.delete(0, tk.END)
                             self.email_port.insert(0, str(used_port))
-                            messagebox.showinfo("Success", f"Test email sent successfully using Host: {used_host} (Port {used_port})!\n\nHost and Port fields have been auto-updated.")
+                            messagebox.showinfo("Success", display_dates(f"Test email sent successfully using Host: {used_host} (Port {used_port})!\n\nHost and Port fields have been auto-updated."))
                         self.root.after(0, apply_auto_discovered)
                     else:
                         self.root.after(0, lambda: messagebox.showinfo("Success", "Test email sent successfully!"))
@@ -4681,7 +4802,7 @@ class ModbusApp(BackupMixin):
                     server.quit()
                     self.root.after(0, lambda: messagebox.showinfo("Success", "POP3 connection successful!"))
             except Exception as e:
-                self.root.after(0, lambda msg=str(e): messagebox.showerror("Failure", f"Test failed: {msg}"))
+                self.root.after(0, lambda msg=str(e): messagebox.showerror("Failure", display_dates(f"Test failed: {msg}")))
 
         threading.Thread(target=run_test, daemon=True).start()
 
@@ -4866,14 +4987,14 @@ class ModbusApp(BackupMixin):
                 else:
                     reg_display = f"Reg {reg_id}" if reg_id else "N/A"
 
-            self.rules_tree.insert("", "end", values=(
+            self.rules_tree.insert("", "end", values=display_dates((
                 device_display,
                 reg_display,
                 get_display_cond(alert.get('condition')),
                 alert.get('threshold'),
                 f"{alert.get('interval', '0')} min",
                 alert.get('template', '{name} alert: {value}')
-            ))
+            )))
 
     def export_device_config(self):
         filepath = filedialog.asksaveasfilename(
@@ -4889,7 +5010,7 @@ class ModbusApp(BackupMixin):
             self.log_audit("DEVICE_EXPORT", "DEVICE", f"Exported device configuration to '{os.path.basename(filepath)}'")
             messagebox.showinfo("Success", "Device configuration exported successfully.")
         except Exception as e:
-            messagebox.showerror("Error", f"Failed to export configuration: {e}")
+            messagebox.showerror("Error", display_dates(f"Failed to export configuration: {e}"))
 
     def import_device_config(self):
         filepath = filedialog.askopenfilename(
@@ -4941,7 +5062,7 @@ class ModbusApp(BackupMixin):
             self.log_audit("DEVICE_IMPORT", "DEVICE", f"Imported device config ({'Replace' if ans else 'Merge'}) from '{os.path.basename(filepath)}'")
             messagebox.showinfo("Success", "Device configuration imported successfully. All active polling threads have been stopped. Please restart them as needed.")
         except Exception as e:
-            messagebox.showerror("Error", f"Failed to import configuration: {e}")
+            messagebox.showerror("Error", display_dates(f"Failed to import configuration: {e}"))
 
     def export_alert_config(self):
         filepath = filedialog.asksaveasfilename(
@@ -4958,7 +5079,7 @@ class ModbusApp(BackupMixin):
             self.log_audit("ALERT_RULE_EXPORT", "ALARM", f"Exported alarm rules to '{os.path.basename(filepath)}'")
             messagebox.showinfo("Success", "Alarm rules exported successfully.")
         except Exception as e:
-            messagebox.showerror("Error", f"Failed to export alarm rules: {e}")
+            messagebox.showerror("Error", display_dates(f"Failed to export alarm rules: {e}"))
 
     def import_alert_config(self):
         filepath = filedialog.askopenfilename(
@@ -5011,7 +5132,7 @@ class ModbusApp(BackupMixin):
             self.log_audit("ALERT_RULE_IMPORT", "ALARM", f"Imported alarm rules ({'Replace' if ans else 'Merge'}) from '{os.path.basename(filepath)}'")
             messagebox.showinfo("Success", "Alarm rules imported successfully.")
         except Exception as e:
-            messagebox.showerror("Error", f"Failed to import alarm rules: {e}")
+            messagebox.showerror("Error", display_dates(f"Failed to import alarm rules: {e}"))
 
     def is_lora_alert(self, alert):
         dev_ip = str(alert.get('device_ip', ''))
@@ -5115,7 +5236,7 @@ class ModbusApp(BackupMixin):
                 .replace("{thresh}", formatted_thresh)
                 .replace("{condition}", str(alert.get('condition', '')))
                 .replace("{cond}", str(alert.get('condition', '')))
-                .replace("{time}", ts_str)
+                .replace("{time}", display_dates(ts_str))
                 .replace("{ip}", str(alert.get('device_ip', '0.0.0.0'))))
 
             success, response_msg = send_fast2sms(api_key, route, numbers, msg_text, sender_id=sender_id, template_id=template_id, entity_id=entity_id)
@@ -5151,7 +5272,7 @@ class ModbusApp(BackupMixin):
         def fld(lbl, parent=left, initial="", show=None):
             f = tk.Frame(parent, bg=self.COLORS["bg_surface"])
             f.pack(fill="x", pady=6)
-            tk.Label(f, text=lbl, font=("Segoe UI", 8, "bold"), fg=self.COLORS["text_dim"], bg=self.COLORS["bg_surface"]).pack(anchor="w")
+            tk.Label(f, text=display_dates(lbl), font=("Segoe UI", 8, "bold"), fg=self.COLORS["text_dim"], bg=self.COLORS["bg_surface"]).pack(anchor="w")
             e = tk.Entry(f, bg=self.COLORS["bg_dark"], fg=self.COLORS["text_main"], relief="flat", font=self.FONTS["body"], insertbackground="black", show=show)
             e.insert(0, str(initial))
             e.pack(fill="x", pady=(2, 0), ipady=6)
@@ -5205,7 +5326,7 @@ class ModbusApp(BackupMixin):
                   relief="flat", padx=20, pady=8, command=self.show_sms_logs_history).pack(fill="x", pady=4)
 
         info_text = "Note: Fast2SMS requires a valid API Key from fast2sms.com.\nIf you do not have a registered DLT Sender ID & Template ID, please select 'q (Quick SMS)' route.\nMultiple numbers should be separated by commas (e.g. 9876543210, 9123456789)."
-        info_lbl = tk.Label(left, text=info_text, 
+        info_lbl = tk.Label(left, text=display_dates(info_text), 
                            font=("Segoe UI", 8, "italic"), fg=self.COLORS["warning"], bg=self.COLORS["bg_surface"], justify="left")
         info_lbl.pack(fill="x", pady=15)
 
@@ -5384,9 +5505,9 @@ class ModbusApp(BackupMixin):
         def run_test():
             success, result_msg = send_fast2sms(api_key, route, numbers, test_msg, sender_id=sender_id, template_id=template_id, entity_id=entity_id)
             if success:
-                self.root.after(0, lambda: messagebox.showinfo("Test SMS Success", f"Fast2SMS Response:\n{result_msg}"))
+                self.root.after(0, lambda: messagebox.showinfo("Test SMS Success", display_dates(f"Fast2SMS Response:\n{result_msg}")))
             else:
-                self.root.after(0, lambda: messagebox.showerror("Test SMS Failed", f"Could not send SMS via Fast2SMS:\n{result_msg}"))
+                self.root.after(0, lambda: messagebox.showerror("Test SMS Failed", display_dates(f"Could not send SMS via Fast2SMS:\n{result_msg}")))
                 
         threading.Thread(target=run_test, daemon=True).start()
 
@@ -5558,7 +5679,7 @@ class ModbusApp(BackupMixin):
             if not v1: v1 = "{name}"
             if not v2: v2 = "{value}"
 
-            self.sms_rules_tree.insert("", "end", values=(
+            self.sms_rules_tree.insert("", "end", values=display_dates((
                 alias,
                 reg_disp,
                 get_display_cond(a.get('condition')),
@@ -5566,7 +5687,7 @@ class ModbusApp(BackupMixin):
                 v1,
                 v2,
                 tpl if tpl else f"{v1}|{v2}"
-            ))
+            )))
 
     def export_sms_alert_config(self):
         filepath = filedialog.asksaveasfilename(
@@ -5584,7 +5705,7 @@ class ModbusApp(BackupMixin):
             self.log_audit("SMS_RULE_EXPORT", "ALARM", f"Exported SMS alarm rules to '{os.path.basename(filepath)}'")
             messagebox.showinfo("Success", "SMS alarm rules exported successfully.")
         except Exception as e:
-            messagebox.showerror("Error", f"Failed to export SMS alarm rules: {e}")
+            messagebox.showerror("Error", display_dates(f"Failed to export SMS alarm rules: {e}"))
 
     def import_sms_alert_config(self):
         filepath = filedialog.askopenfilename(
@@ -5635,7 +5756,7 @@ class ModbusApp(BackupMixin):
             self.log_audit("SMS_RULE_IMPORT", "ALARM", f"Imported SMS alarm rules from '{os.path.basename(filepath)}'")
             messagebox.showinfo("Success", "SMS alarm rules imported successfully.")
         except Exception as e:
-            messagebox.showerror("Error", f"Failed to import SMS alarm rules: {e}")
+            messagebox.showerror("Error", display_dates(f"Failed to import SMS alarm rules: {e}"))
 
     def show_sms_logs_history(self):
         bar = tk.Frame(self.content_frame, bg=self.COLORS["bg_dark"])
@@ -5644,7 +5765,7 @@ class ModbusApp(BackupMixin):
         tk.Button(bar, text="⬅ BACK TO SMS CONFIG", bg=self.COLORS["bg_surface"], fg=self.COLORS["text_dim"], font=self.FONTS["button"], relief="flat", padx=12, command=lambda: self.navigate("sms_config")).pack(side="left", padx=5)
         
         date_str = datetime.now().strftime("%Y-%m-%d")
-        tk.Label(bar, text=f"SMS Sent Logs: {date_str}", font=("Segoe UI", 10, "bold"), fg=self.COLORS["text_dim"], bg=self.COLORS["bg_dark"]).pack(side="left", padx=20)
+        tk.Label(bar, text=display_dates(f"SMS Sent Logs: {date_str}"), font=("Segoe UI", 10, "bold"), fg=self.COLORS["text_dim"], bg=self.COLORS["bg_dark"]).pack(side="left", padx=20)
         
         cnt = tk.Frame(self.content_frame, bg=self.COLORS["bg_surface"], highlightbackground=self.COLORS["bg_highlight"], highlightthickness=1)
         cnt.pack(fill="both", expand=True, padx=30, pady=(0, 20))
@@ -5683,7 +5804,7 @@ class ModbusApp(BackupMixin):
                     for row in reader:
                         if len(row) >= 5:
                             msg_val = row[5] if len(row) > 5 else ""
-                            tree.insert("", 0, values=(row[0], row[1], row[2], row[3], row[4], msg_val))
+                            tree.insert("", 0, values=display_dates((row[0], row[1], row[2], row[3], row[4], msg_val)))
             except Exception as e:
                 self.log(f"Error reading SMS logs: {e}")
 
@@ -5793,7 +5914,7 @@ class ModbusApp(BackupMixin):
                     f"Time of Event: {ts_str}\n"
                     f"================================")
             
-            msg.attach(MIMEText(body, 'plain'))
+            msg.attach(MIMEText(display_dates(body), 'plain'))
             
             smtp_server = s.get('smtp_server', 'smtp.gmail.com')
             smtp_port_raw = s.get('smtp_port', 587)
@@ -5909,7 +6030,7 @@ class ModbusApp(BackupMixin):
         interval_map = {"5 Mins": 300, "30 Mins": 1800, "1 Hour": 3600, "6 Hours": 21600, "12 Hours": 43200, "24 Hours": 86400}
         interval_sec = interval_map.get(interval_str, 3600)
         threading.Thread(target=self.send_scheduled_pdf_email, args=(interval_str, interval_sec), daemon=True).start()
-        messagebox.showinfo("Report Email Dispatched", f"Generating PDF data report for the past {interval_str} and sending via email in the background...")
+        messagebox.showinfo("Report Email Dispatched", display_dates(f"Generating PDF data report for the past {interval_str} and sending via email in the background..."))
 
     @storage_operation
     def send_scheduled_pdf_email(self, interval_str, interval_sec):
@@ -5967,10 +6088,10 @@ class ModbusApp(BackupMixin):
                 if not device_list:
                     scheduled_all_approved = False
                     c.setFillColorRGB(0.0, 0.36, 0.72); c.setFont("Helvetica-Bold", 18)
-                    c.drawString(40, h-50, comp_info.get("company_name", "TempTrek Environmental Monitoring System"))
+                    c.drawString(40, h-50, display_dates(comp_info.get("company_name", "TempTrek Environmental Monitoring System")))
                     c.setFont("Helvetica", 9); c.setFillColorRGB(0.5, 0.5, 0.5)
-                    c.drawString(40, h-70, f"SCHEDULED REPORT ({interval_str.upper()}) | GENERATED: {to_dt.strftime('%Y-%m-%d %H:%M:%S')}")
-                    c.drawString(40, h-85, f"RANGE: {from_dt.strftime('%Y-%m-%d %H:%M')} TO {to_dt.strftime('%Y-%m-%d %H:%M')}")
+                    c.drawString(40, h-70, display_dates(f"SCHEDULED REPORT ({interval_str.upper()}) | GENERATED: {to_dt.strftime('%Y-%m-%d %H:%M:%S')}"))
+                    c.drawString(40, h-85, display_dates(f"RANGE: {from_dt.strftime('%Y-%m-%d %H:%M')} TO {to_dt.strftime('%Y-%m-%d %H:%M')}"))
                     c.line(40, h-95, w-40, h-95)
                     c.drawString(40, h-130, "No configured devices found.")
                     draw_scheduled_approval_status(False)
@@ -5995,10 +6116,10 @@ class ModbusApp(BackupMixin):
 
                         # Header
                         c.setFillColorRGB(0.0, 0.36, 0.72); c.setFont("Helvetica-Bold", 18)
-                        c.drawString(40, h-50, comp_info.get("company_name", "TempTrek Environmental Monitoring System"))
+                        c.drawString(40, h-50, display_dates(comp_info.get("company_name", "TempTrek Environmental Monitoring System")))
                         c.setFont("Helvetica", 9); c.setFillColorRGB(0.5, 0.5, 0.5)
-                        c.drawString(40, h-70, f"DEVICE: {d_alias} ({ip}:{port} @ Slave {slave}) | EXPORTED: {to_dt.strftime('%Y-%m-%d %H:%M:%S')}")
-                        c.drawString(40, h-85, f"PERIODIC REPORT ({interval_str.upper()}) | RANGE: {from_dt.strftime('%Y-%m-%d %H:%M')} TO {to_dt.strftime('%Y-%m-%d %H:%M')}")
+                        c.drawString(40, h-70, display_dates(f"DEVICE: {d_alias} ({ip}:{port} @ Slave {slave}) | EXPORTED: {to_dt.strftime('%Y-%m-%d %H:%M:%S')}"))
+                        c.drawString(40, h-85, display_dates(f"PERIODIC REPORT ({interval_str.upper()}) | RANGE: {from_dt.strftime('%Y-%m-%d %H:%M')} TO {to_dt.strftime('%Y-%m-%d %H:%M')}"))
                         c.setStrokeColorRGB(0.0, 0.36, 0.72); c.setLineWidth(1.5)
                         c.line(40, h-95, w-40, h-95)
 
@@ -6114,7 +6235,8 @@ class ModbusApp(BackupMixin):
                                 py = gy + 40 + (i * plot_h / 5)
                                 c.setStrokeColorRGB(0.88, 0.88, 0.88)
                                 c.line(gx+60, py, gx+60+plot_w, py)
-                                c.drawString(gx+15, py-2, f"{tick_val:.2f}")
+                                prec = max((channel_precision(dev, reg, self.trend_settings.get("decimal_places", 3)) for reg, _ in all_series), default=3)
+                                c.drawString(gx+15, py-2, display_dates(f"{tick_val:.{prec}f}"))
 
                             # Draw Data Lines
                             palette = ["#D32F2F", "#28A745", "#4285F4", "#F29900", "#6F42C1"]
@@ -6144,19 +6266,19 @@ class ModbusApp(BackupMixin):
                                 ly_leg = gy + gh - 45 - (idx * 14)
                                 c.setFillColorRGB(r_col, g_col, b_col); c.rect(gx + gw - 140, ly_leg, 8, 8, fill=1, stroke=0)
                                 c.setFillColorRGB(0.2, 0.2, 0.2); c.setFont("Helvetica-Bold", 8)
-                                c.drawString(gx + gw - 125, ly_leg + 1, leg_name.upper())
+                                c.drawString(gx + gw - 125, ly_leg + 1, display_dates(leg_name.upper()))
 
                         # --- DATA LOG TABLE ---
                         curr_y = gy - 35
                         c.setFillColorRGB(0.1, 0.1, 0.1); c.setFont("Helvetica-Bold", 10)
-                        c.drawString(40, curr_y, f"HISTORICAL DATA LOG (TIME WINDOW: {interval_str.upper()})")
+                        c.drawString(40, curr_y, display_dates(f"HISTORICAL DATA LOG (TIME WINDOW: {interval_str.upper()})"))
 
                         curr_y -= 25
                         c.line(40, curr_y+15, w-40, curr_y+15)
                         c.setFont("Helvetica-Bold", f_size)
                         c.drawString(40, curr_y, "TIMESTAMP")
                         for i, rname in enumerate(reg_names):
-                            c.drawString(180 + (i*col_spacing), curr_y, rname.upper())
+                            c.drawString(180 + (i*col_spacing), curr_y, display_dates(rname.upper()))
 
                         curr_y -= 30
                         c.line(40, curr_y+18, w-40, curr_y+18)
@@ -6175,7 +6297,7 @@ class ModbusApp(BackupMixin):
                                 c.setFillColorRGB(0.1, 0.1, 0.1); c.setFont("Helvetica-Bold", f_size)
                                 c.drawString(40, curr_y, "TIMESTAMP")
                                 for i, rname in enumerate(reg_names):
-                                    c.drawString(180 + (i*col_spacing), curr_y, rname.upper())
+                                    c.drawString(180 + (i*col_spacing), curr_y, display_dates(rname.upper()))
                                 curr_y -= 30
                                 c.line(40, curr_y+18, w-40, curr_y+18)
                                 c.setFont("Helvetica", f_size)
@@ -6208,7 +6330,7 @@ class ModbusApp(BackupMixin):
                                 c.setFillColorRGB(0.2, 0.2, 0.2)
                                 c.setFont("Helvetica", f_size)
 
-                            c.drawString(40, curr_y, ts)
+                            c.drawString(40, curr_y, display_dates(ts))
 
                             for i, r_addr in enumerate(registers):
                                 v = pivoted[ts].get(r_addr, "---")
@@ -6226,7 +6348,7 @@ class ModbusApp(BackupMixin):
                                                 fv = float(v)
                                                 v = "---" if (math.isnan(fv) or math.isinf(fv)) else f"{fv:.{prec}f}"
                                         except: pass
-                                c.drawString(180 + (i*col_spacing), curr_y, v)
+                                c.drawString(180 + (i*col_spacing), curr_y, display_dates(v))
 
                             curr_y -= 15
                             rows_found += 1
@@ -6256,7 +6378,7 @@ class ModbusApp(BackupMixin):
                     f"Approval Status: {approval_label}\n\n"
                     f"Attached is the automated PDF data report for all monitored devices covering the past {interval_str}.\n"
                     f"=========================================")
-            msg.attach(MIMEText(body, 'plain'))
+            msg.attach(MIMEText(display_dates(body), 'plain'))
 
             if os.path.exists(target_pdf):
                 with open(target_pdf, 'rb') as f_pdf:
@@ -6378,29 +6500,29 @@ class ModbusApp(BackupMixin):
         def dt_selector(parent, label, initial_dt):
             f = tk.Frame(parent, bg=self.COLORS["bg_surface"])
             f.pack(side="left", padx=10)
-            tk.Label(f, text=label, font=("Segoe UI", 8, "bold"), 
+            tk.Label(f, text=display_dates(label), font=("Segoe UI", 8, "bold"), 
                      bg=self.COLORS["bg_surface"], fg=self.COLORS["text_dim"]).pack(anchor="w")
             box = tk.Frame(f, bg=self.COLORS["bg_dark"], padx=5, pady=3)
             box.pack(pady=(5, 0))
             
-            years = [str(y) for y in range(2024, 2031)]
+            years = [f"{y % 100:02d}" for y in range(2024, 2031)]
             months = [f"{i:02d}" for i in range(1, 13)]
             days = [f"{i:02d}" for i in range(1, 32)]
             hours = [f"{i:02d}" for i in range(0, 24)]
             mins = [f"{i:02d}" for i in range(0, 61)]
             
             sel = {}
-            y_cb = ttk.Combobox(box, values=years, width=5, font=("Consolas", 9))
-            y_cb.set(initial_dt.strftime("%Y"))
-            y_cb.pack(side="left")
+            d_cb = ttk.Combobox(box, values=days, width=3, font=("Consolas", 9))
+            d_cb.set(initial_dt.strftime("%d"))
+            d_cb.pack(side="left")
             tk.Label(box, text="-", bg=self.COLORS["bg_dark"], fg="white").pack(side="left")
             m_cb = ttk.Combobox(box, values=months, width=3, font=("Consolas", 9))
             m_cb.set(initial_dt.strftime("%m"))
             m_cb.pack(side="left")
             tk.Label(box, text="-", bg=self.COLORS["bg_dark"], fg="white").pack(side="left")
-            d_cb = ttk.Combobox(box, values=days, width=3, font=("Consolas", 9))
-            d_cb.set(initial_dt.strftime("%d"))
-            d_cb.pack(side="left")
+            y_cb = ttk.Combobox(box, values=years, width=5, font=("Consolas", 9))
+            y_cb.set(initial_dt.strftime("%y"))
+            y_cb.pack(side="left")
             
             tk.Label(box, text="  ", bg=self.COLORS["bg_dark"]).pack(side="left")
             h_cb = ttk.Combobox(box, values=hours, width=3, font=("Consolas", 9))
@@ -6528,14 +6650,14 @@ class ModbusApp(BackupMixin):
         dev_alias = dev.get('device_name', ip)
 
         try:
-            get_dt = lambda s: datetime.strptime(f"{s['y'].get()}-{s['m'].get()}-{s['d'].get()} {s['h'].get()}:{s['min'].get()}:00", "%Y-%m-%d %H:%M:%S")
+            get_dt = lambda s: datetime.strptime(f"20{s['y'].get()}-{s['m'].get()}-{s['d'].get()} {s['h'].get()}:{s['min'].get()}:00", "%Y-%m-%d %H:%M:%S")
             from_dt = get_dt(self.view_from_dt)
             to_dt = get_dt(self.view_to_dt)
             if to_dt < from_dt:
                 messagebox.showwarning("Date Range", "TO date/time must be after FROM date/time.")
                 return
         except Exception as e:
-            messagebox.showerror("Error", f"Invalid date selection: {e}")
+            messagebox.showerror("Error", display_dates(f"Invalid date selection: {e}"))
             return
 
         loaded_context = getattr(self, "view_loaded_context", None)
@@ -6577,7 +6699,7 @@ class ModbusApp(BackupMixin):
         self.log_audit("DATA_APPROVAL", "APPROVE", f"Approved data for device '{dev_alias}' from {from_dt} to {to_dt}",
                        device_info=f"{platform.node()}; device={ip}:{port}; slave={slave_id_part}",
                        previous_value="VIEWED / DRAFT", updated_value="APPROVED")
-        messagebox.showinfo("Success", f"Data for '{dev_alias}' ({from_dt.strftime('%Y-%m-%d')} to {to_dt.strftime('%Y-%m-%d')}) has been APPROVED and moved to 'Approve Data'!")
+        messagebox.showinfo("Success", display_dates(f"Data for '{dev_alias}' ({from_dt.strftime('%Y-%m-%d')} to {to_dt.strftime('%Y-%m-%d')}) has been APPROVED and moved to 'Approve Data'!"))
         self.load_view_data_records()
 
     def load_view_data_records(self):
@@ -6615,11 +6737,11 @@ class ModbusApp(BackupMixin):
             self.view_tree.column(col, width=125, minwidth=90, anchor="center", stretch=True)
 
         try:
-            get_dt = lambda s: datetime.strptime(f"{s['y'].get()}-{s['m'].get()}-{s['d'].get()} {s['h'].get()}:{s['min'].get()}:00", "%Y-%m-%d %H:%M:%S")
+            get_dt = lambda s: datetime.strptime(f"20{s['y'].get()}-{s['m'].get()}-{s['d'].get()} {s['h'].get()}:{s['min'].get()}:00", "%Y-%m-%d %H:%M:%S")
             from_dt = get_dt(self.view_from_dt)
             to_dt = get_dt(self.view_to_dt)
         except Exception as e:
-            messagebox.showerror("Error", f"Invalid date selection: {e}")
+            messagebox.showerror("Error", display_dates(f"Invalid date selection: {e}"))
             return
 
         approvals = load_approvals()
@@ -6707,7 +6829,7 @@ class ModbusApp(BackupMixin):
                 if all(v == "-" or v == "" for v in reading_values):
                     continue
                 visible_timestamps.append(ts)
-                self.view_tree.insert("", "end", values=(ts, dev_alias, *reading_values, "VIEWED / DRAFT"))
+                self.view_tree.insert("", "end", values=display_dates((ts, dev_alias, *reading_values, "VIEWED / DRAFT")))
                 inserted_count += 1
             self.view_loaded_context = {
                 "device": f"{ip}:{port}:{slave_id_part}",
@@ -6772,29 +6894,29 @@ class ModbusApp(BackupMixin):
         def dt_selector(parent, label, initial_dt):
             f = tk.Frame(parent, bg=self.COLORS["bg_surface"])
             f.pack(side="left", padx=10)
-            tk.Label(f, text=label, font=("Segoe UI", 8, "bold"), 
+            tk.Label(f, text=display_dates(label), font=("Segoe UI", 8, "bold"), 
                      bg=self.COLORS["bg_surface"], fg=self.COLORS["text_dim"]).pack(anchor="w")
             box = tk.Frame(f, bg=self.COLORS["bg_dark"], padx=5, pady=3)
             box.pack(pady=(5, 0))
             
-            years = [str(y) for y in range(2024, 2031)]
+            years = [f"{y % 100:02d}" for y in range(2024, 2031)]
             months = [f"{i:02d}" for i in range(1, 13)]
             days = [f"{i:02d}" for i in range(1, 32)]
             hours = [f"{i:02d}" for i in range(0, 24)]
             mins = [f"{i:02d}" for i in range(0, 61)]
             
             sel = {}
-            y_cb = ttk.Combobox(box, values=years, width=5, font=("Consolas", 9))
-            y_cb.set(initial_dt.strftime("%Y"))
-            y_cb.pack(side="left")
+            d_cb = ttk.Combobox(box, values=days, width=3, font=("Consolas", 9))
+            d_cb.set(initial_dt.strftime("%d"))
+            d_cb.pack(side="left")
             tk.Label(box, text="-", bg=self.COLORS["bg_dark"], fg="white").pack(side="left")
             m_cb = ttk.Combobox(box, values=months, width=3, font=("Consolas", 9))
             m_cb.set(initial_dt.strftime("%m"))
             m_cb.pack(side="left")
             tk.Label(box, text="-", bg=self.COLORS["bg_dark"], fg="white").pack(side="left")
-            d_cb = ttk.Combobox(box, values=days, width=3, font=("Consolas", 9))
-            d_cb.set(initial_dt.strftime("%d"))
-            d_cb.pack(side="left")
+            y_cb = ttk.Combobox(box, values=years, width=5, font=("Consolas", 9))
+            y_cb.set(initial_dt.strftime("%y"))
+            y_cb.pack(side="left")
             
             tk.Label(box, text="  ", bg=self.COLORS["bg_dark"]).pack(side="left")
             h_cb = ttk.Combobox(box, values=hours, width=3, font=("Consolas", 9))
@@ -6910,11 +7032,11 @@ class ModbusApp(BackupMixin):
             self.app_tree.column(col, width=125, minwidth=90, anchor="center", stretch=True)
 
         try:
-            get_dt = lambda s: datetime.strptime(f"{s['y'].get()}-{s['m'].get()}-{s['d'].get()} {s['h'].get()}:{s['min'].get()}:00", "%Y-%m-%d %H:%M:%S")
+            get_dt = lambda s: datetime.strptime(f"20{s['y'].get()}-{s['m'].get()}-{s['d'].get()} {s['h'].get()}:{s['min'].get()}:00", "%Y-%m-%d %H:%M:%S")
             from_dt = get_dt(self.app_from_dt)
             to_dt = get_dt(self.app_to_dt)
         except Exception as e:
-            messagebox.showerror("Error", f"Invalid date selection: {e}")
+            messagebox.showerror("Error", display_dates(f"Invalid date selection: {e}"))
             return
 
         approvals = load_approvals()
@@ -6996,7 +7118,7 @@ class ModbusApp(BackupMixin):
                 reading_values = [pivoted_data[ts].get(name, "-") for name in register_names]
                 if all(v == "-" or v == "" for v in reading_values):
                     continue
-                self.app_tree.insert("", "end", values=(ts, dev_alias, *reading_values, "APPROVED"))
+                self.app_tree.insert("", "end", values=display_dates((ts, dev_alias, *reading_values, "APPROVED")))
                 inserted_count += 1
 
         if inserted_count > 0:
@@ -7050,31 +7172,31 @@ class ModbusApp(BackupMixin):
         def dt_selector(label, initial_dt):
             f = tk.Frame(dt_cnt, bg=self.COLORS["bg_surface"])
             f.pack(side="left", fill="x", expand=True, padx=5)
-            tk.Label(f, text=label, font=("Segoe UI", 8, "bold"), 
+            tk.Label(f, text=display_dates(label), font=("Segoe UI", 8, "bold"), 
                      bg=self.COLORS["bg_surface"], fg=self.COLORS["text_dim"]).pack(anchor="w")
             
             box = tk.Frame(f, bg=self.COLORS["bg_dark"], padx=5, pady=5)
             box.pack(fill="x", pady=(5, 0))
             
-            years = [str(y) for y in range(2024, 2031)]
+            years = [f"{y % 100:02d}" for y in range(2024, 2031)]
             months = [f"{i:02d}" for i in range(1, 13)]
             days = [f"{i:02d}" for i in range(1, 32)]
             hours = [f"{i:02d}" for i in range(0, 24)]
             mins = [f"{i:02d}" for i in range(0, 61)]
             
             sel = {}
-            # Layout: YYYY - MM - DD
-            y_cb = ttk.Combobox(box, values=years, width=5, font=("Consolas", 9))
-            y_cb.set(initial_dt.strftime("%Y"))
-            y_cb.pack(side="left")
+            # Layout: DD - MM - YY
+            d_cb = ttk.Combobox(box, values=days, width=3, font=("Consolas", 9))
+            d_cb.set(initial_dt.strftime("%d"))
+            d_cb.pack(side="left")
             tk.Label(box, text="-", bg=self.COLORS["bg_dark"], fg="white").pack(side="left")
             m_cb = ttk.Combobox(box, values=months, width=3, font=("Consolas", 9))
             m_cb.set(initial_dt.strftime("%m"))
             m_cb.pack(side="left")
             tk.Label(box, text="-", bg=self.COLORS["bg_dark"], fg="white").pack(side="left")
-            d_cb = ttk.Combobox(box, values=days, width=3, font=("Consolas", 9))
-            d_cb.set(initial_dt.strftime("%d"))
-            d_cb.pack(side="left")
+            y_cb = ttk.Combobox(box, values=years, width=5, font=("Consolas", 9))
+            y_cb.set(initial_dt.strftime("%y"))
+            y_cb.pack(side="left")
             
             # Layout: HH : MM
             tk.Label(box, text="  ", bg=self.COLORS["bg_dark"]).pack(side="left")
@@ -7121,7 +7243,7 @@ class ModbusApp(BackupMixin):
                         font=self.FONTS["button"], relief="flat", cursor="hand2", 
                         command=lambda: self.perform_export("pdf")).pack(side="left", fill="x", expand=True, padx=5, ipady=12)
 
-        tk.Label(card, text=f"Excel files are generated as CSV. PDF limit: {MAX_PDF_REGISTERS} registers and {MAX_PDF_RECORDS:,} records per report.",
+        tk.Label(card, text=display_dates(f"Excel files are generated as CSV. PDF limit: {MAX_PDF_REGISTERS} registers and {MAX_PDF_RECORDS:,} records per report."),
                  font=("Segoe UI", 7), bg=self.COLORS["bg_surface"], fg=self.COLORS["text_dim"]).pack(pady=15)
 
     @storage_operation
@@ -7170,18 +7292,18 @@ class ModbusApp(BackupMixin):
         
         if not all_files:
             d_name = dev.get('device_name', ip)
-            messagebox.showerror("Error", f"No data found for {d_name}")
+            messagebox.showerror("Error", display_dates(f"No data found for {d_name}"))
             return
             
         try:
-            get_dt = lambda s: datetime.strptime(f"{s['y'].get()}-{s['m'].get()}-{s['d'].get()} {s['h'].get()}:{s['min'].get()}:00", "%Y-%m-%d %H:%M:%S")
+            get_dt = lambda s: datetime.strptime(f"20{s['y'].get()}-{s['m'].get()}-{s['d'].get()} {s['h'].get()}:{s['min'].get()}:00", "%Y-%m-%d %H:%M:%S")
             from_dt = get_dt(from_selectors)
             to_dt = get_dt(to_selectors)
             if to_dt < from_dt:
                 messagebox.showwarning("Date Range", "TO date/time must be after FROM date/time.")
                 return
         except Exception as e:
-            messagebox.showerror("Error", f"Invalid date selection: {e}")
+            messagebox.showerror("Error", display_dates(f"Invalid date selection: {e}"))
             return
 
         # Find device alias and names for lookup
@@ -7290,7 +7412,7 @@ class ModbusApp(BackupMixin):
                         
                         # Sort by timestamp
                         for ts in sorted(pivoted_data.keys()):
-                            row_vals = [ts, dev_alias]
+                            row_vals = [display_dates(ts), dev_alias]
                             for rname in reg_headers:
                                 row_vals.append(pivoted_data[ts].get(rname, ""))
                             if all(v == "" or v == "-" for v in row_vals[2:]):
@@ -7298,7 +7420,7 @@ class ModbusApp(BackupMixin):
                             row_vals.append("APPROVED" if pivoted_approval.get(ts, False) else "VIEWED / DRAFT")
                             writer.writerow(row_vals)
                     
-                    messagebox.showinfo("Success", f"Data pivoted and exported to {target_file}")
+                    messagebox.showinfo("Success", display_dates(f"Data pivoted and exported to {target_file}"))
                     approval_values = [pivoted_approval.get(ts, False) for ts in pivoted_data]
                     export_status = "APPROVED" if approval_values and all(approval_values) else "DRAFT / CONTAINS UNAPPROVED DATA"
                     self.log_audit("DATA_EXPORT", "EXPORT", f"Exported CSV data for device '{dev_alias}' ({len(pivoted_data)} records)",
@@ -7307,7 +7429,7 @@ class ModbusApp(BackupMixin):
                     webbrowser.open(target_file)
                 else:
                     messagebox.showwarning("No Data", "No records found for the range.")
-            except Exception as e: messagebox.showerror("Error", f"Excel Pivot Export failed: {e}")
+            except Exception as e: messagebox.showerror("Error", display_dates(f"Excel Pivot Export failed: {e}"))
 
         elif fmt == "pdf":
             if not HAS_REPORTLAB:
@@ -7316,8 +7438,8 @@ class ModbusApp(BackupMixin):
             if len(sorted_regs) > MAX_PDF_REGISTERS:
                 messagebox.showerror(
                     "PDF Register Limit",
-                    f"A PDF report supports a maximum of {MAX_PDF_REGISTERS} registers. "
-                    f"This device currently has {len(sorted_regs)} configured report registers."
+                    display_dates(f"A PDF report supports a maximum of {MAX_PDF_REGISTERS} registers. "
+                    f"This device currently has {len(sorted_regs)} configured report registers.")
                 )
                 return
             
@@ -7399,8 +7521,8 @@ class ModbusApp(BackupMixin):
                 if len(pivoted_data) > MAX_PDF_RECORDS:
                     messagebox.showerror(
                         "PDF Record Limit",
-                        f"A single PDF supports a maximum of {MAX_PDF_RECORDS:,} records. "
-                        "Select a smaller date range or a larger time interval."
+                        display_dates(f"A single PDF supports a maximum of {MAX_PDF_RECORDS:,} records. "
+                        "Select a smaller date range or a larger time interval.")
                     )
                     return
 
@@ -7414,7 +7536,7 @@ class ModbusApp(BackupMixin):
                         force_approved=exporting_from_approved
                     )
                     report_kind = "Approved Data" if exporting_from_approved else "View Data"
-                    messagebox.showinfo("Success", f"{report_kind} PDF log generated: {target_file}")
+                    messagebox.showinfo("Success", display_dates(f"{report_kind} PDF log generated: {target_file}"))
                     self.log_audit("DATA_EXPORT", "EXPORT", f"Exported {report_kind} PDF log for device '{dev_alias}' ({len(pivoted_data)} records)",
                                    device_info=f"{platform.node()}; device={ip}:{port}; slave={slave_id_part}",
                                    updated_value="FINAL / APPROVED" if exporting_from_approved else "DRAFT")
@@ -7449,7 +7571,7 @@ class ModbusApp(BackupMixin):
 
                     # Title
                     canvas_obj.setFillColorRGB(0.01, 0.35, 0.73); canvas_obj.setFont("Helvetica-Bold", 18)
-                    canvas_obj.drawString(40, h-50, self.company_details.get("company_name", "TempTrek Environmental Monitoring System"))
+                    canvas_obj.drawString(40, h-50, display_dates(self.company_details.get("company_name", "TempTrek Environmental Monitoring System")))
                     
                     # Header Stamp Badge (Top Right)
                     if is_approved:
@@ -7467,10 +7589,10 @@ class ModbusApp(BackupMixin):
 
                     # Metadata
                     canvas_obj.setFont("Helvetica", 9); canvas_obj.setFillColorRGB(0.5, 0.5, 0.5)
-                    canvas_obj.drawString(40, h-70, f"DEVICE: {dev_alias} | GENERATED: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-                    canvas_obj.drawString(40, h-85, f"RANGE: {from_dt} TO {to_dt}")
+                    canvas_obj.drawString(40, h-70, display_dates(f"DEVICE: {dev_alias} | GENERATED: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"))
+                    canvas_obj.drawString(40, h-85, display_dates(f"RANGE: {from_dt} TO {to_dt}"))
                     canvas_obj.line(40, h-95, w-40, h-95)
-                    canvas_obj.setFont("Helvetica", 8); canvas_obj.drawRightString(w-40, 20, f"Page {page_num}")
+                    canvas_obj.setFont("Helvetica", 8); canvas_obj.drawRightString(w-40, 20, display_dates(f"Page {page_num}"))
 
                 page = 1
                 draw_report_header(c, page)
@@ -7516,8 +7638,8 @@ class ModbusApp(BackupMixin):
                         py = gy + 40 + (i * plot_h / 5)
                         c.setStrokeColorRGB(0.85, 0.85, 0.85)
                         c.line(gx+60, py, gx+60+plot_w, py)
-                        prec = 2 # Fixed precision for PDF axis
-                        c.drawString(gx+15, py-2, f"{tick_val:.{prec}f}")
+                        prec = graph_precision(self.devices, [f"{ip}:{port}:{slave_id_part}:{reg}" for reg in sorted_regs], self.trend_settings.get("decimal_places", 3))
+                        c.drawString(gx+15, py-2, display_dates(f"{tick_val:.{prec}f}"))
 
                     # Draw Data (Line or Bar)
                     palette = ["#005CB8", "#28A745", "#D73A49", "#F29900", "#6F42C1"]
@@ -7556,7 +7678,7 @@ class ModbusApp(BackupMixin):
                         ly_leg = gy + gh - 50 - (idx * 15)
                         c.setFillColorRGB(r_col, g_col, b_col); c.rect(gx + gw - 140, ly_leg, 8, 8, fill=1, stroke=0)
                         c.setFillColorRGB(0.2, 0.2, 0.2); c.setFont("Helvetica-Bold", 8)
-                        c.drawString(gx + gw - 125, ly_leg + 1, rname[:18].upper())
+                        c.drawString(gx + gw - 125, ly_leg + 1, display_dates(rname[:18].upper()))
 
                 # --- DATA TABLE ---
                 y = gy - 40
@@ -7571,7 +7693,7 @@ class ModbusApp(BackupMixin):
                     col_w = remaining_w / max(1, len(reg_names_only))
                     
                     for i, rname in enumerate(reg_names_only):
-                        canvas_obj.drawString(x_start + (i*col_w), y_pos, rname[:12].upper())
+                        canvas_obj.drawString(x_start + (i*col_w), y_pos, display_dates(rname[:12].upper()))
                     
                     canvas_obj.setStrokeColorRGB(0.1, 0.1, 0.1); canvas_obj.setLineWidth(1)
                     canvas_obj.line(40, y_pos-5, w-40, y_pos-5)
@@ -7588,8 +7710,8 @@ class ModbusApp(BackupMixin):
                         y = draw_table_header(c, y)
                     
                     c.setFillColorRGB(0.2, 0.2, 0.2); c.setFont("Helvetica", 9)
-                    c.drawString(40, y, ts)
-                    c.drawString(180, y, dev_alias[:20])
+                    c.drawString(40, y, display_dates(ts))
+                    c.drawString(180, y, display_dates(dev_alias[:20]))
                     
                     x_start = 320
                     remaining_w = w - 40 - x_start
@@ -7627,7 +7749,7 @@ class ModbusApp(BackupMixin):
                             c.setFillColorRGB(0.2, 0.2, 0.2); c.setFont("Helvetica", 9)
                             
                         display_text = f"{val_str}{unit}" if val_str != "-" else "-"
-                        c.drawString(x_start + (i*col_w), y, display_text)
+                        c.drawString(x_start + (i*col_w), y, display_dates(display_text))
                     
                     # Row grid line
                     c.setStrokeColorRGB(0.9, 0.9, 0.9); c.setLineWidth(0.5)
@@ -7635,12 +7757,12 @@ class ModbusApp(BackupMixin):
                     y -= 18
 
                 c.save()
-                messagebox.showinfo("Success", f"PDF report generated: {target_file}")
+                messagebox.showinfo("Success", display_dates(f"PDF report generated: {target_file}"))
                 self.log_audit("DATA_EXPORT", "EXPORT", f"Exported PDF report for device '{dev_alias}' ({len(sorted_ts)} records)",
                                device_info=f"{platform.node()}; device={ip}:{port}; slave={slave_id_part}",
                                updated_value="FINAL / APPROVED" if is_approved else "DRAFT")
                 webbrowser.open(target_file)
-            except Exception as e: messagebox.showerror("Error", f"PDF Export failed: {e}")
+            except Exception as e: messagebox.showerror("Error", display_dates(f"PDF Export failed: {e}"))
 
     @storage_operation
     def _generate_view_data_log_pdf(self, target_file, dev, dev_alias, from_dt, to_dt,
@@ -7670,7 +7792,7 @@ class ModbusApp(BackupMixin):
 
         rows_per_page = 14
         data_pages = max(1, (len(sorted_ts) + rows_per_page - 1) // rows_per_page)
-        total_pages = 1 + data_pages
+        total_pages = 2 + data_pages
         printed_at = datetime.now()
 
         approvals = load_approvals()
@@ -7697,9 +7819,9 @@ class ModbusApp(BackupMixin):
             c.setFont("Helvetica-Bold" if bold else "Helvetica", size)
             value = str(value)
             if centered:
-                c.drawCentredString(x, y, value)
+                c.drawCentredString(x, y, display_dates(value))
             else:
-                c.drawString(x, y, value)
+                c.drawString(x, y, display_dates(value))
 
         def watermark():
             if approved:
@@ -7814,7 +7936,7 @@ class ModbusApp(BackupMixin):
             text(w / 2, 20, f"Printed By - {self.current_user} On {printed_at.strftime('%d/%m/%Y %H:%M:%S')}", False, 8, True)
             c.setFillColorRGB(0, 0, 0)
             c.setFont("Helvetica", 8)
-            c.drawRightString(right - 2, 20, f"Page {page_no} of {total_pages}")
+            c.drawRightString(right - 2, 20, display_dates(f"Page {page_no} of {total_pages}"))
             return header_bottom - 12
 
         # Page 1: Side-by-side MKT (Left Table) & MKRH (Right Table) Summary Report
@@ -7932,6 +8054,122 @@ class ModbusApp(BackupMixin):
 
         c.showPage()
 
+        # Page 2: up to ten channels, with every record in the selected range.
+        graph_top = common_header(2)
+        text(25, graph_top, "CHANNEL TREND - FULL SELECTED RANGE", True, 10)
+        graph_ts = sorted_ts
+        text(25, graph_top - 13,
+             f"All {len(graph_ts)} records plotted for {len(reg_names_only)} registers. Records equally spaced in time order.", size=8)
+        palette = [(0.0, 0.36, 0.72), (0.8, 0.22, 0.1), (0.0, 0.48, 0.3),
+                   (0.48, 0.2, 0.65), (0.65, 0.4, 0.0), (0.0, 0.48, 0.58),
+                   (0.7, 0.15, 0.45), (0.3, 0.3, 0.3), (0.45, 0.5, 0.0),
+                   (0.35, 0.25, 0.15)]
+        series = []
+        for channel_idx, name in enumerate(reg_names_only):
+            unit = dev_units.get(str(sorted_regs[channel_idx]), "")
+            color = palette[channel_idx % len(palette)]
+            legend_x = 30 + (channel_idx % 4) * ((w - 60) / 4)
+            legend_y = graph_top - 31 - (channel_idx // 4) * 16
+            c.setStrokeColorRGB(*color)
+            c.setFillColorRGB(*color)
+            c.setLineWidth(1.5)
+            c.line(legend_x, legend_y, legend_x + 16, legend_y)
+            c.circle(legend_x + 8, legend_y, 2.5, fill=1, stroke=0)
+            legend_label = f"{name} ({unit})" if unit else name
+            legend_size = min(8, 158 / max(c.stringWidth(legend_label, "Helvetica", 1), 1))
+            text(legend_x + 21, legend_y - 3, legend_label, size=legend_size)
+            points = []
+            for index, ts in enumerate(graph_ts):
+                raw = pivoted_data[ts].get(name, "-")
+                try:
+                    value = float(raw)
+                except (ValueError, TypeError):
+                    continue
+                if math.isfinite(value):
+                    points.append((index, value, str(raw)))
+            series.append((color, points))
+
+        left, right, bottom = 85, w - 55, 100
+        top = graph_top - 65 - 16 * ((len(reg_names_only) - 1) // 4)
+        all_values = [point[1] for _, points in series for point in points]
+        if all_values:
+            low, high = min(all_values), max(all_values)
+            padding = (high - low) * 0.2 if high != low else max(abs(low) * 0.05, 1)
+            low, high = low - padding, high + padding
+            precision = max(channel_precision(dev, reg) for reg in sorted_regs)
+            text(left, top + 12, "Recorded value (units shown in legend)", size=8)
+            c.setStrokeColorRGB(0.7, 0.7, 0.7)
+            c.setLineWidth(0.4)
+            for fraction in (0, 0.2, 0.4, 0.6, 0.8, 1):
+                yy = bottom + fraction * (top - bottom)
+                c.line(left, yy, right, yy)
+                tick = f"{low + fraction * (high - low):.{precision}f}"
+                c.setFont("Helvetica", 7)
+                c.setFillColorRGB(0, 0, 0)
+                c.drawRightString(left - 8, yy - 2, tick)
+            c.line(left, bottom, left, top)
+            xs = [left + 25 + (right - left - 50) * index / (len(graph_ts) - 1)
+                  if len(graph_ts) > 1 else (left + right) / 2
+                  for index in range(len(graph_ts))]
+            tick_count = min(8, len(graph_ts))
+            tick_indices = {round(i * (len(graph_ts) - 1) / max(1, tick_count - 1))
+                            for i in range(tick_count)}
+            for index in sorted(tick_indices):
+                ts = graph_ts[index]
+                text(xs[index], bottom - 14, ts[11:19], size=7, centered=True)
+                text(xs[index], bottom - 26, ts[:10], size=7, centered=True)
+            text(w / 2, 58, "Selected point labels show exact values. All recorded values appear in the following data tables.",
+                 size=7, centered=True)
+            # Draw all lines first so subsequent lines cannot obscure value labels.
+            annotations = []
+            for color, points in series:
+                previous = None
+                # Limit annotations, not plotted data, to keep a long report legible.
+                label_count = min(8, len(points))
+                label_positions = {round(i * (len(points) - 1) / max(1, label_count - 1))
+                                   for i in range(label_count)}
+                for point_pos, (index, value, label) in enumerate(points):
+                    xx = xs[index]
+                    yy = bottom + (value - low) / (high - low) * (top - bottom)
+                    c.setStrokeColorRGB(*color)
+                    c.setFillColorRGB(*color)
+                    c.setLineWidth(1.4)
+                    if previous is not None and index == previous[0] + 1:
+                        c.line(previous[1], previous[2], xx, yy)
+                    c.circle(xx, yy, 3 if len(graph_ts) <= 20 else 1, fill=1, stroke=0)
+                    if point_pos in label_positions:
+                        annotations.append((xx, yy, label, color))
+                    previous = (index, xx, yy)
+            occupied = []
+            for xx, yy, label, color in annotations:
+                size = min(8, 58 / max(c.stringWidth(label, "Helvetica", 1), 1))
+                label_w = c.stringWidth(label, "Helvetica", size) + 4
+                label_x = min(right - label_w / 2, max(left + label_w / 2, xx))
+                label_y = yy + 7
+                for offset in [7] + [v for step in range(1, 25) for v in (7 + step * 11, -step * 11)]:
+                    candidate = yy + offset
+                    bounds = (label_x - label_w / 2, candidate - 2,
+                              label_x + label_w / 2, candidate + size + 2)
+                    if bounds[1] < bottom + 2 or bounds[3] > top - 2:
+                        continue
+                    if not any(bounds[0] < b[2] and bounds[2] > b[0] and
+                               bounds[1] < b[3] and bounds[3] > b[1] for b in occupied):
+                        label_y = candidate
+                        occupied.append(bounds)
+                        break
+                c.setStrokeColorRGB(*color)
+                c.setLineWidth(0.5)
+                if abs(label_y - yy) > 10:
+                    c.line(xx, yy, label_x, label_y + size / 2)
+                c.setFillColorRGB(1, 1, 1)
+                c.rect(label_x - label_w / 2, label_y - 2, label_w, size + 4, fill=1, stroke=0)
+                c.setFillColorRGB(*color)
+                c.setFont("Helvetica", size)
+                c.drawCentredString(label_x, label_y, label)
+        else:
+            text(w / 2, (top + bottom) / 2, "No numeric readings in these records", size=10, centered=True)
+        c.showPage()
+
         # Remaining pages: bordered date/time/channel log table.
         usable_w = w - 50
         fixed = [42, 84, 52]
@@ -7940,7 +8178,7 @@ class ModbusApp(BackupMixin):
         headers = ["Sr. No.", "Log Date", "Time"] + [n[:12] for n in reg_names_only]
 
         for page_idx in range(data_pages):
-            page_no = page_idx + 2
+            page_no = page_idx + 3
             y = common_header(page_no)
             x = 25
             for cw, label in zip(widths, headers):
@@ -8027,7 +8265,7 @@ class ModbusApp(BackupMixin):
                 self.mini_tree.selection_remove(sel[0])
                 self.btn_add_reg_main.config(text="+ ADD REGISTER", bg=self.COLORS["bg_highlight"])
             else:
-                self.mini_tree.insert("", "end", values=(addr, name, unit, dtype, reg_mode, math_str, dec_prec))
+                self.mini_tree.insert("", "end", values=display_dates((addr, name, unit, dtype, reg_mode, math_str, dec_prec)))
             
             if hasattr(self, 'entry_reg_addr_prefix'): self.entry_reg_addr_prefix.set("null")
             self.entry_reg_addr.delete(0, tk.END)
@@ -8040,7 +8278,7 @@ class ModbusApp(BackupMixin):
             self.entry_reg_factor.insert(0, "1")
             self.entry_reg_prec.set("3")
             self.entry_reg_addr.focus()
-        except Exception as err: messagebox.showerror("Error", f"Invalid Address: {err}")
+        except Exception as err: messagebox.showerror("Error", display_dates(f"Invalid Address: {err}"))
 
     def on_mini_select(self, event):
         sel = self.mini_tree.selection()
@@ -8190,7 +8428,7 @@ class ModbusApp(BackupMixin):
                 d_alias = d.get('device_name', '')
                 display_device = d_alias.upper() if d_alias else addr_str
 
-                self.node_tree.insert("", "end", values=(
+                self.node_tree.insert("", "end", values=display_dates((
                     f"{global_idx:02d}",
                     display_device if i == 0 else "", 
                     d.get('slave_id', 1) if i == 0 else "",
@@ -8202,7 +8440,7 @@ class ModbusApp(BackupMixin):
                     mode,
                     dec_prec,
                     status_text if i == 0 else ""
-                ), tags=(row_tag, status_tag, f"dev_idx_{dev_idx}"))
+                )), tags=(row_tag, status_tag, f"dev_idx_{dev_idx}"))
                 global_idx += 1
 
     def add_device_submit(self):
@@ -8344,13 +8582,13 @@ class ModbusApp(BackupMixin):
                 self.log_audit(act, "DEVICE", msg)
             self.refresh_device_list()
             self.clear_add_device_form()
-            messagebox.showinfo("Success", f"Added {len(slave_ids)} nodes successfully.")
+            messagebox.showinfo("Success", display_dates(f"Added {len(slave_ids)} nodes successfully."))
         except Exception as e: 
-            messagebox.showerror("Error", f"Invalid data: {e}")
+            messagebox.showerror("Error", display_dates(f"Invalid data: {e}"))
             self.refresh_device_list()
             self.clear_add_device_form()
         except Exception as e: 
-            messagebox.showerror("Error", f"Invalid data: {e}")
+            messagebox.showerror("Error", display_dates(f"Invalid data: {e}"))
 
     def clear_add_device_form(self):
         """ Resets the entire form to 'Add' mode """
@@ -8419,7 +8657,7 @@ class ModbusApp(BackupMixin):
                              highlightbackground=self.COLORS["bg_highlight"], highlightthickness=1)
         hdr_frame.pack(fill="x", padx=20, pady=15)
 
-        tk.Label(hdr_frame, text=f"NODE CONFIGURATION: {d_name.upper()}", font=("Segoe UI", 12, "bold"), 
+        tk.Label(hdr_frame, text=display_dates(f"NODE CONFIGURATION: {d_name.upper()}"), font=("Segoe UI", 12, "bold"), 
                  fg=self.COLORS["accent"], bg=self.COLORS["bg_surface"]).pack(anchor="w", pady=(0, 10))
 
         info_grid = tk.Frame(hdr_frame, bg=self.COLORS["bg_surface"])
@@ -8440,9 +8678,9 @@ class ModbusApp(BackupMixin):
             row = i // 3
             cell = tk.Frame(info_grid, bg=self.COLORS["bg_surface"])
             cell.grid(row=row, column=col, sticky="w", padx=15, pady=4)
-            tk.Label(cell, text=k, font=("Segoe UI", 8, "bold"), fg=self.COLORS["text_dim"], bg=self.COLORS["bg_surface"]).pack(side="left", padx=(0, 5))
+            tk.Label(cell, text=display_dates(k), font=("Segoe UI", 8, "bold"), fg=self.COLORS["text_dim"], bg=self.COLORS["bg_surface"]).pack(side="left", padx=(0, 5))
             val_fg = self.COLORS["success"] if v == "ACTIVE" else (self.COLORS["danger"] if v == "INACTIVE" else self.COLORS["text_main"])
-            tk.Label(cell, text=v, font=("Segoe UI", 9, "bold"), fg=val_fg, bg=self.COLORS["bg_surface"]).pack(side="left")
+            tk.Label(cell, text=display_dates(v), font=("Segoe UI", 9, "bold"), fg=val_fg, bg=self.COLORS["bg_surface"]).pack(side="left")
 
         # Register Mapping Table Header
         reg_title_frame = tk.Frame(top, bg=self.COLORS["bg_dark"])
@@ -8502,7 +8740,7 @@ class ModbusApp(BackupMixin):
             math_str = f"0={op} / 1={fact}" if dt == "BOOLEAN" else f"{op} {fact}"
             dp = decimals.get(str(reg), "3")
 
-            tree.insert("", "end", values=(reg, str(nm).upper() if nm else f"REG {reg}", un, dt, md, math_str, dp))
+            tree.insert("", "end", values=display_dates((reg, str(nm).upper() if nm else f"REG {reg}", un, dt, md, math_str, dp)))
 
         # Close Button
         btn_bar = tk.Frame(top, bg=self.COLORS["bg_dark"], pady=10)
@@ -8566,7 +8804,7 @@ class ModbusApp(BackupMixin):
             if dtype == "BOOLEAN":
                 unit_val = "na"
 
-            self.mini_tree.insert("", "end", values=(
+            self.mini_tree.insert("", "end", values=display_dates((
                 r, 
                 names.get(str(r), ""), 
                 unit_val, 
@@ -8574,7 +8812,7 @@ class ModbusApp(BackupMixin):
                 mode,
                 math_str,
                 decimals.get(str(r), "3")
-            ))
+            )))
             
         self.btn_add.config(text="UPDATE NODE", bg=self.COLORS["warning"])
 
@@ -8628,7 +8866,7 @@ class ModbusApp(BackupMixin):
         tk.Button(bar, text="⬅ BACK TO LOGS", bg=self.COLORS["bg_surface"], fg=self.COLORS["text_dim"], font=self.FONTS["button"], relief="flat", padx=12, command=lambda: self.navigate("live_log")).pack(side="left", padx=5)
         
         date_str = datetime.now().strftime("%Y-%m-%d")
-        tk.Label(bar, text=f"Alerts for: {date_str}", font=("Segoe UI", 10, "bold"), fg=self.COLORS["text_dim"], bg=self.COLORS["bg_dark"]).pack(side="left", padx=20)
+        tk.Label(bar, text=display_dates(f"Alerts for: {date_str}"), font=("Segoe UI", 10, "bold"), fg=self.COLORS["text_dim"], bg=self.COLORS["bg_dark"]).pack(side="left", padx=20)
         
         tk.Button(bar, text="💾 EXPORT TO CSV", bg=self.COLORS["accent"], fg="black", font=self.FONTS["button"], relief="flat", padx=12, command=self.export_email_alerts_to_csv).pack(side="right", padx=5)
 
@@ -8671,9 +8909,9 @@ class ModbusApp(BackupMixin):
                     reader = csv.reader((line.replace('\0', '') for line in f))
                     header = next(reader, None) # Skip header
                     for row in reader:
-                        if row: tree.insert("", "end", values=row)
+                        if row: tree.insert("", "end", values=display_dates(row))
             except Exception as e:
-                tk.Label(cnt, text=f"Error reading log: {e}", fg="red").pack()
+                tk.Label(cnt, text=display_dates(f"Error reading log: {e}"), fg="red").pack()
         else:
             tk.Label(cnt, text="No alarm history for today.", font=("Segoe UI", 12), fg=self.COLORS["text_dim"], bg=self.COLORS["bg_surface"]).pack(pady=50)
 
@@ -8695,10 +8933,10 @@ class ModbusApp(BackupMixin):
         if target_file:
             try:
                 shutil.copy2(source_fn, target_file)
-                messagebox.showinfo("Success", f"Alarm history exported to:\n{target_file}")
+                messagebox.showinfo("Success", display_dates(f"Alarm history exported to:\n{target_file}"))
                 webbrowser.open(target_file)
             except Exception as e:
-                messagebox.showerror("Export Failed", f"Could not export file: {e}")
+                messagebox.showerror("Export Failed", display_dates(f"Could not export file: {e}"))
 
     def show_email_logs_history(self):
         bar = tk.Frame(self.content_frame, bg=self.COLORS["bg_dark"])
@@ -8707,7 +8945,7 @@ class ModbusApp(BackupMixin):
         tk.Button(bar, text="⬅ BACK TO LOGS", bg=self.COLORS["bg_surface"], fg=self.COLORS["text_dim"], font=self.FONTS["button"], relief="flat", padx=12, command=lambda: self.navigate("live_log")).pack(side="left", padx=5)
         
         date_str = datetime.now().strftime("%Y-%m-%d")
-        tk.Label(bar, text=f"Emails Sent: {date_str}", font=("Segoe UI", 10, "bold"), fg=self.COLORS["text_dim"], bg=self.COLORS["bg_dark"]).pack(side="left", padx=20)
+        tk.Label(bar, text=display_dates(f"Emails Sent: {date_str}"), font=("Segoe UI", 10, "bold"), fg=self.COLORS["text_dim"], bg=self.COLORS["bg_dark"]).pack(side="left", padx=20)
         
         tk.Button(bar, text="💾 EXPORT LOGS", bg=self.COLORS["success"], fg="white", font=self.FONTS["button"], relief="flat", padx=12, command=self.export_email_logs_to_csv).pack(side="right", padx=5)
 
@@ -8745,9 +8983,9 @@ class ModbusApp(BackupMixin):
                     reader = csv.reader((line.replace('\0', '') for line in f))
                     header = next(reader, None)
                     for row in reader:
-                        if row: tree.insert("", "end", values=row)
+                        if row: tree.insert("", "end", values=display_dates(row))
             except Exception as e:
-                tk.Label(cnt, text=f"Error: {e}", fg="red").pack()
+                tk.Label(cnt, text=display_dates(f"Error: {e}"), fg="red").pack()
         else:
             tk.Label(cnt, text="No emails sent today.", font=("Segoe UI", 12), fg=self.COLORS["text_dim"], bg=self.COLORS["bg_surface"]).pack(pady=50)
 
@@ -8763,12 +9001,12 @@ class ModbusApp(BackupMixin):
 
     def _append_alarm_live(self, row):
         if hasattr(self, 'alerts_live_tree') and self.alerts_live_tree.winfo_exists():
-            self.alerts_live_tree.insert("", "end", values=row)
+            self.alerts_live_tree.insert("", "end", values=display_dates(row))
             self.alerts_live_tree.yview_moveto(1)
 
     def _append_email_log_live(self, row):
         if hasattr(self, 'email_logs_live_tree') and self.email_logs_live_tree.winfo_exists():
-            self.email_logs_live_tree.insert("", "end", values=row)
+            self.email_logs_live_tree.insert("", "end", values=display_dates(row))
             self.email_logs_live_tree.yview_moveto(1)
 
     @storage_operation
@@ -8843,16 +9081,16 @@ class ModbusApp(BackupMixin):
             def draw_header(curr_page):
                 c.setFillColorRGB(0.05, 0.08, 0.12); c.rect(0, 0, w, h, fill=1)
                 c.setFillColorRGB(0, 0.7, 1.0); c.setFont("Helvetica-Bold", 20)
-                c.drawString(40, h-45, self.company_details.get("company_name", "TempTrek Environmental Monitoring System"))
+                c.drawString(40, h-45, display_dates(self.company_details.get("company_name", "TempTrek Environmental Monitoring System")))
                 c.setFillColorRGB(1, 1, 1); c.setFont("Helvetica", 10)
-                c.drawString(40, h-65, f"COMPLETE DAILY LOG | Date: {datetime.now().strftime('%Y-%m-%d')} | Page: {curr_page}")
+                c.drawString(40, h-65, display_dates(f"COMPLETE DAILY LOG | Date: {datetime.now().strftime('%Y-%m-%d')} | Page: {curr_page}"))
                 c.setStrokeColorRGB(0, 0.7, 1.0); c.setLineWidth(1.5); c.line(40, h-75, w-40, h-75)
                 
                 c.setFont("Helvetica-Bold", 9); c.setFillColorRGB(0.85, 0.85, 0.85)
                 yh = h - 95
                 labels = [("S.NO", 40), ("DEVICE NAME", 85), ("IP", 210), ("FIELD NAME", 330), 
                           ("ADDR", 470), ("READING", 520), ("UNIT", 610), ("TYPE", 660), ("TIME", 725)]
-                for lbl, lx in labels: c.drawString(lx, yh, lbl)
+                for lbl, lx in labels: c.drawString(lx, yh, display_dates(lbl))
                 c.setLineWidth(0.5); c.line(40, yh-5, w-40, yh-5)
                 return yh - 22
 
@@ -8867,15 +9105,15 @@ class ModbusApp(BackupMixin):
                 c.setFillColorRGB(1, 0.2, 0.2) if is_alert else c.setFillColorRGB(0.95, 0.95, 0.95)
                 c.setFont("Helvetica-Bold" if is_alert else "Helvetica", 8)
                 
-                c.drawString(40, y, f"{idx+1:03d}")
-                c.drawString(85, y, str(e[1])[:22])
-                c.drawString(210, y, str(e[2])[:22])
-                c.drawString(330, y, str(e[3])[:28])
-                c.drawString(470, y, str(e[4]))
-                c.drawString(520, y, str(e[5])[:25])
-                c.drawString(610, y, str(e[6]))
-                c.drawString(660, y, str(e[7])[:15])
-                c.drawString(725, y, str(e[8]))
+                c.drawString(40, y, display_dates(f"{idx+1:03d}"))
+                c.drawString(85, y, display_dates(str(e[1])[:22]))
+                c.drawString(210, y, display_dates(str(e[2])[:22]))
+                c.drawString(330, y, display_dates(str(e[3])[:28]))
+                c.drawString(470, y, display_dates(str(e[4])))
+                c.drawString(520, y, display_dates(str(e[5])[:25]))
+                c.drawString(610, y, display_dates(str(e[6])))
+                c.drawString(660, y, display_dates(str(e[7])[:15]))
+                c.drawString(725, y, display_dates(str(e[8])))
                 
                 y -= 14
                 if y < 45:
@@ -8885,10 +9123,10 @@ class ModbusApp(BackupMixin):
             
             c.save()
             self.log_audit("LOG_EXPORT", "EXPORT", f"Exported complete daily log PDF ({len(all_logs)} records)")
-            messagebox.showinfo("Success", f"Full Daily Log Exported!\n\nLocation: {fn}")
+            messagebox.showinfo("Success", display_dates(f"Full Daily Log Exported!\n\nLocation: {fn}"))
             webbrowser.open(target_file)
         except Exception as ex:
-            messagebox.showerror("Export Error", f"Failed to generate report: {ex}")
+            messagebox.showerror("Export Error", display_dates(f"Failed to generate report: {ex}"))
 
     def show_live_log(self):
         bar = tk.Frame(self.content_frame, bg=self.COLORS["bg_dark"])
@@ -8945,25 +9183,52 @@ class ModbusApp(BackupMixin):
             tag = ""
             if any(k in str(e[5]) for k in ["SUCCESS:", "FAILURE:", "ALERT:"]):
                 tag = "alert_row"
-            self.log_tree.insert("", "end", values=e, tags=(tag,))
+            self.log_tree.insert("", "end", values=display_dates(e), tags=(tag,))
         self.log_tree.yview_moveto(1)
 
     # -------------------------
     # CORE LOGIC
     # -------------------------
+    def _wait_for_device_restart(self, dev, starter):
+        """Queue one restart without overlapping polling workers or blocking Tk."""
+        key = f"{dev['ip']}:{dev['port']}:{dev.get('slave_id', 1)}"
+        worker = self.device_threads.get(key)
+        if worker is None or not worker.is_alive():
+            return False
+        stop = self.stop_events.get(key)
+        if stop is not None and stop.is_set() and not getattr(stop, 'restart_requested', False):
+            stop.restart_requested = True
+
+            def retry():
+                if self.stop_events.get(key) is not stop or not stop.restart_requested:
+                    return
+                if self.restore_in_progress or self.restart_required:
+                    stop.restart_requested = False
+                    return
+                if worker.is_alive():
+                    self.root.after(100, retry)
+                    return
+                stop.restart_requested = False
+                starter(dev)
+
+            self.root.after(100, retry)
+        return True
+
     def start_device(self, dev):
         if self.restore_in_progress or self.restart_required:
             raise RuntimeError("Restart TempTrek before starting monitoring.")
         ip, port, slave = dev['ip'], dev['port'], dev.get('slave_id', 1)
         key = f"{ip}:{port}:{slave}"
-        if key in self.device_threads and self.device_threads[key].is_alive(): return
+        if self._wait_for_device_restart(dev, self.start_device): return
         ev = threading.Event()
         rev = threading.Event()
         self.stop_events[key] = ev
         self.refresh_events[key] = rev
         t = threading.Thread(target=read_modbus_device, args=(ip, port, dev['registers'], self, ev, slave, rev), daemon=True)
-        t.start()
+        self.device_modes[key] = "live"
         self.device_threads[key] = t
+        t.start()
+        self.refresh_monitoring_indicators()
         self.root.after(500, self.refresh_view_if_active)
 
     def start_simulation_device(self, dev):
@@ -8971,7 +9236,7 @@ class ModbusApp(BackupMixin):
             raise RuntimeError("Restart TempTrek before starting monitoring.")
         ip, port, slave = dev['ip'], dev['port'], dev.get('slave_id', 1)
         key = f"{ip}:{port}:{slave}"
-        if key in self.device_threads and self.device_threads[key].is_alive(): return
+        if self._wait_for_device_restart(dev, self.start_simulation_device): return
         
         ev = threading.Event()
         rev = threading.Event()
@@ -8979,8 +9244,10 @@ class ModbusApp(BackupMixin):
         self.refresh_events[key] = rev
         
         t = threading.Thread(target=read_dummy_device, args=(ip, port, dev['registers'], self, ev, slave, rev), daemon=True)
-        t.start()
+        self.device_modes[key] = "simulation"
         self.device_threads[key] = t
+        t.start()
+        self.refresh_monitoring_indicators()
         self.root.after(500, self.refresh_view_if_active)
 
     def simulate_all_devices(self):
@@ -8988,14 +9255,23 @@ class ModbusApp(BackupMixin):
 
     def stop_device(self, dev):
         key = f"{dev['ip']}:{dev['port']}:{dev.get('slave_id', 1)}"
-        if key in self.stop_events: self.stop_events[key].set()
+        if key in self.stop_events:
+            self.stop_events[key].restart_requested = False
+            self.stop_events[key].set()
+        if key in self.refresh_events:
+            self.refresh_events[key].set()
+        self.refresh_monitoring_indicators()
         self.root.after(500, self.refresh_view_if_active)
 
     def start_all_devices(self):
         for d in self.devices: self.start_device(d)
 
     def stop_all_devices(self):
-        for e in self.stop_events.values(): e.set()
+        for e in self.stop_events.values():
+            e.restart_requested = False
+            e.set()
+        for e in self.refresh_events.values(): e.set()
+        self.refresh_monitoring_indicators()
         self.root.after(500, self.refresh_view_if_active)
 
     def refresh_view_if_active(self):
@@ -9003,6 +9279,7 @@ class ModbusApp(BackupMixin):
 
     def periodic_refresher(self):
         try:
+            self.refresh_monitoring_indicators()
             errors = []
             while len(errors) < 20:
                 try:
@@ -9010,12 +9287,12 @@ class ModbusApp(BackupMixin):
                 except queue.Empty:
                     break
             if errors:
-                messagebox.showerror("Storage error — action required", "\n".join(dict.fromkeys(errors)))
+                messagebox.showerror("Storage error — action required", display_dates("\n".join(dict.fromkeys(errors))))
             if not self.restore_in_progress and not self.restart_required:
                 self.check_scheduled_pdf_email()
                 self.check_automatic_backup()
         except Exception as exc:
-            messagebox.showerror("Background operation failed", str(exc))
+            messagebox.showerror("Background operation failed", display_dates(str(exc)))
         finally:
             self.root.after(1000, self.periodic_refresher)
 
@@ -9111,7 +9388,7 @@ class ModbusApp(BackupMixin):
                                     display_val = f"{float(vn):.{prec}f}"
                                 except: pass
                             
-                            self.live_labels[lid].config(text=display_val)
+                            self.live_labels[lid].config(text=display_dates(display_val))
                             
                             # Persistence
                             self.last_values[lid] = display_val
@@ -9121,13 +9398,13 @@ class ModbusApp(BackupMixin):
                             self.last_update_times[lid] = full_ts
                             time_lid = f"{lid}:time"
                             if time_lid in self.live_labels:
-                                self.live_labels[time_lid].config(text=f"Last Update: {full_ts}")
+                                self.live_labels[time_lid].config(text=display_dates(f"Last Update: {full_ts}"))
 
                             # Update Sync Time on Header
                             k_sync = f"{ip}:{port}:{slave}:sync"
                             if k_sync in self.live_labels:
                                 self.last_update_times[f"{ip}:{port}:{slave}"] = ts
-                                self.live_labels[k_sync].config(text=f"Last Sync: {ts}")
+                                self.live_labels[k_sync].config(text=display_dates(f"Last Sync: {ts}"))
                             
                             # Update History for Graphing
                             try:
@@ -9164,7 +9441,7 @@ class ModbusApp(BackupMixin):
             tag = ""
             if any(k in msg for k in ["SUCCESS:", "FAILURE:", "ALERT:"]):
                 tag = "alert_row"
-            self.log_tree.insert("", "end", values=e, tags=(tag,))
+            self.log_tree.insert("", "end", values=display_dates(e), tags=(tag,))
             self.log_tree.yview_moveto(1)
 
     def update_chat_from_history(self):
@@ -9211,7 +9488,7 @@ class ModbusApp(BackupMixin):
         
         data = self.data_history.get(lid, [])
         if hasattr(self, 'graph_title'):
-            self.graph_title.config(text=f"MONITORING: {name.upper()}")
+            self.graph_title.config(text=display_dates(f"MONITORING: {name.upper()}"))
         
         w = self.graph_canvas.winfo_width()
         h = self.graph_canvas.winfo_height()
@@ -9237,8 +9514,8 @@ class ModbusApp(BackupMixin):
             val = v_min + (i * (v_max - v_min) / 4)
             y_g = h - padding - (i * usable_h / 4)
             self.graph_canvas.create_line(offset_x, y_g, w-padding, y_g, fill=self.COLORS["bg_highlight"], dash=(2, 2))
-            prec = int(self.trend_settings.get("decimal_places", 3))
-            self.graph_canvas.create_text(offset_x-5, y_g, text=f"{val:.{prec}f}", fill=self.COLORS["text_dim"], font=("Segoe UI", 6), anchor="e")
+            prec = graph_precision(self.devices, lid, self.trend_settings.get("decimal_places", 3))
+            self.graph_canvas.create_text(offset_x-5, y_g, text=display_dates(f"{val:.{prec}f}"), fill=self.COLORS["text_dim"], font=("Segoe UI", 6), anchor="e")
 
         points = []
         for i, v in enumerate(data):
@@ -9328,7 +9605,7 @@ class ModbusApp(BackupMixin):
             self.log_audit("LOGO_UPLOAD", "CONFIG", f"Uploaded new PDF report header logo '{os.path.basename(filepath)}'")
             messagebox.showinfo("Success", "Report logo updated successfully!\n\nIt will now appear on the right side of all exported PDF report headers.")
         except Exception as e:
-            messagebox.showerror("Upload Error", f"Failed to save logo image: {e}")
+            messagebox.showerror("Upload Error", display_dates(f"Failed to save logo image: {e}"))
 
     # -------------------------
     # VIEW: COMPANY DETAILS
@@ -9448,9 +9725,9 @@ class ModbusApp(BackupMixin):
             l1 = self.comp_line1_entry.get().strip() or "TempTrek Environmental Monitoring System"
             l2 = self.comp_line2_entry.get().strip() or "Environmental Monitoring Department"
             l3 = self.comp_line3_entry.get().strip() or "Temperature and Humidity Report"
-            self.lbl_prev_line1.config(text=l1)
-            self.lbl_prev_line2.config(text=l2)
-            self.lbl_prev_line3.config(text=l3)
+            self.lbl_prev_line1.config(text=display_dates(l1))
+            self.lbl_prev_line2.config(text=display_dates(l2))
+            self.lbl_prev_line3.config(text=display_dates(l3))
         if hasattr(self, 'lbl_logo_status'):
             custom_logo = os.path.join(DATA_PATH, "logo.png")
             if os.path.exists(custom_logo):
@@ -9489,7 +9766,7 @@ class ModbusApp(BackupMixin):
             messagebox.showinfo("Success", "Report logo updated successfully!\n\nIt will now appear on all exported PDF report headers.")
             self.update_company_preview()
         except Exception as e:
-            messagebox.showerror("Upload Error", f"Failed to save logo image: {e}")
+            messagebox.showerror("Upload Error", display_dates(f"Failed to save logo image: {e}"))
 
     def save_company_details_action(self):
         line1 = self.comp_line1_entry.get().strip()
@@ -9513,7 +9790,7 @@ class ModbusApp(BackupMixin):
             self.update_company_preview()
             messagebox.showinfo("Success", "Company header details saved successfully.\n\nAll future PDF exports will use these updated titles.")
         except Exception as e:
-            messagebox.showerror("Error", f"Failed to save company details: {e}")
+            messagebox.showerror("Error", display_dates(f"Failed to save company details: {e}"))
 
     def reset_company_details_action(self):
         if messagebox.askyesno("Confirm Reset", "Reset company details back to default values?"):
@@ -9585,10 +9862,10 @@ class ModbusApp(BackupMixin):
             if cat_filter != "ALL" and category.upper() != cat_filter:
                 continue
             if search_query:
-                combined = " ".join(str(value) for value in entry[:9]).lower()
+                combined = " ".join(str(value) for value in display_dates(entry[:9])).lower()
                 if search_query not in combined:
                     continue
-            self.audit_tree.insert("", "end", values=(ts, user, workstation, action, category, previous, updated, status, details))
+            self.audit_tree.insert("", "end", values=display_dates((ts, user, workstation, action, category, previous, updated, status, details)))
 
     def export_audit_log_to_pdf(self):
         if not HAS_REPORTLAB:
@@ -9636,9 +9913,9 @@ class ModbusApp(BackupMixin):
                 c.setFont("Helvetica-Bold" if bold else "Helvetica", size)
                 value = str(value)
                 if centered:
-                    c.drawCentredString(x, y, value)
+                    c.drawCentredString(x, y, display_dates(value))
                 else:
-                    c.drawString(x, y, value)
+                    c.drawString(x, y, display_dates(value))
 
             cat_filter = self.audit_cat_cb.get() if hasattr(self, 'audit_cat_cb') else "ALL"
             search_filter = self.audit_search_entry.get().strip() if hasattr(self, 'audit_search_entry') else ""
@@ -9728,7 +10005,7 @@ class ModbusApp(BackupMixin):
                 text(w / 2, 20, f"Printed By - {self.current_user} On {printed_at.strftime('%d/%m/%Y %H:%M:%S')}", False, 8, True)
                 c.setFillColorRGB(0, 0, 0)
                 c.setFont("Helvetica", 8)
-                c.drawRightString(right - 2, 20, f"Page {page_no} of {total_pages}")
+                c.drawRightString(right - 2, 20, display_dates(f"Page {page_no} of {total_pages}"))
 
                 # Table Column Headers
                 y_hdr = meta_top - (4 * row_h) - 15
@@ -9761,10 +10038,10 @@ class ModbusApp(BackupMixin):
 
             c.save()
             self.log_audit("AUDIT_LOG_EXPORT", "EXPORT", f"Exported equipment audit trail PDF report to '{os.path.basename(target_file)}'")
-            messagebox.showinfo("Success", f"Equipment Audit Trail PDF exported successfully!\n\nFile: {target_file}")
+            messagebox.showinfo("Success", display_dates(f"Equipment Audit Trail PDF exported successfully!\n\nFile: {target_file}"))
             webbrowser.open(target_file)
         except Exception as e:
-            messagebox.showerror("Error", f"Failed to export equipment audit trail PDF: {e}")
+            messagebox.showerror("Error", display_dates(f"Failed to export equipment audit trail PDF: {e}"))
 
     def export_audit_log_to_csv(self):
         date_str = datetime.now().strftime("%Y-%m-%d")
@@ -9785,10 +10062,10 @@ class ModbusApp(BackupMixin):
                     row = self.audit_tree.item(item)['values']
                     writer.writerow(row)
             self.log_audit("AUDIT_LOG_EXPORT", "EXPORT", f"Exported audit log report to '{os.path.basename(target_file)}'")
-            messagebox.showinfo("Success", f"Audit log exported to {target_file}")
+            messagebox.showinfo("Success", display_dates(f"Audit log exported to {target_file}"))
             webbrowser.open(target_file)
         except Exception as e:
-            messagebox.showerror("Error", f"Failed to export audit log: {e}")
+            messagebox.showerror("Error", display_dates(f"Failed to export audit log: {e}"))
 
 # -------------------------
 # MAIN
@@ -9796,14 +10073,14 @@ class ModbusApp(BackupMixin):
 def main():
     root = tk.Tk()
     def report_error(kind, value, traceback):
-        messagebox.showerror("Operation failed", str(value), parent=root)
+        messagebox.showerror("Operation failed", display_dates(str(value)), parent=root)
     root.report_callback_exception = report_error
     try:
         if STARTUP_STORAGE_ERROR is not None:
             raise RuntimeError(f"Restore recovery failed. Original folders have been retained: {STARTUP_STORAGE_ERROR}")
         app = ModbusApp(root)
     except Exception as exc:
-        messagebox.showerror("TempTrek could not start", str(exc), parent=root)
+        messagebox.showerror("TempTrek could not start", display_dates(str(exc)), parent=root)
         root.destroy()
         return
     root.mainloop()

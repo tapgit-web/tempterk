@@ -23,6 +23,8 @@ SOURCE = ast.parse(Path(__file__).with_name("2.py").read_text(encoding="utf-8"))
 
 
 def source_function(name, namespace):
+    from date_display import display_dates
+    namespace.setdefault("display_dates", display_dates)
     namespace.setdefault("DPAPI_PREFIX", security.DPAPI_PREFIX)
     namespace.setdefault("COMPANY_CONFIG_FILE", "nonexistent-company-reference.json")
     namespace.setdefault("Path", Path)
@@ -306,11 +308,13 @@ class StorageTests(unittest.TestCase):
             (self.root / "live" / "readings.csv").write_text("current data")
             app.restore_in_progress = True
             app._restore_backup_worker(backup, payload, manifest)
-            self.assertEqual((self.root / "live" / "readings.csv").read_text(), "snapshot")
-            self.assertTrue(app.restart_required)
+            self.assertEqual((self.root / "live" / "readings.csv").read_text(), "current data")
+            self.assertTrue(any(p.read_text() == "snapshot" for p in (self.root / "reports" / "restored_backups").rglob("readings.csv")))
+            self.assertFalse(app.restart_required)
             self.assertTrue(Path(backup).exists())
             self.assertEqual(len(list((self.root / "storage").glob("*.ttbackup"))), 2)
-            self.assertTrue(security.STORAGE_FROZEN.is_set())
+            self.assertFalse(security.STORAGE_FROZEN.is_set())
+            security.atomic_write(self.root / "live" / "after-restore.txt", "recording remains writable")
 
     @unittest.skipUnless(os.name == "nt", "Windows DPAPI integration")
     def test_safety_backup_failure_does_not_replace_data(self):

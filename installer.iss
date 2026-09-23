@@ -2,7 +2,7 @@
 [Setup]
 AppId={{D3B2C1A4-5F8A-4B2E-9C7D-8E1A2B3C4D5D}
 AppName=TempTrek Environmental Monitoring System
-AppVersion=2.5.2
+AppVersion=2.5.5
 AppPublisher=The Automation People
 DefaultDirName={autopf}\TempTrek Environmental Monitoring System
 DefaultGroupName=TempTrek Environmental Monitoring System
