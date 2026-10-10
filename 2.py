@@ -1,4 +1,4 @@
-from graph_format import channel_precision, graph_precision
+﻿from graph_format import channel_precision, graph_precision
 from date_display import display_dates
 import time
 import math
@@ -15,6 +15,7 @@ from collections import deque
 import random
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, simpledialog
+from PIL import Image, ImageTk
 
 try:
     from pymodbus.client.sync import ModbusTcpClient
@@ -848,7 +849,12 @@ def read_modbus_device(host, port, registers, app, stop_event, unit_id=1, refres
     def log_ui(msg):
         # Format: [IP:PORT:SLAVE] MESSAGE
         prefix = f"[{host}:{port}:{unit_id}]"
-        app.root.after(0, lambda: app.log(f"{prefix} {msg}"))
+        app.root.after(0, lambda: app.log(f"{prefix} {msg}") if not stop_event.is_set() else None)
+
+    def failed_read(reg):
+        # A failed read is not a measurement of zero.
+        lid = f"{host}:{port}:{unit_id}:{reg}"
+        app.root.after(0, lambda: app.mark_read_error(lid) if not stop_event.is_set() else None)
 
     while not stop_event.is_set():
         with lock:
@@ -865,6 +871,8 @@ def read_modbus_device(host, port, registers, app, stop_event, unit_id=1, refres
                 
                 if not is_connected:
                     if not client.connect():
+                        for reg in registers:
+                            failed_read(reg)
                         log_ui(f"Connection Failed ❌")
                         # Skip this poll cycle if connection fails
                         stop_event.wait(2)
@@ -882,8 +890,10 @@ def read_modbus_device(host, port, registers, app, stop_event, unit_id=1, refres
                         dt = "INT32"
                         reg_mode = "FC04" # Fixed back to FC04
                         poll_interval = 1.0
-                        for d in list(app.devices):
-                            if d['ip'] == host and d['port'] == port and d.get('slave_id', 1) == unit_id:
+                        d = None
+                        for candidate in list(app.devices):
+                            if candidate['ip'] == host and candidate['port'] == port and candidate.get('slave_id', 1) == unit_id:
+                                d = candidate
                                 dt = d.get('types', {}).get(str(reg), "INT32")
                                 reg_mode = d.get('modes', {}).get(str(reg), "FC04")
                                 try:
@@ -895,13 +905,22 @@ def read_modbus_device(host, port, registers, app, stop_event, unit_id=1, refres
                                 except: divisor = 1.0
                                 break
 
+                        if d is None:
+                            failed_read(reg)
+                            continue
+
                         # Determine how many registers to read
                         count_to_read = 2 if ("32" in dt or dt == "BCD" or "DOUBLE" in dt) else 1
 
                         param_name = 'slave' if PYMODBUS_V3 else 'unit'
                         kwargs = {param_name: unit_id}
 
-                        reg_num = int(''.join(filter(str.isdigit, str(reg)))) if any(c.isdigit() for c in str(reg)) else 0
+                        address_match = re.fullmatch(r"(?:[A-Za-z_]+:?)?(\d+)", str(reg))
+                        if address_match is None:
+                            raise ValueError(f"Invalid register address: {reg}")
+                        reg_num = int(address_match.group(1))
+                        if reg_num + count_to_read > 65536:
+                            raise ValueError(f"Register address out of range: {reg}")
                         if reg_mode == "FC03":
                             result = client.read_holding_registers(address=reg_num, count=count_to_read, **kwargs)
                         elif reg_mode == "FC01":
@@ -915,7 +934,7 @@ def read_modbus_device(host, port, registers, app, stop_event, unit_id=1, refres
                             break
                         if result is None:
                             log_ui(f"TIMEOUT @ {reg}")
-                            log_ui(f"Reg {reg} \u2192 0")
+                            failed_read(reg)
                             continue
                             
                         if result.isError():
@@ -925,21 +944,28 @@ def read_modbus_device(host, port, registers, app, stop_event, unit_id=1, refres
                                 codes = {1:"Illegal Func", 2:"Illegal Addr", 3:"Illegal Data", 4:"Fail"}
                                 err_msg = codes.get(result.exception_code, f"Error {result.exception_code}")
                             log_ui(f"Read Error @ {reg}: {err_msg}")
-                            log_ui(f"Reg {reg} \u2192 0")
+                            failed_read(reg)
                             continue
+
+                        response_unit = getattr(result, 'dev_id', getattr(result, 'slave_id', getattr(result, 'unit_id', None)))
+                        if response_unit is not None and response_unit != unit_id:
+                            log_ui(f"Unexpected slave {response_unit} @ {reg}")
+                            failed_read(reg)
+                            client.close()
+                            break
 
                         try:
                             # Safe Access to registers/bits
                             if reg_mode in ["FC01", "FC02"]:
                                 if not hasattr(result, "bits") or len(result.bits) < count_to_read:
                                     log_ui(f"Partial Read @ {reg}")
-                                    log_ui(f"Reg {reg} \u2192 0")
+                                    failed_read(reg)
                                     continue
                                 value = 1 if result.bits[0] else 0
                             else:
                                 if not hasattr(result, "registers") or len(result.registers) < count_to_read:
                                     log_ui(f"Partial Read @ {reg}")
-                                    log_ui(f"Reg {reg} \u2192 0")
+                                    failed_read(reg)
                                     continue
 
                                 # 32-bit Types
@@ -981,6 +1007,8 @@ def read_modbus_device(host, port, registers, app, stop_event, unit_id=1, refres
                                 val_to_log = label_0 if int(value) == 0 else label_1
                                 csv_val = "0" if int(value) == 0 else "1"
                             else:
+                                if not math.isfinite(value):
+                                    raise ValueError("Non-finite reading")
                                 # Format value based on selected precision
                                 try:
                                     # Use per-register decimal places if available, else fallback to global setting
@@ -1000,6 +1028,7 @@ def read_modbus_device(host, port, registers, app, stop_event, unit_id=1, refres
                             log_ui(f"Reg {reg} \u2192 {val_to_log}")
                             
                             # Throttle CSV writes based on poll_interval
+                            is_lora = ("LORA" in str(d.get('node_type', '')).upper()) or ("LORA" in str(d.get('device_name', '')).upper())
                             now = time.time()
                             last_t = last_csv_write.get(reg, 0.0)
                             if now - last_t >= poll_interval:
@@ -1016,7 +1045,7 @@ def read_modbus_device(host, port, registers, app, stop_event, unit_id=1, refres
                                     last_csv_write[reg] = now
                         except Exception as e:
                             log_ui(f"Decode Error @ {reg}: {e}")
-                            log_ui(f"Reg {reg} \u2192 0")
+                            failed_read(reg)
 
                         # Check Email Alerts
                         for alert in app.email_settings.get('alerts', []):
@@ -1062,13 +1091,15 @@ def read_modbus_device(host, port, registers, app, stop_event, unit_id=1, refres
 
                     except PermissionError:
                         log_ui(f"Error: CSV File Open! Close it.")
-                        log_ui(f"Reg {reg} \u2192 0")
+                        failed_read(reg)
                     except Exception as e:
                         log_ui(f"Error: {e}")
-                        log_ui(f"Reg {reg} \u2192 0")
+                        failed_read(reg)
 
             except Exception as e:
                 log_ui(f"Global IP Error ({host}): {e}")
+                for reg in registers:
+                    failed_read(reg)
 
         if refresh_event:
             refresh_event.wait(timeout=1.0)
@@ -1279,6 +1310,7 @@ class ModbusApp(BackupMixin):
         self.node_tree = None
         self.mini_tree = None
         self.last_values = {} # { lid: "string_val" }
+        self.stale_readings = set()
         self.last_update_times = {} # { key: "timestamp" }
         self.refresh_events = {}
         
@@ -1827,6 +1859,13 @@ class ModbusApp(BackupMixin):
     # -------------------------
     # 1. SPLASH SCREEN
     # -------------------------
+    def brand_logo(self, size):
+        """Load the supplied brand artwork without changing the application icon."""
+        with Image.open(resource_path("temptrek_logo.png")) as source:
+            logo = source.convert("RGBA")
+            logo.thumbnail(size, Image.Resampling.LANCZOS)
+        return ImageTk.PhotoImage(logo, master=self.root)
+
     def show_splash(self):
         self.clear_window()
         self.root.configure(bg=self.COLORS["bg_dark"])
@@ -1834,9 +1873,8 @@ class ModbusApp(BackupMixin):
         container = tk.Frame(self.root, bg=self.COLORS["bg_dark"])
         container.place(relx=0.5, rely=0.5, anchor="center")
         
-        # Logo Icon
-        if self.icon_img:
-            tk.Label(container, image=self.icon_img, bg=self.COLORS["bg_dark"]).pack(pady=20)
+        self.splash_logo = self.brand_logo((480, 130))
+        tk.Label(container, image=self.splash_logo, bg=self.COLORS["bg_dark"]).pack(pady=20)
         
         # Title with Glow Effect
         tk.Label(container, text="TempTrek Environmental Monitoring System", font=("Segoe UI", 32, "bold"), 
@@ -1977,10 +2015,9 @@ class ModbusApp(BackupMixin):
 
         logo_frame = tk.Frame(self.sidebar, bg=self.COLORS["bg_surface"], pady=30)
         logo_frame.pack(fill="x")
-        tk.Label(logo_frame, text="Temp", font=("Segoe UI", 16, "bold"), 
-                 fg=self.COLORS["accent"], bg=self.COLORS["bg_surface"]).pack(side="left", padx=(30, 0))
-        tk.Label(logo_frame, text="Trek", font=("Segoe UI", 16), 
-                 fg=self.COLORS["text_main"], bg=self.COLORS["bg_surface"]).pack(side="left")
+        self.sidebar_logo = self.brand_logo((210, 65))
+        tk.Label(logo_frame, image=self.sidebar_logo,
+                 bg=self.COLORS["bg_surface"]).pack()
 
         nav_area = tk.Frame(self.sidebar, bg=self.COLORS["bg_surface"])
         nav_area.pack(fill="both", expand=True)
@@ -2146,8 +2183,8 @@ class ModbusApp(BackupMixin):
                         borderwidth=0)
         
         style.configure("Treeview.Heading", 
-                        background=self.COLORS["bg_highlight"], 
-                        foreground=self.COLORS["accent"],
+                        background="#1E3A8A", 
+                        foreground="#FFFFFF",
                         font=("Segoe UI", 10, "bold"),
                         relief="flat",
                         padding=12)
@@ -3976,6 +4013,8 @@ class ModbusApp(BackupMixin):
             self.live_labels[f"{val_id}:monitoring"] = status_lbl
 
             ts_text = f"Last Update: {cached_ts}" if cached_ts else "Last Update: --"
+            if val_id in self.stale_readings:
+                ts_text = f"STALE - {ts_text}"
             time_lbl = tk.Label(r_frame, text=display_dates(ts_text), font=("Segoe UI", 8), 
                                 fg=self.COLORS["text_dim"], bg=self.COLORS["bg_surface"])
             time_lbl.pack(pady=(0, 6))
@@ -7846,49 +7885,16 @@ class ModbusApp(BackupMixin):
             text(w / 2, top - 38, comp_info.get("department_name", "Environmental Monitoring Department"), True, 9, True)
             text(w / 2, top - 53, comp_info.get("report_title", "Temperature and Humidity Report"), False, 9, True)
             
-            # Left side icon + Temp Trek logo
-            icon_path = resource_path("icon.png")
-            if not os.path.exists(icon_path):
-                icon_path = resource_path("icon.ico")
-            
-            icon_drawn = False
-            if os.path.exists(icon_path):
-                try:
-                    c.drawImage(icon_path, left + 8, top - 54, width=38, height=42, mask='auto', preserveAspectRatio=True)
-                    icon_drawn = True
-                except Exception:
-                    pass
-
-            left_text_x = (left + 48) if icon_drawn else (left + 10)
-            left_text_w = 102 if icon_drawn else 138
-
-            left_logo_path = None
-            for candidate in [resource_path("temptrek_logo.png"), resource_path("left_logo.png")]:
-                if os.path.exists(candidate) and candidate != icon_path:
-                    left_logo_path = candidate
-                    break
-
-            logo_drawn = False
-            if left_logo_path:
-                try:
-                    c.drawImage(left_logo_path, left_text_x, top - 56, width=left_text_w, height=46, mask='auto', preserveAspectRatio=True)
-                    logo_drawn = True
-                except Exception:
-                    pass
-
-            if not logo_drawn:
-                sx = left_text_x + (5 if icon_drawn else 30)
-                c.setFillColorRGB(0.0, 0.36, 0.72)
-                c.setFont("Helvetica-Bold", 14)
-                c.drawString(sx, top - 38, "Temp")
-                c.setFillColorRGB(0.11, 0.12, 0.13)
-                c.setFont("Helvetica", 14)
-                c.drawString(sx + 38, top - 38, "Trek")
+            # Brand artwork is separate from the desktop application icon.
+            left_logo_path = resource_path("temptrek_logo.png")
+            if os.path.exists(left_logo_path):
+                c.drawImage(left_logo_path, left + 10, top - 58, width=138, height=50,
+                            mask='auto', preserveAspectRatio=True)
 
             # Right side logo option (draws uploaded logo image, or fallback DATA LOG text)
             right_logo_path = None
             for candidate in [os.path.join(DATA_PATH, "logo.png"), os.path.join(DATA_PATH, "config", "logo.png"), resource_path("logo.png"), resource_path("company_logo.png")]:
-                if os.path.exists(candidate) and candidate != icon_path:
+                if os.path.exists(candidate):
                     right_logo_path = candidate
                     break
 
@@ -9296,6 +9302,14 @@ class ModbusApp(BackupMixin):
         finally:
             self.root.after(1000, self.periodic_refresher)
 
+    def mark_read_error(self, lid):
+        """Retain the last measurement and visibly flag its failed refresh."""
+        self.stale_readings.add(lid)
+        label = self.live_labels.get(f"{lid}:time")
+        if label is not None:
+            last = self.last_update_times.get(lid, '--')
+            label.config(text=display_dates(f"STALE - Last Update: {last}"))
+
     def log(self, msg):
         ts = datetime.now().strftime("%H:%M:%S")
         sno = len(self.global_log) + 1
@@ -9370,8 +9384,14 @@ class ModbusApp(BackupMixin):
                         except Exception:
                             pass
 
-                    if should_update_ui and lid in self.live_labels:
+                    if should_update_ui and "\u2192" in content:
+                        self.stale_readings.discard(lid)
+                        self.last_values[lid] = vn
+                        self.last_update_times[lid] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+                    if should_update_ui and "\u2192" in content and lid in self.live_labels:
                         try:
+                            self.stale_readings.discard(lid)
                             # Match view: Auto-format based on perceived type or value
                             display_val = vn
                             if dtype == "BOOLEAN":
@@ -9941,7 +9961,7 @@ class ModbusApp(BackupMixin):
                 
                 # Left side icon/logo (Temp Trek image format)
                 left_logo_path = None
-                for candidate in [resource_path("temptrek_logo.png"), resource_path("logo.png"), resource_path("left_logo.png"), resource_path("icon.png")]:
+                for candidate in [resource_path("temptrek_logo.png"), resource_path("logo.png"), resource_path("left_logo.png")]:
                     if os.path.exists(candidate):
                         left_logo_path = candidate
                         break
@@ -9970,8 +9990,7 @@ class ModbusApp(BackupMixin):
                 right_image_drawn = False
                 if right_logo_path:
                     try:
-                        c.drawImage(right_logo_path, right - 148, top - 57, width=48, height=48, mask='auto', preserveAspectRatio=True)
-                        text(right - 92, top - 38, "AUDIT TRAIL", True, 10, False)
+                        c.drawImage(right_logo_path, right - 148, top - 57, width=138, height=50, mask='auto', preserveAspectRatio=True)
                         right_image_drawn = True
                     except Exception:
                         pass

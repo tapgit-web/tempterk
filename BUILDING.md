@@ -1,9 +1,9 @@
 # Windows application packages
 
-Built version: 2.5.4, Windows x64.
+Built version: 2.5.5, Windows x64.
 
 - `dist/TempTrek Environmental Monitoring System.exe`: standalone application, including Python and required libraries.
-- `dist/TempTrek-2.5.4-x64.msi`: native per-machine Windows Installer package. Installs to 64-bit Program Files, creates Start menu and desktop shortcuts, and supports uninstall through Windows Installed apps.
+- `dist/TempTrek-2.5.5-x64.msi`: native per-machine Windows Installer package. Installs to 64-bit Program Files, creates Start menu and desktop shortcuts, and supports uninstall through Windows Installed apps.
 
 Run `build.bat` using Windows Python 3.12 to rebuild both artifacts. `build_msi.py` reads the version from `installer.iss`; increase that version for a new release. The MSI builder uses Python 3.12's Windows-only `msilib`, which was removed in Python 3.13. No WiX or Inno Setup installation is required for this path. `installer.iss` remains available separately if an Inno Setup EXE installer is also desired.
 
